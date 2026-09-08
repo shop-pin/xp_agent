@@ -1,0 +1,9 @@
+# 只跟踪 my_src（我的复现代码）和 my_docs（学习笔记），忽略教程本体的其余文件
+/*
+!/my_src
+!/my_docs
+!/.gitignore
+
+# my_src 里的构建产物与依赖
+my_src/node_modules/
+my_src/dist/

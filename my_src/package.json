@@ -1,0 +1,18 @@
+{
+  "name": "mini-claude-mine",
+  "version": "1.0.0",
+  "description": "My from-scratch mini Claude Code, built chapter by chapter",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "mock": "tsc && node run-mock.mjs",
+    "live": "tsc && node run-live.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}
