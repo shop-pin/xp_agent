@@ -9,7 +9,8 @@
     "live": "tsc && node run-live.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.52.0"
+    "@anthropic-ai/sdk": "^0.52.0",
+    "glob": "^13.0.6"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
