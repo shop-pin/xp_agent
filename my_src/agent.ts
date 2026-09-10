@@ -1,9 +1,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import Anthropic from "@anthropic-ai/sdk";
 import { executeTool, toolDefinitions } from "./tools.js";
+import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
-const SYSTEM_PROMPT = "You are a coding agent.";
+
 export class Agent {
     private client: Anthropic;
     private messages: Anthropic.MessageParam[] = [];
@@ -16,12 +17,15 @@ export class Agent {
     }
 
     async chat(userText: string): Promise<void> {
-        this.messages.push({ role: "user", content: userText });
+        const content = this.messages.length === 0
+            ? `${userText}\n\n${buildUserContextReminder()}`
+            : userText;
+        this.messages.push({ role: "user", content: content });
         while (true) {
             const response = await this.client.messages.create({
                 model: MODEL,
                 max_tokens: 4096,
-                system: SYSTEM_PROMPT,
+                system: buildSystemPrompt(),
                 tools: toolDefinitions,
                 messages: this.messages,
             })

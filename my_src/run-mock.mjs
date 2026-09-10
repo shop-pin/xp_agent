@@ -2,8 +2,9 @@
 // No API key needed. Usage: npm run mock -- [chapter]   (compiles first, then runs)
 //   npm run mock        → chapter 1
 //   npm run mock -- 2   → chapter 2
+//   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
 import { startMock } from "../steps/mock-anthropic.mjs";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { pathToFileURL, fileURLToPath } from "url";
@@ -42,6 +43,46 @@ const scenarios = {
       }
     },
   },
+  "3": {
+    prompt: "Read the file greeting.txt and tell me what it says.",
+    needsLog: true,
+    setup: (dir) => {
+      writeFileSync(join(dir, "greeting.txt"), "hello from step one.");
+      writeFileSync(
+        join(dir, "CLAUDE.md"),
+        "Project marker: MINI-CLAUDE-MD-MARKER.\n@./.claude/rules/test-rule.md\n"
+      );
+      mkdirSync(join(dir, ".claude", "rules"), { recursive: true });
+      writeFileSync(join(dir, ".claude", "rules", "test-rule.md"), "Rule marker: MINI-RULE-MARKER.\n");
+    },
+    turns: [
+      { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }] },
+      { text: "greeting.txt says: hello from step one." },
+    ],
+    // chapter 3's deliverable is prompt assembly — assert on the request itself
+    verify: (dir, logPath) => {
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const req = events.find((e) => e.type === "request");
+      const today = new Date().toISOString().split("T")[0];
+      const checks = [
+        ["static core is in system", req.system.includes("Mini Claude Code")],
+        ["# Environment block in system", req.system.includes("# Environment")],
+        ["working directory in system", req.system.includes("Working directory: " + dir)],
+        ["platform + shell in system", req.system.includes("Platform: ") && req.system.includes("Shell: ")],
+        ["CLAUDE.md is NOT in system", !req.system.includes("MINI-CLAUDE-MD-MARKER")],
+        ["<system-reminder> in first user msg", req.firstUserText.includes("<system-reminder>")],
+        ["CLAUDE.md content in reminder", req.firstUserText.includes("MINI-CLAUDE-MD-MARKER")],
+        ["@include resolved (rules loaded)", req.firstUserText.includes("MINI-RULE-MARKER")],
+        ["today's date in reminder", req.firstUserText.includes("Today's date is " + today)],
+      ];
+      let ok = true;
+      for (const [name, pass] of checks) {
+        console.log(`  ${pass ? "✓" : "✗"} ${name}`);
+        if (!pass) ok = false;
+      }
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -53,7 +94,8 @@ if (!s) {
 const workdir = mkdtempSync(join(tmpdir(), `my-ch${chapter}-`));
 s.setup(workdir);
 
-const mock = await startMock({ scenario: { id: `ch${chapter}`, turns: s.turns } });
+const logPath = s.needsLog ? join(tmpdir(), `my-ch${chapter}-log-${process.pid}.jsonl`) : undefined;
+const mock = await startMock({ scenario: { id: `ch${chapter}`, turns: s.turns }, logPath });
 process.env.ANTHROPIC_BASE_URL = mock.url;
 process.env.ANTHROPIC_API_KEY = "test";
 process.chdir(workdir);
@@ -65,4 +107,4 @@ const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
 await new mod.Agent().chat(s.prompt);
 
 await mock.close();
-if (s.verify) s.verify(workdir);
+if (s.verify) s.verify(workdir, logPath);
