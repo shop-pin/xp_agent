@@ -43,6 +43,53 @@ const scenarios = {
       }
     },
   },
+  "7": {
+    // chapter 7: read 3 files (4 main-loop requests) — by the final request the
+    // history exceeds the threshold, an aux summarize call fires, and the last
+    // request must carry [summary, ...recent] instead of the full history.
+    prompt: "Read a.txt, then b.txt, then c.txt, then summarize.",
+    needsLog: true,
+    setup: (dir) => {
+      writeFileSync(join(dir, "a.txt"), "alpha");
+      writeFileSync(join(dir, "b.txt"), "beta");
+      writeFileSync(join(dir, "c.txt"), "gamma");
+    },
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "read_file", input: { file_path: "a.txt" } }] },
+          { tools: [{ name: "read_file", input: { file_path: "b.txt" } }] },
+          { tools: [{ name: "read_file", input: { file_path: "c.txt" } }] },
+          { text: "All three read: alpha, beta, gamma." },
+        ],
+      },
+      // the aux summarize call is recognized by its system prompt
+      compact: {
+        match: "Summarize the conversation",
+        turns: [{ text: "Earlier: a.txt=alpha, b.txt=beta, c.txt=gamma." }],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const compactReqs = reqs.filter((e) => e.track === "compact");
+      check("4 main-loop model calls", mainReqs.length === 4);
+      check("aux summarize call went out", compactReqs.length === 1);
+      check("transcript is plain text (tool pairs rendered, not split)",
+        typeof compactReqs[0]?.firstUserText === "string"
+        && compactReqs[0].firstUserText.includes("[tool call / result]")
+        && compactReqs[0].firstUserText.includes("user: "));
+      check("history shrank to summary + recent (3 msgs, was 7)", mainReqs[3]?.messageCount === 3);
+      check("summary from aux call landed at history head",
+        typeof mainReqs[3]?.firstUserText === "string"
+        && mainReqs[3].firstUserText.includes("[Summary of earlier conversation]")
+        && mainReqs[3].firstUserText.includes("a.txt=alpha"));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.
@@ -179,7 +226,10 @@ const workdir = mkdtempSync(join(tmpdir(), `my-ch${chapter}-`));
 s.setup(workdir);
 
 const logPath = s.needsLog ? join(tmpdir(), `my-ch${chapter}-log-${process.pid}.jsonl`) : undefined;
-const mock = await startMock({ scenario: { id: `ch${chapter}`, turns: s.turns }, logPath });
+const scenario = s.tracks
+  ? { id: `ch${chapter}`, tracks: s.tracks }
+  : { id: `ch${chapter}`, turns: s.turns };
+const mock = await startMock({ scenario, logPath });
 process.env.ANTHROPIC_BASE_URL = mock.url;
 process.env.ANTHROPIC_API_KEY = "test";
 process.chdir(workdir);

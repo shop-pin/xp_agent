@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { executeTool, toolDefinitions } from "./tools.js";
 import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
 import { checkPermission } from "./permissions.js";
+import { maybeCompact } from "./context.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -35,6 +36,7 @@ export class Agent {
             : userText;
         this.messages.push({ role: "user", content: content });
         while (true) {
+            this.messages = await maybeCompact(this.messages, this.client, MODEL);
             const stream = this.client.messages.stream({
                 model: MODEL,
                 max_tokens: 4096,
@@ -46,7 +48,7 @@ export class Agent {
             const response = await stream.finalMessage();
             process.stdout.write("\n");
             this.messages.push({ role: "assistant", content: response.content });
-
+            
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 
             if (toolUses.length === 0) return;
