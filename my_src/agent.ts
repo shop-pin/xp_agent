@@ -16,6 +16,18 @@ export class Agent {
         });
     }
 
+    history(): Anthropic.MessageParam[] {
+        return this.messages;
+    }
+
+    loadHistory(messages: Anthropic.MessageParam[]): void {
+        this.messages = messages;
+    }
+
+    clearHistory(): void {
+        this.messages = [];
+    }
+
     async chat(userText: string): Promise<void> {
         const content = this.messages.length === 0
             ? `${userText}\n\n${buildUserContextReminder()}`

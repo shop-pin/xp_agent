@@ -43,6 +43,39 @@ const scenarios = {
       }
     },
   },
+  "4": {
+    // chapter 4 drives the CLI, not the Agent directly: run 1 saves a session,
+    // run 2 must restore it via --resume and continue the same conversation.
+    runs: [
+      { argv: ["Remember that my favorite color is blue."] },
+      { argv: ["--resume", "What is my favorite color?"] },
+    ],
+    needsLog: true,
+    setup: () => {},
+    turns: [
+      { text: "Got it — your favorite color is blue." },
+      { text: "Your favorite color is blue." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const sessionPath = join(dir, ".mini-session.json");
+      check("session file saved to disk", existsSync(sessionPath));
+      let saved = null;
+      try { saved = JSON.parse(readFileSync(sessionPath, "utf-8")); } catch {}
+      // checked after BOTH runs: 2 restored + 1 new user + 1 new assistant.
+      // A broken resume would overwrite the file with just 2 fresh messages.
+      check("session ends with 4 messages (2 restored + 2 new)", Array.isArray(saved) && saved.length === 4);
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("two model calls total (one per run)", reqs.length === 2);
+      check("run 1 sent only its own message (1 msg)", reqs[0]?.messageCount === 1);
+      check("run 2 restored the history (3 msgs, not 1)", reqs[1]?.messageCount === 3);
+      check("run 2's first user msg is run 1's text", typeof reqs[1]?.firstUserText === "string"
+        && reqs[1].firstUserText.includes("Remember that my favorite color is blue."));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "3": {
     prompt: "Read the file greeting.txt and tell me what it says.",
     needsLog: true,
@@ -101,10 +134,20 @@ process.env.ANTHROPIC_API_KEY = "test";
 process.chdir(workdir);
 
 console.log(`▶ mock model at ${mock.url}   sandbox: ${workdir}   chapter: ${chapter}`);
-console.log(`  you: ${s.prompt}\n`);
 
-const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
-await new mod.Agent().chat(s.prompt);
+if (s.runs) {
+  // CLI chapters: drive runCli(argv) once per run, in-process.
+  const mod = await import(pathToFileURL(join(HERE, "dist", "cli.js")).href);
+  for (const r of s.runs) {
+    console.log(`  you: ${r.argv.join(" ")}\n`);
+    await mod.runCli(r.argv);
+    console.log();
+  }
+} else {
+  console.log(`  you: ${s.prompt}\n`);
+  const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+  await new mod.Agent().chat(s.prompt);
+}
 
 await mock.close();
 if (s.verify) s.verify(workdir, logPath);
