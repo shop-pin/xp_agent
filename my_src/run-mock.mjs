@@ -43,6 +43,35 @@ const scenarios = {
       }
     },
   },
+  "6": {
+    // chapter 6: the model tries a destructive command; the gate must stop it
+    // BEFORE execution and report the denial back as a normal tool_result.
+    prompt: "Delete everything in the demo folder with rm -rf.",
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, "demo"));
+      writeFileSync(join(dir, "demo", "precious.txt"), "do not lose me");
+    },
+    turns: [
+      {
+        text: "I'll remove it.",
+        tools: [{ name: "run_shell", input: { command: "rm -rf demo" } }],
+      },
+      { text: "That was blocked by the permission system, so nothing was deleted." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      check("nothing was deleted (precious.txt survives)", existsSync(join(dir, "demo", "precious.txt")));
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("two model calls (model saw the denial and recovered)", reqs.length === 2);
+      const denial = (reqs[1]?.toolResults || []).map((t) => t.content).join(" ");
+      check("tool_result back to the model says Denied", denial.includes("Denied"));
+      check("denial is NOT raw shell output", !denial.includes("Command failed"));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "5": {
     // chapter 5's deliverable: requests go out as streams (SSE), while the
     // final message shape stays identical so the tool loop is unbroken.

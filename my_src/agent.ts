@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import Anthropic from "@anthropic-ai/sdk";
 import { executeTool, toolDefinitions } from "./tools.js";
 import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
+import { checkPermission } from "./permissions.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -53,8 +54,10 @@ export class Agent {
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             for (const tu of toolUses) {
                 console.log(`  ->${tu.name}(${JSON.stringify(tu.input)})`);
-                const result = await executeTool(tu.name, tu.input as Record<string, any>);
-                toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: result });
+                const output = checkPermission(tu.name, tu.input as Record<string, any>) === "deny"
+                    ? `Denied: ${tu.name} was blocked by the permission system.`
+                    : await executeTool(tu.name, tu.input as Record<string, any>);
+                toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }
             this.messages.push({ role: "user", content: toolResult });
         }
