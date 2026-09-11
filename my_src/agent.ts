@@ -34,19 +34,17 @@ export class Agent {
             : userText;
         this.messages.push({ role: "user", content: content });
         while (true) {
-            const response = await this.client.messages.create({
+            const stream = this.client.messages.stream({
                 model: MODEL,
                 max_tokens: 4096,
                 system: buildSystemPrompt(),
                 tools: toolDefinitions,
                 messages: this.messages,
             })
+            stream.on("text", (t) => process.stdout.write(t));
+            const response = await stream.finalMessage();
+            process.stdout.write("\n");
             this.messages.push({ role: "assistant", content: response.content });
-            for (const block of response.content) {
-                if (block.type === "text") {
-                    console.log(`block.text: ${block.text}`);
-                }
-            }
 
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 

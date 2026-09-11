@@ -43,6 +43,28 @@ const scenarios = {
       }
     },
   },
+  "5": {
+    // chapter 5's deliverable: requests go out as streams (SSE), while the
+    // final message shape stays identical so the tool loop is unbroken.
+    prompt: "Read the file greeting.txt and tell me what it says.",
+    needsLog: true,
+    setup: (dir) => writeFileSync(join(dir, "greeting.txt"), "hello from step five."),
+    turns: [
+      { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }] },
+      { text: "greeting.txt says: hello from step five." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("two model calls (tool loop still intact)", reqs.length === 2);
+      check("request 1 was streamed", reqs[0]?.stream === true);
+      check("request 2 was streamed", reqs[1]?.stream === true);
+      check("finalMessage shape ok (tool_result sent back)", (reqs[1]?.toolResults || []).length === 1);
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "4": {
     // chapter 4 drives the CLI, not the Agent directly: run 1 saves a session,
     // run 2 must restore it via --resume and continue the same conversation.
