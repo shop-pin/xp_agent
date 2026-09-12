@@ -186,6 +186,58 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "11": {
+    // chapter 11: the main agent forks a read-only sub-agent via the `agent`
+    // tool. The sub-agent runs its own loop on a separate track (own system
+    // prompt, fresh context, read-only tools, non-streaming), denies a write
+    // attempt in-loop, and its final text returns to the main loop as a
+    // tool_result.
+    prompt: "Use a sub-agent to find out what greeting.txt says.",
+    needsLog: true,
+    setup: (dir) => writeFileSync(join(dir, "greeting.txt"), "hello from the subagent demo."),
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "agent", input: { task: "Read greeting.txt and report its contents." } }] },
+          { text: "The sub-agent reports: hello from the subagent demo." },
+        ],
+      },
+      sub: {
+        match: "explore sub-agent",
+        turns: [
+          { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }] },
+          { tools: [{ name: "write_file", input: { file_path: "evil.txt", content: "mwahaha" } }] },
+          { text: "greeting.txt says: hello from the subagent demo." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const subReqs = reqs.filter((e) => e.track === "sub");
+      check("2 main-loop calls (fork + continue)", mainReqs.length === 2);
+      check("sub-agent ran its own 3-call loop", subReqs.length === 3);
+      check("sub-agent tools are read-only",
+        subReqs[0]?.tools.includes("read_file") && subReqs[0]?.tools.includes("list_files")
+        && subReqs[0]?.tools.includes("grep_search")
+        && !subReqs[0]?.tools.includes("write_file") && !subReqs[0]?.tools.includes("run_shell"));
+      check("sub-agent context is fresh (1 message, not the main history)", subReqs[0]?.messageCount === 1);
+      check("sub-agent has its own system prompt",
+        subReqs[0]?.system.includes("explore sub-agent")
+        && !subReqs[0]?.system.includes("Mini Claude Code"));
+      check("main loop streams, sub-agent does not",
+        mainReqs[0]?.stream === true && subReqs[0]?.stream === false);
+      check("sub-agent write attempt denied in-loop",
+        (subReqs[2]?.toolResults || []).some((t) => t.content.includes("Denied"))
+        && !existsSync(join(dir, "evil.txt")));
+      check("sub-agent summary reached main as tool_result",
+        (mainReqs[1]?.toolResults || []).some((t) => t.content.includes("hello from the subagent demo")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.

@@ -5,6 +5,7 @@ import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
 import { checkPermission } from "./permissions.js";
 import { maybeCompact } from "./context.js";
 import { recallMemories } from "./memory.js";
+import { runSubAgent } from "./subagent.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -62,6 +63,11 @@ export class Agent {
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             for (const tu of toolUses) {
                 console.log(`  ->${tu.name}(${JSON.stringify(tu.input)})`);
+                if (tu.name === "agent") {
+                    const summary = await runSubAgent(String((tu.input as any).task || ""), this.client, MODEL);
+                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: summary });
+                    continue;
+                }
                 const blocked = checkPermission(tu.name, tu.input as Record<string, any>) === "deny"
                     || (this.mode === "plan" && ["write_file", "edit_file", "run_shell"].includes(tu.name));
                 const output = blocked
