@@ -4,6 +4,7 @@ import { executeTool, toolDefinitions } from "./tools.js";
 import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
 import { checkPermission } from "./permissions.js";
 import { maybeCompact } from "./context.js";
+import { recallMemories } from "./memory.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -40,7 +41,7 @@ export class Agent {
             const stream = this.client.messages.stream({
                 model: MODEL,
                 max_tokens: 4096,
-                system: buildSystemPrompt(),
+                system: buildSystemPrompt() + recallMemories(userText),
                 tools: toolDefinitions,
                 messages: this.messages,
             })

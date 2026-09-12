@@ -90,6 +90,38 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "8": {
+    // chapter 8: a memory dir on disk holds two files; the user asks about
+    // deployment. recallMemories() must score the deploy memory above zero and
+    // inject it into the SYSTEM prompt — while the irrelevant one stays out.
+    prompt: "Where should I deploy my changes to test them?",
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-memory"));
+      writeFileSync(
+        join(dir, ".mini-memory", "deploy.md"),
+        "Deploy target: the staging server at staging.example.com. Deploy there to test changes.\n"
+      );
+      writeFileSync(
+        join(dir, ".mini-memory", "color.md"),
+        "The user's favorite color is blue.\n"
+      );
+    },
+    turns: [{ text: "Deploy to staging.example.com." }],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("one model call", reqs.length === 1);
+      check("relevant memory recalled into system", reqs[0]?.system.includes("staging.example.com"));
+      check("memory section header present", reqs[0]?.system.includes("# Memory"));
+      check("irrelevant memory filtered out", !reqs[0]?.system.includes("favorite color"));
+      check("recall lands in system, not the user message",
+        !reqs[0]?.firstUserText.includes("staging.example.com"));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.
