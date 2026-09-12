@@ -11,6 +11,7 @@ const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 export class Agent {
     private client: Anthropic;
     private messages: Anthropic.MessageParam[] = [];
+    private mode: string = "default";
 
     constructor() {
         this.client = new Anthropic({
@@ -29,6 +30,10 @@ export class Agent {
 
     clearHistory(): void {
         this.messages = [];
+    }
+
+    setMode(mode: string): void {
+        this.mode = mode;
     }
 
     async chat(userText: string): Promise<void> {
@@ -57,8 +62,10 @@ export class Agent {
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             for (const tu of toolUses) {
                 console.log(`  ->${tu.name}(${JSON.stringify(tu.input)})`);
-                const output = checkPermission(tu.name, tu.input as Record<string, any>) === "deny"
-                    ? `Denied: ${tu.name} was blocked by the permission system.`
+                const blocked = checkPermission(tu.name, tu.input as Record<string, any>) === "deny"
+                    || (this.mode === "plan" && ["write_file", "edit_file", "run_shell"].includes(tu.name));
+                const output = blocked
+                    ? `Denied: ${tu.name} was blocked (${this.mode} mode).`
                     : await executeTool(tu.name, tu.input as Record<string, any>);
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }

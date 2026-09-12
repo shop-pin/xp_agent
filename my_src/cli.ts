@@ -18,6 +18,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
             console.log(`resumed ${saved.length} messages`);
         }
     }
+    if (argv.includes("--plan")) {
+        agent.setMode("plan");
+        argv = argv.filter((t) => t !== "--plan");
+        console.log(`(plan mode: read-only)`);
+    }
 
     const oneshot = argv.join(" ").trim()
     if (oneshot) {

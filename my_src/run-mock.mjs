@@ -160,6 +160,32 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "10": {
+    // chapter 10: --plan starts the CLI in read-only mode. The model tries to
+    // write a file, the gate denies it naming plan mode, nothing lands on disk,
+    // and the model recovers with a text-only reply.
+    needsLog: true,
+    setup: () => {},
+    runs: [{ argv: ["--plan", "Create a file report.txt with the plan."] }],
+    turns: [
+      { tools: [{ name: "write_file", input: { file_path: "report.txt", content: "the plan" } }] },
+      { text: "That was blocked because we're in plan (read-only) mode." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      check("nothing was written in plan mode", !existsSync(join(dir, "report.txt")));
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("two model calls (model saw the denial and recovered)", reqs.length === 2);
+      check("the actual task reached the model", reqs[0]?.firstUserText.includes("Create a file report.txt"));
+      const denial = (reqs[1]?.toolResults || []).map((t) => t.content).join(" ");
+      check("tool_result says Denied", denial.includes("Denied"));
+      check("denial names the mode (plan)", denial.includes("plan"));
+      check("denial is not the file content", !denial.includes("the plan"));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.
