@@ -2,6 +2,7 @@ import * as readline from "readline";
 import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
 import { saveSession, loadSession } from "./session.js";
+import { resolveSkill } from "./skills.js";
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
     let resume: boolean = false;
@@ -20,7 +21,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
     const oneshot = argv.join(" ").trim()
     if (oneshot) {
-        await agent.chat(oneshot)
+        await agent.chat(resolveSkill(oneshot) ?? oneshot);
         saveSession(agent.history())
         return;
     }
@@ -52,7 +53,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                 }
                 if (input) {
                     try {
-                        await agent.chat(input);
+                        await agent.chat(resolveSkill(input) ?? input);
                     } catch (e: any) {
                         console.error(`error: ${e.message ?? e}`);
                     }

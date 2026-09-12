@@ -122,6 +122,44 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "9": {
+    // chapter 9: a skill file in .mini-skills/. "/commit <args>" resolves to the
+    // file's prompt with args appended; an unknown /name falls through as a
+    // plain message; a non-slash message is untouched.
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-skills"));
+      writeFileSync(
+        join(dir, ".mini-skills", "commit.md"),
+        "Write a conventional commit message for the current diff.\n"
+      );
+    },
+    runs: [
+      { argv: ["/commit fix the login bug"] },
+      { argv: ["/nosuchskill hello there"] },
+      { argv: ["just a plain message"] },
+    ],
+    turns: [
+      { text: "feat: fix the login bug" },
+      { text: "I don't know that skill." },
+      { text: "Plain message received." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("three model calls (one per run)", reqs.length === 3);
+      check("skill prompt replaces the /command",
+        reqs[0]?.firstUserText.includes("Write a conventional commit message")
+        && !reqs[0]?.firstUserText.includes("/commit"));
+      check("args appended to skill prompt", reqs[0]?.firstUserText.includes("fix the login bug"));
+      check("unknown /name passes through as plain text",
+        reqs[1]?.firstUserText.includes("/nosuchskill hello there"));
+      check("non-slash message untouched", reqs[2]?.firstUserText.includes("just a plain message"));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.
