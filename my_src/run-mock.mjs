@@ -238,6 +238,32 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "12": {
+    // chapter 12: a real MCP server subprocess (mcp-demo-server.mjs) provides
+    // an `add` tool over stdio JSON-RPC. The agent must discover it, advertise
+    // it as mcp__demo__add, route the model's call to the server, and feed the
+    // result (42) back through the tool loop. Built-in tools stay in the list.
+    prompt: "Use the add tool to compute 17 + 25.",
+    needsLog: true,
+    envMcp: true,
+    setup: () => {},
+    turns: [
+      { tools: [{ name: "mcp__demo__add", input: { a: 17, b: 25 } }] },
+      { text: "17 + 25 = 42." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("two model calls", reqs.length === 2);
+      check("MCP tool advertised to the model", reqs[0]?.tools.includes("mcp__demo__add"));
+      check("built-in tools still present alongside MCP", reqs[0]?.tools.includes("read_file"));
+      check("MCP result (42) fed back as tool_result",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("42")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.
@@ -380,6 +406,7 @@ const scenario = s.tracks
 const mock = await startMock({ scenario, logPath });
 process.env.ANTHROPIC_BASE_URL = mock.url;
 process.env.ANTHROPIC_API_KEY = "test";
+if (s.envMcp) process.env.MINI_MCP_SERVER = join(HERE, "mcp-demo-server.mjs");
 process.chdir(workdir);
 
 console.log(`▶ mock model at ${mock.url}   sandbox: ${workdir}   chapter: ${chapter}`);
@@ -395,7 +422,9 @@ if (s.runs) {
 } else {
   console.log(`  you: ${s.prompt}\n`);
   const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
-  await new mod.Agent().chat(s.prompt);
+  const agent = new mod.Agent();
+  await agent.chat(s.prompt);
+  if (agent.closeMcp) agent.closeMcp(); // kill the MCP child so the event loop can drain
 }
 
 await mock.close();
