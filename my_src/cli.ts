@@ -45,6 +45,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     }
     if (oneshot) {
         await agent.chat(resolveSkill(oneshot) ?? oneshot);
+        agent.closeMcp(); // MCP 子进程 stdio 会挂住事件循环，one-shot 结束必须显式关闭
         saveSession(agent.history())
         return;
     }

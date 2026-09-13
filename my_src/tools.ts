@@ -127,6 +127,20 @@ export const toolDefinitions: Anthropic.Tool[] = [
             required: ["url"],
         },
     },
+    {
+        name: "agent",
+        description: "Fork a read-only explore sub-agent to investigate a task in an isolated context. It can read files, list directories, and grep, and returns a concise summary. Use it for broad searches that would otherwise flood the main conversation.",
+        input_schema: {
+            type: "object",
+            properties: {
+                task: {
+                    type: "string",
+                    description: "The task for the sub-agent to investigate",
+                },
+            },
+            required: ["task"],
+        },
+    },
 ];
 
 export async function executeTool(name: string, input: Record<string, any>): Promise<string> {

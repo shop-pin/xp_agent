@@ -50,8 +50,24 @@ export class Agent {
     }
 
     private transcriptText(): string {
+        // 评估器/分类器需要看到工具证据；裸渲染会把 tool_use/tool_result 全变占位符，
+        // 导致 "done.txt exists" 这类目标永远判不通过（ch14 实测发现）
+        const blockText = (b: any): string => {
+            if (b.type === "tool_use") return `[tool_use ${b.name}: ${JSON.stringify(b.input)}]`;
+            if (b.type === "tool_result") {
+                const c = typeof b.content === "string"
+                    ? b.content
+                    : Array.isArray(b.content)
+                        ? b.content.map((x: any) => x?.text ?? "").join(" ")
+                        : "";
+                return `[tool_result: ${String(c).slice(0, 300)}]`;
+            }
+            return `[${b.type}]`;
+        };
         return this.messages
-            .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content : "[tool call / result]"}`)
+            .map((m) => `${m.role}: ${typeof m.content === "string"
+                ? m.content
+                : Array.isArray(m.content) ? m.content.map(blockText).join(" ") : "[content]"}`)
             .join("\n");
     }
 

@@ -18,23 +18,44 @@ rl.on("line", (line) => {
       break;
     case "tools/list":
       respond(msg.id, {
-        tools: [{
-          name: "add",
-          description: "Add two numbers together",
-          inputSchema: {
-            type: "object",
-            properties: { a: { type: "number" }, b: { type: "number" } },
-            required: ["a", "b"],
+        tools: [
+          {
+            name: "add",
+            description: "Add two numbers together",
+            inputSchema: {
+              type: "object",
+              properties: { a: { type: "number" }, b: { type: "number" } },
+              required: ["a", "b"],
+            },
           },
-        }],
+          {
+            name: "echo",
+            description: "Echo back the given message",
+            inputSchema: {
+              type: "object",
+              properties: { message: { type: "string" } },
+              required: ["message"],
+            },
+          },
+          {
+            name: "timestamp",
+            description: "Return the current Unix timestamp in seconds",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
       });
       break;
     case "tools/call": {
-      const { a, b } = msg.params?.arguments || {};
-      if (typeof a !== "number" || typeof b !== "number") {
+      const name = msg.params?.name;
+      const args = msg.params?.arguments || {};
+      if (name === "echo") {
+        respond(msg.id, { content: [{ type: "text", text: String(args.message ?? "") }] });
+      } else if (name === "timestamp") {
+        respond(msg.id, { content: [{ type: "text", text: String(Math.floor(Date.now() / 1000)) }] });
+      } else if (typeof args.a !== "number" || typeof args.b !== "number") {
         respond(msg.id, { content: [{ type: "text", text: "error: a and b must be numbers" }] });
       } else {
-        respond(msg.id, { content: [{ type: "text", text: String(a + b) }] });
+        respond(msg.id, { content: [{ type: "text", text: String(args.a + args.b) }] });
       }
       break;
     }
