@@ -24,7 +24,25 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         console.log(`(plan mode: read-only)`);
     }
 
+    if (argv.includes("--auto")) {
+        agent.setMode("auto");
+        argv = argv.filter((t) => t !== "--auto");
+        console.log(`(auto mode: a classifier gates dangerous actions)`);
+    }
+
+    let goalCondition: string | undefined;
+    if (argv.includes("--goal")) {
+        const gi = argv.indexOf("--goal");
+        goalCondition = argv[gi + 1];
+        argv.splice(gi, 2);
+    }
+
     const oneshot = argv.join(" ").trim()
+    if (goalCondition) {
+        await agent.pursueGoal(goalCondition, oneshot);
+        saveSession(agent.history());
+        return;
+    }
     if (oneshot) {
         await agent.chat(resolveSkill(oneshot) ?? oneshot);
         saveSession(agent.history())

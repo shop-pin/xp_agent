@@ -264,6 +264,82 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "15": {
+    // chapter 15: autonomy. Run 1 (--goal): the evaluator judges "done.txt
+    // exists" — first NOT_MET (reason gets reinjected as the next turn), the
+    // model writes the file, second evaluation says MET. Run 2 (--auto): the
+    // classifier reads the transcript and blocks the secret.txt write with
+    // <block>yes</block>; the model sees "Blocked" as the tool_result.
+    // Both side-calls are routed by their system prompts — the exact phrases
+    // "goal evaluator" and "security monitor" are contract anchors: keep them
+    // verbatim in autonomy.ts, and keep them out of the main system prompt.
+    needsLog: true,
+    setup: () => {},
+    runs: [
+      { argv: ["--goal", "done.txt exists", "Create done.txt with ok."] },
+      { argv: ["--auto", "Create secret.txt with credentials."] },
+      { argv: ["--auto", "Create notes-auto.txt with hello."] },
+    ],
+    tracks: {
+      main: {
+        turns: [
+          { text: "Working on it." },
+          { tools: [{ name: "write_file", input: { file_path: "done.txt", content: "ok" } }] },
+          { text: "Created done.txt." },
+          { tools: [{ name: "write_file", input: { file_path: "secret.txt", content: "creds" } }] },
+          { text: "That write was blocked by the auto-mode monitor." },
+          { tools: [{ name: "write_file", input: { file_path: "notes-auto.txt", content: "hello" } }] },
+          { text: "Created notes-auto.txt." },
+        ],
+      },
+      goal: {
+        match: "goal evaluator",
+        turns: [
+          { text: "NOT_MET: done.txt has not been created yet." },
+          { text: "MET" },
+        ],
+      },
+      auto: {
+        match: "security monitor",
+        turns: [
+          { text: "<block>yes</block> writing credential files is out of scope" },
+          { text: "<block>no</block> harmless file creation" },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      check("goal run: done.txt actually created", existsSync(join(dir, "done.txt")));
+      check("auto run: secret.txt NOT written (classifier blocked it)", !existsSync(join(dir, "secret.txt")));
+      check("auto run: allow verdict lets notes-auto.txt through", existsSync(join(dir, "notes-auto.txt")));
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const goalReqs = reqs.filter((e) => e.track === "goal");
+      const autoReqs = reqs.filter((e) => e.track === "auto");
+      check("7 main-loop calls (3 goal + 4 auto)", mainReqs.length === 7);
+      check("2 evaluator calls (NOT_MET then MET)", goalReqs.length === 2);
+      check("2 classifier calls (block then allow)", autoReqs.length === 2);
+      check("evaluator is a side call: single message, not streamed",
+        goalReqs[0]?.messageCount === 1 && goalReqs[0]?.stream === false);
+      check("evaluator receives condition + transcript",
+        typeof goalReqs[0]?.firstUserText === "string"
+        && goalReqs[0].firstUserText.includes("done.txt exists"));
+      check("reinjection grew history (1 -> 3 msgs by 2nd main call)",
+        mainReqs[0]?.messageCount === 1 && mainReqs[1]?.messageCount === 3);
+      check("write tool_result fed back before final eval (5 msgs)",
+        mainReqs[2]?.messageCount === 5);
+      check("classifier is a side call: single message, not streamed",
+        autoReqs[0]?.messageCount === 1 && autoReqs[0]?.stream === false);
+      check("classifier transcript includes what it judges (secret.txt)",
+        typeof autoReqs[0]?.firstUserText === "string"
+        && autoReqs[0].firstUserText.includes("secret.txt"));
+      check("model saw 'Blocked' tool_result after the block",
+        (mainReqs[4]?.toolResults || []).some((t) => t.content.includes("Blocked")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.

@@ -1,4 +1,3 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import Anthropic from "@anthropic-ai/sdk";
 import { executeTool, toolDefinitions } from "./tools.js";
 import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
@@ -7,6 +6,7 @@ import { maybeCompact } from "./context.js";
 import { recallMemories } from "./memory.js";
 import { runSubAgent } from "./subagent.js";
 import { connectMcp, type McpConnection } from "./mcp.js";
+import { evaluateGoal, classifyAction } from "./autonomy.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -47,6 +47,26 @@ export class Agent {
     closeMcp(): void {
         this.mcp?.close();
         this.mcp = null;
+    }
+
+    private transcriptText(): string {
+        return this.messages
+            .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content : "[tool call / result]"}`)
+            .join("\n");
+    }
+
+    async pursueGoal(condition: string, prompt: string): Promise<void> {
+        await this.chat(prompt);
+        for (let i = 0; i < 5; i++) {
+            const verdict = await evaluateGoal(condition, this.transcriptText(), this.client, MODEL);
+            if (verdict.met) {
+                console.log(`✓ goal met: ${condition}`);
+                return;
+            }
+            console.log(`  (goal not met — ${verdict.reason}; continuing)`);
+            await this.chat(`The goal "${condition}" is not met yet: ${verdict.reason}. Keep working toward it.`);
+        }
+        console.log(`  (gave up after 5 iterations without meeting: ${condition})`);
     }
 
     async chat(userText: string): Promise<void> {
@@ -93,6 +113,13 @@ export class Agent {
                         : "Denied: no MCP server connected.";
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
                     continue;
+                }
+                if (this.mode === "auto" && ["write_file", "edit_file", "run_shell"].includes(tu.name)) {
+                    const verdict = await classifyAction(tu.name, tu.input as Record<string, any>, this.transcriptText(), this.client, MODEL);
+                    if (!verdict.allow) {
+                        toolResult.push({type: "tool_result", tool_use_id:tu.id, content: `Blocked by auto-mode monitor: ${verdict.reason}`});
+                        continue;
+                    }
                 }
                 const blocked = checkPermission(tu.name, tu.input as Record<string, any>) === "deny"
                     || (this.mode === "plan" && ["write_file", "edit_file", "run_shell"].includes(tu.name));
