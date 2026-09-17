@@ -1,9 +1,9 @@
 import * as readline from "readline";
 import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
-import { saveSession, loadSession } from "./session.js";
+import { loadSession, getLatestSessionId } from "./session.js";
 import { resolveSkill } from "./skills.js";
-import { printWelcome, printError } from "./ui.js";
+import { printWelcome, printError, printInfo } from "./ui.js";
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
     let resume: boolean = false;
@@ -13,10 +13,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     }
     const agent = new Agent();
     if (resume) {
-        const saved = loadSession();
-        if (saved != null) {
-            agent.loadHistory(saved as any);
-            console.log(`resumed ${saved.length} messages`);
+        const sessionId = getLatestSessionId();
+        if (sessionId) {
+            const session = loadSession(sessionId);
+            if (session) {
+                agent.restoreSession({ anthropicMessages: session.anthropicMessages });
+            } else {
+                printInfo("No session found to resume.");
+            }
+        } else {
+            printInfo("No previous sessions found.");
         }
     }
     if (argv.includes("--plan")) {
@@ -41,13 +47,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     const oneshot = argv.join(" ").trim()
     if (goalCondition) {
         await agent.pursueGoal(goalCondition, oneshot);
-        saveSession(agent.history());
         return;
     }
     if (oneshot) {
         await agent.chat(resolveSkill(oneshot) ?? oneshot);
         agent.closeMcp(); // MCP 子进程 stdio 会挂住事件循环，one-shot 结束必须显式关闭
-        saveSession(agent.history())
         return;
     }
     const rl = readline.createInterface({
@@ -72,7 +76,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                 }
                 if (input === "/clear") {
                     agent.clearHistory();
-                    saveSession(agent.history());
                     console.log(`(history cleared)`);
                     ask();
                     return;
@@ -83,7 +86,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     } catch (e: any) {
                         printError(String(e.message ?? e));
                     }
-                    saveSession(agent.history());
                 }
                 ask();
             });

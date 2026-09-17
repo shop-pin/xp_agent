@@ -7,7 +7,9 @@ import { recallMemories } from "./memory.js";
 import { runSubAgent } from "./subagent.js";
 import { connectMcp, type McpConnection } from "./mcp.js";
 import { evaluateGoal, classifyAction } from "./autonomy.js";
-import { printToolCall, printAssistantText, startSpinner, stopSpinner } from "./ui.js";
+import { saveSession } from "./session.js";
+import { randomUUID } from "crypto";
+import { printToolCall, printAssistantText, printInfo, startSpinner, stopSpinner } from "./ui.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -16,6 +18,8 @@ export class Agent {
     private messages: Anthropic.MessageParam[] = [];
     private mode: string = "default";
     private mcp: McpConnection | null = null;
+    private sessionId: string = randomUUID().slice(0, 8);
+    private sessionStartTime: string = new Date().toISOString();
 
     constructor() {
         this.client = new Anthropic({
@@ -38,6 +42,26 @@ export class Agent {
 
     setMode(mode: string): void {
         this.mode = mode;
+    }
+
+    restoreSession(data: { anthropicMessages?: any[] }): void {
+        if (data.anthropicMessages) this.messages = data.anthropicMessages;
+        printInfo(`Session restored (${this.messages.length} messages).`);
+    }
+
+    private autoSave(): void {
+        try {
+            saveSession(this.sessionId, {
+                metadata: {
+                    id: this.sessionId,
+                    model: MODEL,
+                    cwd: process.cwd(),
+                    startTime: this.sessionStartTime,
+                    messageCount: this.messages.length,
+                },
+                anthropicMessages: this.messages,
+            });
+        } catch {} // 写盘失败不打断对话——容错分层的取舍见 my_docs/17-multi-session.md
     }
 
     private async ensureMcp(): Promise<void> {
@@ -125,7 +149,10 @@ export class Agent {
             
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 
-            if (toolUses.length === 0) return;
+            if (toolUses.length === 0) {
+                this.autoSave();
+                return;
+            }
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             for (const tu of toolUses) {

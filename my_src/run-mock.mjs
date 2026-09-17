@@ -4,7 +4,7 @@
 //   npm run mock -- 2   → chapter 2
 //   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
 import { startMock } from "../steps/mock-anthropic.mjs";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { pathToFileURL, fileURLToPath } from "url";
@@ -404,22 +404,41 @@ const scenarios = {
       { text: "Got it — your favorite color is blue." },
       { text: "Your favorite color is blue." },
     ],
+    // ch17 迁移：session 落在 HOME 沙箱的 ~/.mini-claude/sessions/<id>.json，
+    // 断言从"单文件+消息数组"升级为"目录+metadata+消息体"，并断言旧文件已消失
     verify: (dir, logPath) => {
       let ok = true;
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
-      const sessionPath = join(dir, ".mini-session.json");
-      check("session file saved to disk", existsSync(sessionPath));
-      let saved = null;
-      try { saved = JSON.parse(readFileSync(sessionPath, "utf-8")); } catch {}
-      // checked after BOTH runs: 2 restored + 1 new user + 1 new assistant.
-      // A broken resume would overwrite the file with just 2 fresh messages.
-      check("session ends with 4 messages (2 restored + 2 new)", Array.isArray(saved) && saved.length === 4);
+      check("old cwd .mini-session.json is gone", !existsSync(join(dir, ".mini-session.json")));
+      const sessionsDir = join(dir, ".mini-claude", "sessions");
+      let files = [];
+      try { files = readdirSync(sessionsDir).filter((f) => f.endsWith(".json")); } catch {}
+      check("two session files under HOME sandbox (one per run)", files.length === 2);
+      // run2 留下的那份：2 restored + 1 new user + 1 new assistant = 4 条。
+      // resume 坏了的话 run2 只会存 2 条新消息，找不到 messageCount===4 的文件。
+      let run2 = null;
+      for (const f of files) {
+        try {
+          const data = JSON.parse(readFileSync(join(sessionsDir, f), "utf-8"));
+          if (data.metadata?.messageCount === 4) run2 = data;
+        } catch {}
+      }
+      check("run2 session carries full metadata", !!run2
+        && typeof run2.metadata?.id === "string"
+        && typeof run2.metadata?.startTime === "string"
+        && typeof run2.metadata?.model === "string"
+        && run2.metadata?.cwd === dir);
+      check("run2 session ends with 4 messages (2 restored + 2 new)",
+        Array.isArray(run2?.anthropicMessages) && run2.anthropicMessages.length === 4);
+      check("run2's first user msg is run 1's text",
+        typeof run2?.anthropicMessages?.[0]?.content === "string"
+        && run2.anthropicMessages[0].content.includes("Remember that my favorite color is blue."));
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request");
       check("two model calls total (one per run)", reqs.length === 2);
       check("run 1 sent only its own message (1 msg)", reqs[0]?.messageCount === 1);
       check("run 2 restored the history (3 msgs, not 1)", reqs[1]?.messageCount === 3);
-      check("run 2's first user msg is run 1's text", typeof reqs[1]?.firstUserText === "string"
+      check("run 2's request first msg is run 1's text", typeof reqs[1]?.firstUserText === "string"
         && reqs[1].firstUserText.includes("Remember that my favorite color is blue."));
       if (!ok) process.exitCode = 1;
     },
@@ -482,6 +501,11 @@ const scenario = s.tracks
 const mock = await startMock({ scenario, logPath });
 process.env.ANTHROPIC_BASE_URL = mock.url;
 process.env.ANTHROPIC_API_KEY = "test";
+// ch17 HOME 沙箱：~/.mini-claude/... 必须落进临时目录。
+// Windows 的 homedir() 读 USERPROFILE，POSIX 读 HOME——两个都设（homedir 实测不缓存）。
+// 必须在动态 import dist/cli.js 之前设置。
+process.env.HOME = workdir;
+process.env.USERPROFILE = workdir;
 if (s.envMcp) process.env.MINI_MCP_SERVER = join(HERE, "mcp-demo-server.mjs");
 process.chdir(workdir);
 
