@@ -7,6 +7,7 @@ import { recallMemories } from "./memory.js";
 import { runSubAgent } from "./subagent.js";
 import { connectMcp, type McpConnection } from "./mcp.js";
 import { evaluateGoal, classifyAction } from "./autonomy.js";
+import { printToolCall, printAssistantText, startSpinner, stopSpinner } from "./ui.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -98,6 +99,9 @@ export class Agent {
         }));
         while (true) {
             this.messages = await maybeCompact(this.messages, this.client, MODEL);
+            startSpinner();
+            let firstText = true;
+            let response: Anthropic.Message;
             const stream = this.client.messages.stream({
                 model: MODEL,
                 max_tokens: 4096,
@@ -105,9 +109,18 @@ export class Agent {
                 tools: [...toolDefinitions, ...mcpTools],
                 messages: this.messages,
             });
-            stream.on("text", (t) => process.stdout.write(t));
-            const response = await stream.finalMessage();
-            process.stdout.write("\n");
+            try {
+                // src 同款协调：首个 text 事件先停 spinner 再打印，避免 \r 重画吃掉流式输出；
+                // 纯工具调用响应没有 text 事件，靠 finally 兜底
+                stream.on("text", (t) => {
+                    if (firstText) { stopSpinner(); firstText = false; }
+                    printAssistantText(t);
+                });
+                response = await stream.finalMessage();
+            } finally {
+                stopSpinner();
+            }
+            printAssistantText("\n");
             this.messages.push({ role: "assistant", content: response.content });
             
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
@@ -116,7 +129,7 @@ export class Agent {
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             for (const tu of toolUses) {
-                console.log(`  ->${tu.name}(${JSON.stringify(tu.input)})`);
+                printToolCall(tu.name, tu.input as Record<string, any>);
                 if (tu.name === "agent") {
                     const summary = await runSubAgent(String((tu.input as any).task || ""), this.client, MODEL);
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: summary });

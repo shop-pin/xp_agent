@@ -3,6 +3,7 @@ import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
 import { saveSession, loadSession } from "./session.js";
 import { resolveSkill } from "./skills.js";
+import { printWelcome, printError } from "./ui.js";
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
     let resume: boolean = false;
@@ -53,6 +54,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         input: process.stdin,
         output: process.stdout,
     });
+    printWelcome();
     return await new Promise<void>((resolve) => {
         // stdin EOF (Ctrl+D on an empty line) closes the readline interface
         // mid-flight; asking a closed interface throws. Stop asking and let
@@ -79,7 +81,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     try {
                         await agent.chat(resolveSkill(input) ?? input);
                     } catch (e: any) {
-                        console.error(`error: ${e.message ?? e}`);
+                        printError(String(e.message ?? e));
                     }
                     saveSession(agent.history());
                 }
