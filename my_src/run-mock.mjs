@@ -4,7 +4,7 @@
 //   npm run mock -- 2   → chapter 2
 //   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
 import { startMock } from "../steps/mock-anthropic.mjs";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { pathToFileURL, fileURLToPath } from "url";
@@ -245,10 +245,14 @@ const scenarios = {
     // an `add` tool over stdio JSON-RPC. The agent must discover it, advertise
     // it as mcp__demo__add, route the model's call to the server, and feed the
     // result (42) back through the tool loop. Built-in tools stay in the list.
+    // ch20 迁移：配置源从 MINI_MCP_SERVER env 迁到 .mcp.json（Manager 三处合并）
     prompt: "Use the add tool to compute 17 + 25.",
     needsLog: true,
-    envMcp: true,
-    setup: () => {},
+    setup: (dir) => {
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({
+        mcpServers: { demo: { command: "node", args: [join(HERE, "mcp-demo-server.mjs")] } },
+      }, null, 2));
+    },
     turns: [
       { tools: [{ name: "mcp__demo__add", input: { a: 17, b: 25 } }] },
       { text: "17 + 25 = 42." },
@@ -536,6 +540,65 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "20": {
+    // chapter 20: Agent 骨架 I —— 双 server MCP、withRetry 重试、max-cost 截停，一场景三 run。
+    // run 顺序有讲究：retry 必须排在 max-cost 之前。共享 main track 的轮次计数器
+    // 不会"跳过"turn——run2 的检查点正确地不消费收尾 turn 时，那个 turn 会被
+    // 下一个 run 捡走。把 failWith 轮放在 max-cost 轮之前，三个 run 的轮次区间
+    // 就互不越界：run1 消费 t0-t1，run2 消费 t2-t4，run3 消费 t5-t6（t7 是截停断言）。
+    // run1 双 server：.mcp.json 声明 demo + demo2（同一 server 脚本起两个进程），
+    //   两个前缀都要广告，mcp__demo2__add 要路由到 demo2 的连接。
+    // run2 重试：t2 注入 429；envSdkRetries=0 封 SDK 自带重试层，
+    //   用户的 withRetry 接住后退避、重试、拿 t3/t4。
+    // run3 max-cost：每轮 usage 压到 input=100000/out=500（每轮 $0.3075），
+    //   --max-cost 0.5 → 第二轮响应后累计 $0.615 超限。检查点必须在"执行工具前"停：
+    //   t7（预算超限后的收尾文本）永远不该被请求。
+    needsLog: true,
+    envSdkRetries: 0,
+    setup: (dir) => {
+      writeFileSync(join(dir, "greeting.txt"), "hello from step twenty.");
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({
+        mcpServers: {
+          demo: { command: "node", args: [join(HERE, "mcp-demo-server.mjs")] },
+          demo2: { command: "node", args: [join(HERE, "mcp-demo-server.mjs")] },
+        },
+      }, null, 2));
+    },
+    runs: [
+      { argv: ["Use the demo2 add tool to compute 20 + 22."] },
+      { argv: ["Read greeting.txt and tell me what it says."] },
+      { argv: ["--max-cost", "0.5", "Read greeting.txt twice, then tell me what it says."] },
+    ],
+    turns: [
+      { tools: [{ name: "mcp__demo2__add", input: { a: 20, b: 22 } }] },
+      { text: "20 + 22 = 42 (routed via demo2)." },
+      { failWith: { status: 429 } },
+      { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }] },
+      { text: "recovered after retry." },
+      { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }], usage: { input_tokens: 100000, output_tokens: 500 } },
+      { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }], usage: { input_tokens: 100000, output_tokens: 500 } },
+      { text: "never reached: budget must stop before this turn." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const fails = events.filter((e) => e.type === "response" && e.failWith);
+      const crashes = events.filter((e) => e.type === "run_crashed");
+      const res = (i) => (reqs[i]?.toolResults || []).map((t) => t.content).join("\n");
+      check("both MCP servers advertised (demo + demo2)",
+        reqs[0]?.tools.includes("mcp__demo__add") && reqs[0]?.tools.includes("mcp__demo2__add"));
+      check("call routed to demo2, result fed back", res(1).includes("42"));
+      check("429 injected exactly once", fails.length === 1 && fails[0].failWith === 429);
+      check("no run crashed (withRetry caught the 429)", crashes.length === 0);
+      check("retry executed the read after backoff", res(4).includes("hello from step twenty"));
+      check("max-cost stop: turn 7 never requested", !reqs.some((e) => e.turnIndex === 7));
+      check("first read executed before the budget stop", res(6).includes("hello from step twenty"));
+      check("7 main-track requests total (2 + 3 + 2)", reqs.length === 7);
+      if (!ok) process.exitCode = 1;
+    },
+  },
   "19": {
     // chapter 19: permission rules. setup 写项目级 settings.json：
     //   deny  ["run_shell(rm *)"]        —— 阶段①在一切模式快捷方式之前，--yolo 也拦
@@ -605,27 +668,40 @@ process.env.ANTHROPIC_API_KEY = "test";
 // 必须在动态 import dist/cli.js 之前设置。
 process.env.HOME = workdir;
 process.env.USERPROFILE = workdir;
-if (s.envMcp) process.env.MINI_MCP_SERVER = join(HERE, "mcp-demo-server.mjs");
+// ch20：封 SDK 自带重试层（默认 2），否则它先吞掉注入的 429，withRetry 永远等不到失败。
+// 必须在动态 import dist 之前设置（Agent 构造时读取）
+if (s.envSdkRetries !== undefined) process.env.MINI_CLAUDE_SDK_MAX_RETRIES = String(s.envSdkRetries);
 process.chdir(workdir);
 
 console.log(`▶ mock model at ${mock.url}   sandbox: ${workdir}   chapter: ${chapter}`);
 
 if (s.runs) {
   // CLI chapters: drive runCli(argv) once per run, in-process.
+  // 单 run crash（如 ch20 红基线里 stub 放行 429）不中断后续 verify——
+  // 记进日志让断言看到；crash 后 MCP 子进程可能悬着，最后显式退进程
   const mod = await import(pathToFileURL(join(HERE, "dist", "cli.js")).href);
+  let crashed = false;
   for (const r of s.runs) {
     console.log(`  you: ${r.argv.join(" ")}\n`);
-    await mod.runCli(r.argv);
+    try {
+      await mod.runCli(r.argv);
+    } catch (e) {
+      console.log(`  run crashed: ${e?.message ?? e}`);
+      crashed = true;
+      if (logPath) appendFileSync(logPath, JSON.stringify({ type: "run_crashed", error: String(e?.message ?? e) }) + "\n");
+    }
     console.log();
   }
+  await mock.close();
+  if (s.verify) s.verify(workdir, logPath);
+  if (crashed) process.exit(process.exitCode ?? 0);
 } else {
   console.log(`  you: ${s.prompt}\n`);
   const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
   const agent = new mod.Agent();
   if (s.autoConfirm) agent.setConfirmFn(async () => true);
   await agent.chat(s.prompt);
-  if (agent.closeMcp) agent.closeMcp(); // kill the MCP child so the event loop can drain
+  if (agent.close) await agent.close(); // kill the MCP children so the event loop can drain
+  await mock.close();
+  if (s.verify) s.verify(workdir, logPath);
 }
-
-await mock.close();
-if (s.verify) s.verify(workdir, logPath);

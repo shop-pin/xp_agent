@@ -62,6 +62,20 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         argv.splice(gi, 2);
     }
 
+    if (argv.includes("--max-cost")) {
+        const mi = argv.indexOf("--max-cost");
+        const maxCost = Number(argv[mi + 1]);
+        agent.setMaxCost(maxCost);
+        argv.splice(mi, 2);
+        console.log(`(max-cost: $${maxCost})`);
+    }
+
+    if (argv.includes("--max-turns")) {
+        const ti = argv.indexOf("--max-turns");
+        agent.setMaxTurns(Number(argv[ti + 1]));
+        argv.splice(ti, 2);
+    }
+
     const oneshot = argv.join(" ").trim()
     if (goalCondition) {
         await agent.pursueGoal(goalCondition, oneshot);
@@ -69,7 +83,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     }
     if (oneshot) {
         await agent.chat(resolveSkill(oneshot) ?? oneshot);
-        agent.closeMcp(); // MCP 子进程 stdio 会挂住事件循环，one-shot 结束必须显式关闭
+        await agent.close(); // MCP 子进程 stdio 会挂住事件循环，one-shot 结束必须显式关闭
         return;
     }
     const rl = readline.createInterface({
