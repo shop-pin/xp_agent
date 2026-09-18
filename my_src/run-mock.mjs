@@ -483,6 +483,55 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "18": {
+    // chapter 18: read-before-edit。断言锚 = 请求日志里的 toolResults 文本 + 磁盘落盘内容。
+    // 拦截文案的锚定为 "must read this file before editing"（与 src 一致）。
+    // 六个工具打包进一个 assistant 回合：每回合只净增 2 条消息（峰值 4 < COMPACT_THRESHOLD 6），
+    // 不会触发压缩；agent 顺序执行，同批内"先拦 → read 记录 → edit 成功 → 立即再 edit"的时序正好是本章语义。
+    // 用户动手前 1、2 号断言红（未读编辑畅通无阻）；3 号防自伤是回归护栏（漏回写 mtime 时变红）。
+    prompt: "Fix target.txt (alpha to beta, then unique body to edited body) and try to fix dup.txt.",
+    needsLog: true,
+    setup: (dir) => {
+      writeFileSync(join(dir, "target.txt"), "alpha\nunique body\n");
+      writeFileSync(join(dir, "dup.txt"), "same line\nsame line\n");
+    },
+    turns: [
+      {
+        tools: [
+          // 1. 未读先 edit —— 期待被拦
+          { name: "edit_file", input: { file_path: "target.txt", old_string: "alpha", new_string: "beta" } },
+          // 2. read 记录 mtime
+          { name: "read_file", input: { file_path: "target.txt" } },
+          // 3. 同样的 edit —— 期待成功
+          { name: "edit_file", input: { file_path: "target.txt", old_string: "alpha", new_string: "beta" } },
+          // 4. 立即再 edit —— 漏了"写后回写"的话这里会误报 modified externally
+          { name: "edit_file", input: { file_path: "target.txt", old_string: "unique body", new_string: "edited body" } },
+          // 5. read dup（两行相同）
+          { name: "read_file", input: { file_path: "dup.txt" } },
+          // 6. 非唯一 old_string —— 期待报错且落盘不变
+          { name: "edit_file", input: { file_path: "dup.txt", old_string: "same line", new_string: "x" } },
+        ],
+      },
+      { text: "Done." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      // 第二个请求携带全部六个工具结果，按脚本顺序拼接
+      const all = (reqs[1]?.toolResults || []).map((t) => t.content).join("\n");
+      const successCount = (all.match(/Successfully edited target\.txt/g) || []).length;
+      check("edit without read is blocked (must read first)", all.includes("must read this file before editing"));
+      check("edit succeeds after read", successCount >= 1);
+      check("immediate second edit NOT flagged as external modification (mtime written back)",
+        successCount === 2 && !all.includes("modified externally"));
+      check("non-unique old_string rejected", all.includes("found 2 times"));
+      check("target.txt on disk shows both edits", readFileSync(join(dir, "target.txt"), "utf-8") === "beta\nedited body\n");
+      check("dup.txt untouched by non-unique edit", readFileSync(join(dir, "dup.txt"), "utf-8") === "same line\nsame line\n");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];

@@ -18,6 +18,7 @@ export class Agent {
     private messages: Anthropic.MessageParam[] = [];
     private mode: string = "default";
     private mcp: McpConnection | null = null;
+    private readFileState: Map<string, number> = new Map();
     private sessionId: string = randomUUID().slice(0, 8);
     private sessionStartTime: string = new Date().toISOString();
 
@@ -181,7 +182,7 @@ export class Agent {
                     || (this.mode === "plan" && ["write_file", "edit_file", "run_shell"].includes(tu.name));
                 const output = blocked
                     ? `Denied: ${tu.name} was blocked (${this.mode} mode).`
-                    : await executeTool(tu.name, tu.input as Record<string, any>);
+                    : await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState);
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }
             this.messages.push({ role: "user", content: toolResult });

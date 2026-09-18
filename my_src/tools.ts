@@ -1,5 +1,5 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, statSync } from "fs";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
 import { execFileSync, execSync } from "child_process";
 import { glob } from "glob";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -143,17 +143,21 @@ export const toolDefinitions: Anthropic.Tool[] = [
     },
 ];
 
-export async function executeTool(name: string, input: Record<string, any>): Promise<string> {
+export async function executeTool(
+    name: string,
+    input: Record<string, any>,
+    readFileState?: Map<string, number>
+): Promise<string> {
     let result: string;
     switch (name) {
         case "read_file":
-            result = readFile(input as { file_path: string });
+            result = readFile(input as { file_path: string }, readFileState);
             break;
         case "write_file":
-            result = writeFile(input as { file_path: string; content: string });
+            result = writeFile(input as { file_path: string; content: string }, readFileState);
             break;
         case "edit_file":
-            result = editFile(input as { file_path: string; old_string: string; new_string: string });
+            result = editFile(input as { file_path: string; old_string: string; new_string: string }, readFileState);
             break;
         case "list_files":
             result = await listFiles(input as { pattern: string; path?: string });
@@ -173,22 +177,42 @@ export async function executeTool(name: string, input: Record<string, any>): Pro
     return truncateResult(result);
 }
 
-function readFile(input: { file_path: string }): string {
+function readFile(input: { file_path: string }, readFileState?: Map<string, number>): string {
     try {
         const lines = readFileSync(input.file_path, "utf-8").split("\n");
-        return lines.map((l, i) => `${String(i + 1).padStart(4)} | ${l}`).join("\n");
+        const out = lines.map((l, i) => `${String(i + 1).padStart(4)} | ${l}`).join("\n");
+        // 记：簿记失败不能毁掉一次成功的读，stat 单独包 try/catch
+        if (readFileState) {
+            try { readFileState.set(resolve(input.file_path), statSync(input.file_path).mtimeMs); } catch {}
+        }
+        return out;
     } catch (e: any) {
         return `Error reading file: ${e.message}`;
     }
 }
 
-function writeFile(input: { file_path: string; content: string }): string {
+function writeFile(input: { file_path: string; content: string }, readFileState?: Map<string, number>): string {
+    const absPath = resolve(input.file_path);
     try {
+        // 比：已存在的文件必须先读过、读后没被外部改过；新文件跳过（没东西可读）。
+        // 比 处 statSync 抛（TOCTOU 删文件）由外层 catch 收成一次普通失败，不炸 Agent 循环
+        if (readFileState && existsSync(absPath)) {
+            if (!readFileState.has(absPath)) {
+                return "Error: You must read this file before writing. Use read_file first to see its current contents.";
+            }
+            if (statSync(absPath).mtimeMs !== readFileState.get(absPath)) {
+                return `Warning: ${input.file_path} was modified externally since your last read. Please read_file again before writing.`;
+            }
+        }
         const dir = dirname(input.file_path);
         if (dir && !existsSync(dir)) {
             mkdirSync(dir, { recursive: true });
         }
         writeFileSync(input.file_path, input.content);
+        // 更新（防自伤）：不回写的话下次写/编辑会把自己上次写入误判成"外部修改"
+        if (readFileState) {
+            try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+        }
         const n = input.content.split("\n").length;
         return `Successfully wrote to ${input.file_path} (${n} lines)`;
     } catch (e: any) {
@@ -196,8 +220,20 @@ function writeFile(input: { file_path: string; content: string }): string {
     }
 }
 
-function editFile(input: { file_path: string; old_string: string; new_string: string }): string {
+function editFile(
+    input: { file_path: string; old_string: string; new_string: string },
+    readFileState?: Map<string, number>
+): string {
+    const absPath = resolve(input.file_path);
     try {
+        if (readFileState && existsSync(absPath)) {
+            if (!readFileState.has(absPath)) {
+                return "Error: You must read this file before editing. Use read_file first to see its current contents.";
+            }
+            if (statSync(absPath).mtimeMs !== readFileState.get(absPath)) {
+                return `Warning: ${input.file_path} was modified externally since your last read. Please read_file again before editing.`;
+            }
+        }
         const content = readFileSync(input.file_path, "utf-8");
         const actual = findActualString(content, input.old_string);
         if (!actual) {
@@ -210,11 +246,30 @@ function editFile(input: { file_path: string; old_string: string; new_string: st
         // split/join 是字面量替换；String.replace 会把 new_string 里的 $&、$1 当替换模式展开
         const updated = content.split(actual).join(input.new_string);
         writeFileSync(input.file_path, updated);
+        // 更新（防自伤）：编辑失败（found N times 等）不会走到这里，map 里还是有效旧值
+        if (readFileState) {
+            try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+        }
         const viaNormalization = actual !== input.old_string;
-        return `Successfully edited ${input.file_path}${viaNormalization ? " (matched via quote normalization)" : ""}`;
+        const diff = generateDiff(content, actual, input.new_string);
+        return `Successfully edited ${input.file_path}${viaNormalization ? " (matched via quote normalization)" : ""}\n\n${diff}`;
     } catch (e: any) {
         return `Error editing file: ${e.message}`;
     }
+}
+
+// 语义 diff：只描述这次替换（hunk 头 + 增删行），不是逐字符 diff——核对改动够用且省 token。
+// 行号 = 匹配点之前文本里的换行数 + 1；oldString 传 actual（文件里的原始子串），
+// 否则弯引号容错命中的场景里 diff 会和实际改动对不上。
+function generateDiff(oldContent: string, oldString: string, newString: string): string {
+    const beforeChange = oldContent.split(oldString)[0];
+    const lineNum = (beforeChange.match(/\n/g) || []).length + 1;
+    const oldLines = oldString.split("\n");
+    const newLines = newString.split("\n");
+    const parts: string[] = [`@@ -${lineNum},${oldLines.length} +${lineNum},${newLines.length} @@`];
+    for (const l of oldLines) parts.push(`- ${l}`);
+    for (const l of newLines) parts.push(`+ ${l}`);
+    return parts.join("\n");
 }
 
 async function listFiles(input: { pattern: string; path?: string }): Promise<string> {
