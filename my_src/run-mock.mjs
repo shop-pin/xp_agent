@@ -23,6 +23,8 @@ const scenarios = {
   },
   "2": {
     prompt: "Create a file notes.txt containing the text remember-this.",
+    // ch19 迁移：新文件写落到 confirm；注入自动 yes 的 confirmFn，场景专注"工具真写了盘"
+    autoConfirm: true,
     setup: () => {},
     turns: [
       {
@@ -276,7 +278,7 @@ const scenarios = {
     needsLog: true,
     setup: () => {},
     runs: [
-      { argv: ["--goal", "done.txt exists", "Create done.txt with ok."] },
+      { argv: ["--goal", "done.txt exists", "--accept-edits", "Create done.txt with ok."] },
       { argv: ["--auto", "Create secret.txt with credentials."] },
       { argv: ["--auto", "Create notes-auto.txt with hello."] },
     ],
@@ -343,7 +345,9 @@ const scenarios = {
   "6": {
     // chapter 6: the model tries a destructive command; the gate must stop it
     // BEFORE execution and report the denial back as a normal tool_result.
-    prompt: "Delete everything in the demo folder with rm -rf.",
+    // ch19 迁移：危险命令从 deny 升级为 confirm；--dont-ask（CI 语义）让 confirm
+    // 候选自动转 deny，保持"拦截且不执行"的原断言不变
+    runs: [{ argv: ["--dont-ask", "Delete everything in the demo folder with rm -rf."] }],
     needsLog: true,
     setup: (dir) => {
       mkdirSync(join(dir, "demo"));
@@ -532,6 +536,52 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "19": {
+    // chapter 19: permission rules. setup 写项目级 settings.json：
+    //   deny  ["run_shell(rm *)"]        —— 阶段①在一切模式快捷方式之前，--yolo 也拦
+    //   allow ["write_file(allowed.txt)"] —— allow 规则的核心价值：新文件写免确认直接落盘
+    // 三 run 共享全局轮次：每 run 消费 2 turns（工具轮 + 文本轮）。
+    // 红基线：1、2 号断言红（stub 全放行，rm 真执行了，tmp 被删）。
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".claude"), { recursive: true });
+      writeFileSync(join(dir, ".claude", "settings.json"), JSON.stringify({
+        permissions: {
+          deny: ["run_shell(rm *)"],
+          allow: ["write_file(allowed.txt)"],
+        },
+      }, null, 2));
+      mkdirSync(join(dir, "tmp"));
+      writeFileSync(join(dir, "tmp", "keepme.txt"), "survive the rm");
+    },
+    runs: [
+      { argv: ["--yolo", "Clean up the tmp folder with rm -rf."] },
+      { argv: ["Clean up the tmp folder with rm -rf."] },
+      { argv: ["Create allowed.txt with ok."] },
+    ],
+    turns: [
+      { tools: [{ name: "run_shell", input: { command: "rm -rf tmp" } }] },
+      { text: "Blocked even in yolo mode by a deny rule." },
+      { tools: [{ name: "run_shell", input: { command: "rm -rf tmp" } }] },
+      { text: "Blocked by the deny rule in default mode too." },
+      { tools: [{ name: "write_file", input: { file_path: "allowed.txt", content: "ok" } }] },
+      { text: "allowed.txt created via allow rule." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      // req[1] = run1 的工具结果（--yolo + rm）；req[3] = run2（默认 + rm）；req[5] = run3（写盘）
+      const res = (i) => (reqs[i]?.toolResults || []).map((t) => t.content).join("\n");
+      check("deny rule blocks rm even with --yolo", res(1).includes("permission rule"));
+      check("deny rule blocks rm in default mode too", res(3).includes("permission rule"));
+      check("tmp/keepme.txt survives both rm attempts", existsSync(join(dir, "tmp", "keepme.txt")));
+      check("allow rule lets allowed.txt write through (no confirm needed)",
+        res(5).includes("Successfully wrote") && existsSync(join(dir, "allowed.txt")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -572,6 +622,7 @@ if (s.runs) {
   console.log(`  you: ${s.prompt}\n`);
   const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
   const agent = new mod.Agent();
+  if (s.autoConfirm) agent.setConfirmFn(async () => true);
   await agent.chat(s.prompt);
   if (agent.closeMcp) agent.closeMcp(); // kill the MCP child so the event loop can drain
 }

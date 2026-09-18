@@ -37,6 +37,24 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         console.log(`(auto mode: a classifier gates dangerous actions)`);
     }
 
+    if (argv.includes("--yolo") || argv.includes("-y")) {
+        agent.setMode("bypassPermissions");
+        argv = argv.filter((t) => t !== "--yolo" && t !== "-y");
+        console.log(`(bypassPermissions: confirmations skipped; deny rules still apply)`);
+    }
+
+    if (argv.includes("--accept-edits")) {
+        agent.setMode("acceptEdits");
+        argv = argv.filter((t) => t !== "--accept-edits");
+        console.log(`(acceptEdits: file edits auto-approved, dangerous shell still confirmed)`);
+    }
+
+    if (argv.includes("--dont-ask")) {
+        agent.setMode("dontAsk");
+        argv = argv.filter((t) => t !== "--dont-ask");
+        console.log(`(dontAsk: anything needing confirmation is auto-denied)`);
+    }
+
     let goalCondition: string | undefined;
     if (argv.includes("--goal")) {
         const gi = argv.indexOf("--goal");
@@ -57,6 +75,15 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
+    });
+    // 复用同一个 readline 做确认，避免在同一个 stdin 上开第二个 interface
+    // 把第一个搞挂的经典 Node.js 坑
+    agent.setConfirmFn((_message: string) => {
+        return new Promise((resolve) => {
+            rl.question("  Allow? (y/n): ", (answer) => {
+                resolve(answer.toLowerCase().startsWith("y"));
+            });
+        });
     });
     printWelcome();
     return await new Promise<void>((resolve) => {

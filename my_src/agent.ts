@@ -1,7 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
+import * as readline from "readline";
 import { executeTool, toolDefinitions } from "./tools.js";
 import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
-import { checkPermission } from "./permissions.js";
+import { checkPermission, type PermissionMode } from "./permissions.js";
 import { maybeCompact } from "./context.js";
 import { recallMemories } from "./memory.js";
 import { runSubAgent } from "./subagent.js";
@@ -9,16 +10,18 @@ import { connectMcp, type McpConnection } from "./mcp.js";
 import { evaluateGoal, classifyAction } from "./autonomy.js";
 import { saveSession } from "./session.js";
 import { randomUUID } from "crypto";
-import { printToolCall, printAssistantText, printInfo, startSpinner, stopSpinner } from "./ui.js";
+import { printToolCall, printAssistantText, printInfo, printConfirmation, startSpinner, stopSpinner } from "./ui.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
 export class Agent {
     private client: Anthropic;
     private messages: Anthropic.MessageParam[] = [];
-    private mode: string = "default";
+    private mode: PermissionMode = "default";
     private mcp: McpConnection | null = null;
     private readFileState: Map<string, number> = new Map();
+    private confirmedPaths: Set<string> = new Set();
+    private confirmFn?: (message: string) => Promise<boolean>;
     private sessionId: string = randomUUID().slice(0, 8);
     private sessionStartTime: string = new Date().toISOString();
 
@@ -41,8 +44,27 @@ export class Agent {
         this.messages = [];
     }
 
-    setMode(mode: string): void {
+    setMode(mode: PermissionMode): void {
         this.mode = mode;
+    }
+
+    // REPL 注入复用已有 readline 的确认回调；未注入时（one-shot）confirmDangerous 临时开一个
+    setConfirmFn(fn: (message: string) => Promise<boolean>): void {
+        this.confirmFn = fn;
+    }
+
+    private async confirmDangerous(message: string): Promise<boolean> {
+        // 问什么先打出来（src 同款）：回调只收 y/n，展示是 agent 层的职责——
+        // 这样 REPL 注入的回调和 one-shot 的 fallback 都不漏"在批准什么"
+        printConfirmation(message);
+        if (this.confirmFn) return this.confirmFn(message);
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        return new Promise((resolve) => {
+            rl.question("  Allow? (y/n): ", (answer) => {
+                rl.close();
+                resolve(answer.toLowerCase().startsWith("y"));
+            });
+        });
     }
 
     restoreSession(data: { anthropicMessages?: any[] }): void {
@@ -172,17 +194,34 @@ export class Agent {
                     continue;
                 }
                 if (this.mode === "auto" && ["write_file", "edit_file", "run_shell"].includes(tu.name)) {
+                    // auto 的闸门只有分类器，静态流水线不再叠加（对齐 src）
                     const verdict = await classifyAction(tu.name, tu.input as Record<string, any>, this.transcriptText(), this.client, MODEL);
                     if (!verdict.allow) {
                         toolResult.push({type: "tool_result", tool_use_id:tu.id, content: `Blocked by auto-mode monitor: ${verdict.reason}`});
                         continue;
                     }
+                    const output = await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState);
+                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
+                    continue;
                 }
-                const blocked = checkPermission(tu.name, tu.input as Record<string, any>) === "deny"
-                    || (this.mode === "plan" && ["write_file", "edit_file", "run_shell"].includes(tu.name));
-                const output = blocked
-                    ? `Denied: ${tu.name} was blocked (${this.mode} mode).`
-                    : await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState);
+                const perm = checkPermission(tu.name, tu.input as Record<string, any>, this.mode);
+                if (perm.action === "deny") {
+                    printInfo(`Denied: ${perm.message}`);
+                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: `Denied: ${perm.message}` });
+                    continue;
+                }
+                if (perm.action === "confirm" && perm.message) {
+                    // 同一 message 确认一次后缓存；auto 的 confirm 是 reason 不是 path，绝不能缓存（ch26 的坑）
+                    if (!this.confirmedPaths.has(perm.message)) {
+                        const confirmed = await this.confirmDangerous(perm.message);
+                        if (!confirmed) {
+                            toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: "User denied this action." });
+                            continue;
+                        }
+                        this.confirmedPaths.add(perm.message);
+                    }
+                }
+                const output = await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState);
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }
             this.messages.push({ role: "user", content: toolResult });
