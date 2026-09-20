@@ -79,6 +79,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     const oneshot = argv.join(" ").trim()
     if (goalCondition) {
         await agent.pursueGoal(goalCondition, oneshot);
+        await agent.close(); // 同 one-shot：MCP 子进程 stdio 会挂住事件循环
         return;
     }
     if (oneshot) {

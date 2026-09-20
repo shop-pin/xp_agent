@@ -377,7 +377,7 @@ async function webFetch(input: { url: string; max_length?: number }): Promise<st
 const MAX_RESULT_CHARS = 50000;
 
 // 保留头尾、砍中间：编译错误摘要、测试结果统计这类关键信息往往在输出末尾
-function truncateResult(result: string): string {
+export function truncateResult(result: string): string {
     if (result.length <= MAX_RESULT_CHARS) return result;
     const keepEach = Math.floor((MAX_RESULT_CHARS - 60) / 2);
     return (

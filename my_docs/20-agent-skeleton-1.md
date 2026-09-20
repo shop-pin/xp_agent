@@ -115,3 +115,26 @@ if (budget.exceeded) {
 - 驱动修复两处：verify 双调用（runs 分支内 + 尾部各一次，断言打印两遍暴露——改后两分支各自 close+verify）；firstUserText 兼容 block 数组（cache_control 副作用，ch3/9/10 误红）
 - 真机冒烟观察点（下次冒烟必查）：智谱 Anthropic 兼容层对 cache_control 的容忍度——报 400 则加 opt-out 门控
 - 下一章 ch21 预告：4 层压缩（T1 budget→T2 snip→T3 microcompact→T4 auto-compact），本章的 lastInputTokenCount 是它的仪表原料；CONCURRENCY_SAFE_TOOLS 提前执行落地时要回头重审 ch18 的单回合批量场景
+
+## 真机冒烟记录（2026-09-20，覆盖 ch15–20 新增面）
+
+环境：智谱 glm-5.3-flash，沙盒 `test20-smoke/sandbox`（HOME 重定向 `test20-smoke/home` 隔离会话）。基线：mock 16/16 绿（1–12,15,18,19,20；13/14/16 无场景）。
+
+| # | 场景 | 结果 | 关键证据 |
+|---|------|------|---------|
+| 1 | 基础链路 + cache_control | ✅ | **无 400，`1536 cached` 真实命中**——opt-out 门控不需要 |
+| 2 | MCP 双 server 前缀路由 | ✅ | `mcp__demo__add(20+22)=42` + `mcp__demo2__echo("pong2")` |
+| 3 | deny 规则连 --yolo 也拦 | ✅ | `rm -rf ./purge-me` → "Denied by permission rule"，夹具完好，模型自查确认 |
+| 4 | read-before-edit happy path | ✅ | read→edit 顺序执行，Alice→Bob 落盘 |
+| 5 | --max-turns 1 截停 | ✅ | 响应后截停，工具全被 refusal 配对，无 crash |
+| 6 | --max-cost 0.001 截停 | ✅ | $0.0019 > $0.001 触发；瑕疵：消息显示 `$0.00`（toFixed(2) 精度，逻辑正确） |
+| 7 | --goal pursue | ✅* | MET + write 落盘；**首次跑发现挂死 bug（见下），修复后重跑 exit=0** |
+| 8 | 会话落盘 + resume | ✅ | sessions/ 10 个 json、metadata 完整；resume 恢复 2 条消息召回 codeword |
+
+**发现 1（真 bug，已修）：--goal 分支漏 `agent.close()` 进程挂死。** ch14 修过 one-shot + MCP 挂死（one-shot 分支有注释），但 `--goal` 分支 `pursueGoal` 后直接 return——MCP 子进程 stdio 挂住事件循环永不退出。当时 ch14 的 goal 测试没暴露是因为沙盒无 .mcp.json。修复：cli.ts goal 分支 return 前补 `await agent.close()`，重跑 exit=0。**教训：资源清理修复要扫所有"会退出的路径"，不是只修报告的那条。**
+
+**发现 2（非 bug，记录）：CLAUDE.md 双重注入。** 沙盒嵌在 xp_agent 仓库内，`loadClaudeMd` 向上逐层收集（walk-up 是设计行为）→ sandbox/ 与仓库根两份同内容 CLAUDE.md 都进 first message。沙盒放仓库外即消失。
+
+**发现 3（观察结论）：cache_control 无需 opt-out 门控**——智谱兼容层接受块数组 system + 消息断点，缓存命中真实发生（`N cached` 首轮显示，疑似按 cache_creation 计费，费用量级合理）。
+
+工具备忘：冒烟输出过滤 spinner 时勿用 `grep -v Thinking`——最终文本与最后一个 spinner 帧同行会被连带过滤（本次 8B"回复丢失"即此假象）。

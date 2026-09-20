@@ -1,9 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "readline";
-import { executeTool, toolDefinitions } from "./tools.js";
+import { executeTool, toolDefinitions, truncateResult } from "./tools.js";
 import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
 import { checkPermission, type PermissionMode } from "./permissions.js";
-import { maybeCompact } from "./context.js";
 import { recallMemories } from "./memory.js";
 import { runSubAgent } from "./subagent.js";
 import { McpManager } from "./mcp.js";
@@ -11,9 +10,33 @@ import { withRetry } from "./retry.js";
 import { evaluateGoal, classifyAction } from "./autonomy.js";
 import { saveSession } from "./session.js";
 import { randomUUID } from "crypto";
+import { mkdirSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 import { printToolCall, printAssistantText, printInfo, printConfirmation, printCost, startSpinner, stopSpinner } from "./ui.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
+
+// ─── ch21：四层压缩常量 ──────────────────────────────────────
+// T1 budget → T2 snip → T3 microcompact → T4 auto-compact。
+// T1–T3 零 API 成本（原地改 this.messages），T4 是唯一花一次摘要请求的层。
+const SNIPPABLE_TOOLS = new Set(["read_file", "grep_search", "list_files", "run_shell"]);
+const SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]";
+const SNIP_THRESHOLD = 0.60;
+// 热缓存覆盖线：utilization 超过它，就算缓存还热也允许改写老结果——
+// 溢出风险比重建一次缓存更贵（0.60 < 0.75 < 0.85 三线各管一层）
+const SNIP_HOT_OVERRIDE = 0.75;
+const MICROCOMPACT_IDLE_MS = 5 * 60 * 1000; // 缓存 5 分钟没用就算冷
+const KEEP_RECENT_RESULTS = 3;
+
+const MODEL_CONTEXT: Record<string, number> = {
+    "glm-4.7-flash": 128000,
+    "glm-5.3-flash": 128000,
+    "claude-sonnet-4-6": 200000,
+};
+function getContextWindow(model: string): number {
+    return MODEL_CONTEXT[model] || 200000;
+}
 
 export class Agent {
     private client: Anthropic;
@@ -37,6 +60,10 @@ export class Agent {
     private currentTurns = 0;
     private maxCostUsd: number | null = null;
     private maxTurns: number | null = null;
+    // ch21 压缩仪表：最近一次 API 调用时刻——T2/T3 用它判断缓存冷热
+    private lastApiCallTime = 0;
+    // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
+    private effectiveWindow: number;
 
     constructor() {
         // 可选：封 SDK 自带的重试层（默认 2）。MINI_CLAUDE_SDK_MAX_RETRIES=0
@@ -52,6 +79,7 @@ export class Agent {
             baseURL: process.env.ANTHROPIC_BASE_URL,
             ...sdkRetries,
         });
+        this.effectiveWindow = getContextWindow(MODEL) - 20000;
     }
 
     history(): Anthropic.MessageParam[] {
@@ -98,6 +126,192 @@ export class Agent {
             return { exceeded: true, reason: `cost $${this.getCurrentCostUsd().toFixed(2)} exceeds max-cost $${this.maxCostUsd}` };
         }
         return { exceeded: false, reason: "" };
+    }
+
+    // ═══ ch21：四层压缩（本章由你写）═════════════════════════════
+    // 仪表：utilization = lastInputTokenCount / effectiveWindow
+    // 调用点已接好：T1–T3 走 runCompressionPipeline()（每次发请求前），
+    // T4 走 checkAndCompact()（turn 边界：用户消息刚 push、循环未开始）。
+
+    // 组装层：顺序即语义，各一行。
+    runCompressionPipeline(): void {
+        this.budgetToolResults();
+        this.snipStaleResults();
+        this.microcompact();
+    }
+
+    // ── T1 budget：把超大 tool_result 掐头去尾缩进预算。零 API 成本，无缓存门控
+    //    （它只处理大块头——那种结果留着必溢出，缩了顶多重建一次缓存）。
+    private budgetToolResults(): void {
+        const utilization = this.lastInputTokenCount / this.effectiveWindow;
+        if (utilization < 0.5) return;
+        const budget = utilization > 0.7 ? 15000 : 30000;
+
+        for (const msg of this.messages) {
+            if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+            for (let i = 0; i < msg.content.length; i++) {
+                const block = msg.content[i] as any;
+                if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > budget) {
+                    const keepEach = Math.floor((budget - 80) / 2);
+                    block.content = block.content.slice(0, keepEach) +
+                        `\n\n[... budgeted: ${block.content.length - keepEach * 2} chars truncated ...]\n\n` +
+                        block.content.slice(-keepEach);
+                }
+            }
+        }
+    }
+
+    // ── T2 snip：同文件旧读去重 + 只保最近 N 条，被剪的整个 tool_result 换成
+    //    SNIP_PLACEHOLDER。双门控是本层灵魂：缓存热且 utilization 未越覆盖线 → 忍住。
+    private snipStaleResults(): void {
+        const utilization = this.lastInputTokenCount / this.effectiveWindow;
+        const cacheHot = this.lastApiCallTime > 0 && (Date.now() - this.lastApiCallTime) < MICROCOMPACT_IDLE_MS;
+        if (cacheHot && utilization < SNIP_HOT_OVERRIDE) return;
+        if (utilization < SNIP_THRESHOLD) return;
+
+        // 收集所有可剪结果（已剪过的 placeholder 不再收），带定位与反查元数据
+        const results: { msgIdx: number; blockIdx: number; toolName: string; filePath?: string }[] = [];
+        for (let mi = 0; mi < this.messages.length; mi++) {
+            const msg = this.messages[mi];
+            if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+            for (let bi = 0; bi < msg.content.length; bi++) {
+                const block = msg.content[bi] as any;
+                if (block.type === "tool_result" && typeof block.content === "string" && block.content !== SNIP_PLACEHOLDER) {
+                    const toolInfo = this.findToolUseById(block.tool_use_id);
+                    if (toolInfo && SNIPPABLE_TOOLS.has(toolInfo.name)) {
+                        results.push({ msgIdx: mi, blockIdx: bi, toolName: toolInfo.name, filePath: toolInfo.input?.file_path });
+                    }
+                }
+            }
+        }
+
+        if (results.length <= KEEP_RECENT_RESULTS) return;
+
+        // 两个剪枝下标集合，最后统一替换（别边遍历边改）
+        const toSnip = new Set<number>();
+        const seenFiles = new Map<string, number[]>(); // file_path → 出现下标
+
+        for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            if (r.toolName === "read_file" && r.filePath) {
+                const existing = seenFiles.get(r.filePath) || [];
+                existing.push(i);
+                seenFiles.set(r.filePath, existing);
+            }
+        }
+        // ① 同文件旧读：同一 file_path 只留最后一次
+        for (const indices of seenFiles.values()) {
+            if (indices.length > 1) {
+                for (let j = 0; j < indices.length - 1; j++) toSnip.add(indices[j]);
+            }
+        }
+        // ② 保最近：最老的 results.length - KEEP_RECENT_RESULTS 条剪掉
+        const snipBefore = results.length - KEEP_RECENT_RESULTS;
+        for (let i = 0; i < snipBefore; i++) toSnip.add(i);
+
+        for (const idx of toSnip) {
+            const r = results[idx];
+            const block = (this.messages[r.msgIdx].content as any[])[r.blockIdx];
+            block.content = SNIP_PLACEHOLDER;
+        }
+    }
+
+    // ── T3 microcompact：缓存已冷才允许的"大扫除"——所有 tool_result 只保最近
+    //    KEEP_RECENT_RESULTS 条，其余换成 "[Old result cleared]"。
+    private microcompact(): void {
+        if (!this.lastApiCallTime || (Date.now() - this.lastApiCallTime) < MICROCOMPACT_IDLE_MS) return;
+
+        const allResults: { msgIdx: number; blockIdx: number }[] = [];
+        for (let mi = 0; mi < this.messages.length; mi++) {
+            const msg = this.messages[mi];
+            if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+            for (let bi = 0; bi < msg.content.length; bi++) {
+                const block = msg.content[bi] as any;
+                if (block.type === "tool_result" && typeof block.content === "string" &&
+                    block.content !== SNIP_PLACEHOLDER && block.content !== "[Old result cleared]") {
+                    allResults.push({ msgIdx: mi, blockIdx: bi });
+                }
+            }
+        }
+
+        const clearCount = allResults.length - KEEP_RECENT_RESULTS;
+        for (let i = 0; i < clearCount && i < allResults.length; i++) {
+            const r = allResults[i];
+            (this.messages[r.msgIdx].content as any[])[r.blockIdx].content = "[Old result cleared]";
+        }
+    }
+
+    // ── T4 门：唯一要花 API 的一层。0.85 线，turn 边界才检查（见调用点注释）。
+    async checkAndCompact(): Promise<void> {
+        if (this.lastInputTokenCount > this.effectiveWindow * 0.85) {
+            printInfo("Context window filling up, compacting conversation...");
+            await this.compactAnthropic();
+            printInfo("Conversation compacted.");
+        }
+    }
+
+    // 摘要重写（T4 主体）。硬不变式：调用时最后一条必须是纯 user 文本消息——
+    // 它会被 slice(0,-1) 摘出来最后塞回去；如果它是 tool_result，前面的 tool_use
+    // 就孤儿化了，摘要请求直接 400（与 ch20 refusal 配对同源：历史必须自洽）。
+    async compactAnthropic(): Promise<void> {
+        if (this.messages.length < 4) return;
+        const lastUserMsg = this.messages[this.messages.length - 1];
+        const summaryResp = await this.client.messages.create({
+            model: MODEL,
+            max_tokens: 2048,
+            system: "You are a conversation summarizer. Be concise but preserve important details.",
+            messages: [
+                ...this.messages.slice(0, -1),
+                {
+                    role: "user",
+                    content: "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.",
+                },
+            ],
+        });
+        const summaryText =
+            summaryResp.content[0]?.type === "text"
+                ? summaryResp.content[0].text
+                : "No summary available.";
+        this.messages = [
+            { role: "user", content: `[Previous conversation summary]\n${summaryText}` },
+            { role: "assistant", content: "Understood. I have the context from our previous conversation. How can I continue helping?" },
+        ];
+        if (lastUserMsg.role === "user") this.messages.push(lastUserMsg);
+        this.lastInputTokenCount = 0;
+    }
+
+    // ── 大结果持久化：>30KB 的工具结果落盘 ~/.mini-claude/tool-results/，
+    //    上下文里只留预览 + 文件路径。顺序是灵魂：先落盘，再生成预览。
+    private persistLargeResult(toolName: string, result: string): string {
+        const THRESHOLD = 30 * 1024;
+        if (Buffer.byteLength(result) <= THRESHOLD) return result;
+
+        const dir = join(homedir(), ".mini-claude", "tool-results");
+        mkdirSync(dir, { recursive: true });
+        // uuid 后缀：并行工具同一毫秒落盘时，纯时间戳文件名会让第二次写覆盖第一次
+        const filename = `${Date.now()}-${randomUUID().slice(0, 8)}-${toolName}.txt`;
+        const filepath = join(dir, filename);
+        writeFileSync(filepath, result);
+
+        const lines = result.split("\n");
+        const preview = lines.slice(0, 200).join("\n");
+        const sizeKB = (Buffer.byteLength(result) / 1024).toFixed(1);
+
+        // 截断在落盘之后：全量已安全在磁盘上，这里只是防病态预览（单行几百 KB 的文件）
+        return truncateResult(`[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. You can use read_file to see the full result.]\n\nPreview (first 200 lines):\n${preview}`);
+    }
+
+    // 机械反查：tool_use_id → { name, input }。给 T2 判定"这条结果出自哪个工具"用。
+    private findToolUseById(toolUseId: string): { name: string; input: any } | null {
+        for (const msg of this.messages) {
+            if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+            for (const block of msg.content as any[]) {
+                if (block.type === "tool_use" && block.id === toolUseId) {
+                    return { name: block.name, input: block.input };
+                }
+            }
+        }
+        return null;
     }
 
     // REPL 注入复用已有 readline 的确认回调；未注入时（one-shot）confirmDangerous 临时开一个
@@ -223,10 +437,15 @@ export class Agent {
             ? `${userText}\n\n${buildUserContextReminder()}`
             : userText;
         this.messages.push({ role: "user", content: content });
+        // T4 在 turn 边界检查：此刻最后一条消息是纯 user 文本，compactAnthropic 的
+        // slice 不变式才成立。放进 while 顶的话，工具轮的末尾是 tool_result——
+        // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发（ch14 真机发现 5）
+        await this.checkAndCompact();
         await this.ensureMcp();
         const mcpTools: Anthropic.Tool[] = this.mcpManager.getToolDefinitions();
         while (true) {
-            this.messages = await maybeCompact(this.messages, this.client, MODEL);
+            // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
+            this.runCompressionPipeline();
             startSpinner();
             let firstText = true;
             let response: Anthropic.Message;
@@ -263,6 +482,7 @@ export class Agent {
             this.totalCacheCreationTokens += cacheCreation;
             this.totalOutputTokens += u.output_tokens;
             this.lastInputTokenCount = u.input_tokens + cacheRead + cacheCreation + u.output_tokens;
+            this.lastApiCallTime = Date.now();
             this.messages.push({ role: "assistant", content: response.content });
             
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
@@ -318,7 +538,7 @@ export class Agent {
                         toolResult.push({type: "tool_result", tool_use_id:tu.id, content: `Blocked by auto-mode monitor: ${verdict.reason}`});
                         continue;
                     }
-                    const output = await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState);
+                    const output = this.persistLargeResult(tu.name, await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState));
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
                     continue;
                 }
@@ -339,7 +559,7 @@ export class Agent {
                         this.confirmedPaths.add(perm.message);
                     }
                 }
-                const output = await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState);
+                const output = this.persistLargeResult(tu.name, await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState));
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }
             this.messages.push({ role: "user", content: toolResult });

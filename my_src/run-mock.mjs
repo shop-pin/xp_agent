@@ -46,29 +46,43 @@ const scenarios = {
     },
   },
   "7": {
-    // chapter 7: read 3 files (4 main-loop requests) — by the final request the
-    // history exceeds the threshold, an aux summarize call fires, and the last
-    // request must carry [summary, ...recent] instead of the full history.
-    prompt: "Read a.txt, then b.txt, then c.txt, then summarize.",
+    // chapter 7 → ch21 迁移：T4 auto-compact 沿用 aux-track 结构（旧 maybeCompact：
+    // while 顶按消息条数摘要——已退役）。T4 在 turn 边界触发，门是
+    // 0.85 × effectiveWindow（128000-20000 = 108000 → 91800）。单个 goal run 就有
+    // 多条 user turn：pursueGoal 循环里每次 chat() 都是一个边界。
+    // turn1（t0-t3）读完三个文件，末响应注入 usage input=100000（100500 > 91800）
+    // → evaluator 判 NOT_MET 后，第二次 chat() 一进来就该触发摘要请求（compact
+    // aux track），重写后的历史 = [summary, ack, feedback]。
+    // turn1 恰好 3 条 read 结果：T2 的"保最近 3"严格静默（results.length <= 3），
+    // 三个不同文件也不触发同文件去重——本场景只测 T4，不掺 T1/T2。
     needsLog: true,
     setup: (dir) => {
       writeFileSync(join(dir, "a.txt"), "alpha");
       writeFileSync(join(dir, "b.txt"), "beta");
       writeFileSync(join(dir, "c.txt"), "gamma");
     },
+    runs: [{ argv: ["--goal", "a.txt, b.txt and c.txt have all been read", "Read a.txt, then b.txt, then c.txt."] }],
     tracks: {
       main: {
         turns: [
           { tools: [{ name: "read_file", input: { file_path: "a.txt" } }] },
           { tools: [{ name: "read_file", input: { file_path: "b.txt" } }] },
           { tools: [{ name: "read_file", input: { file_path: "c.txt" } }] },
-          { text: "All three read: alpha, beta, gamma." },
+          { text: "All three read: alpha, beta, gamma.", usage: { input_tokens: 100000, output_tokens: 500 } },
+          { text: "All three files were read before the compaction happened." },
         ],
       },
-      // the aux summarize call is recognized by its system prompt
+      // contract anchor: agent.ts compactAnthropic 的 system 提示语，勿改两边
       compact: {
-        match: "Summarize the conversation",
+        match: "conversation summarizer",
         turns: [{ text: "Earlier: a.txt=alpha, b.txt=beta, c.txt=gamma." }],
+      },
+      goal: {
+        match: "goal evaluator",
+        turns: [
+          { text: "NOT_MET: the files have not been read yet." },
+          { text: "MET" },
+        ],
       },
     },
     verify: (dir, logPath) => {
@@ -78,17 +92,20 @@ const scenarios = {
       const reqs = events.filter((e) => e.type === "request");
       const mainReqs = reqs.filter((e) => e.track === "main");
       const compactReqs = reqs.filter((e) => e.track === "compact");
-      check("4 main-loop model calls", mainReqs.length === 4);
-      check("aux summarize call went out", compactReqs.length === 1);
-      check("transcript is plain text (tool pairs rendered, not split)",
-        typeof compactReqs[0]?.firstUserText === "string"
-        && compactReqs[0].firstUserText.includes("[tool call / result]")
-        && compactReqs[0].firstUserText.includes("user: "));
-      check("history shrank to summary + recent (3 msgs, was 7)", mainReqs[3]?.messageCount === 3);
-      check("summary from aux call landed at history head",
-        typeof mainReqs[3]?.firstUserText === "string"
-        && mainReqs[3].firstUserText.includes("[Summary of earlier conversation]")
-        && mainReqs[3].firstUserText.includes("a.txt=alpha"));
+      check("5 main-loop model calls (4 in turn1 + 1 in turn2)", mainReqs.length === 5);
+      check("aux summarize call went out at the turn-2 boundary, non-streamed",
+        compactReqs.length === 1 && compactReqs[0]?.stream === false);
+      check("summary request carries the full turn-1 history (8 msgs + summary instruction)",
+        compactReqs[0]?.messageCount === 9);
+      check("summary request carries real tool results (alpha..gamma, not a text transcript)",
+        (compactReqs[0]?.toolResults || []).map((t) => t.content).join(" ").includes("alpha")
+        && (compactReqs[0]?.toolResults || []).map((t) => t.content).join(" ").includes("gamma"));
+      check("turn-2 history shrank to summary + ack + feedback (3 msgs)",
+        mainReqs[4]?.messageCount === 3);
+      check("summary text landed at history head",
+        typeof mainReqs[4]?.firstUserText === "string"
+        && mainReqs[4].firstUserText.includes("[Previous conversation summary]")
+        && mainReqs[4].firstUserText.includes("a.txt=alpha"));
       if (!ok) process.exitCode = 1;
     },
   },
@@ -642,6 +659,86 @@ const scenarios = {
       check("tmp/keepme.txt survives both rm attempts", existsSync(join(dir, "tmp", "keepme.txt")));
       check("allow rule lets allowed.txt write through (no confirm needed)",
         res(5).includes("Successfully wrote") && existsSync(join(dir, "allowed.txt")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
+  "21": {
+    // chapter 21: T1 budget + T2 snip（大 usage 驱动）+ persistLargeResult。
+    // 两 run 共享 main track，轮次区间互不越界（ch20 教训：条件性消费的 turn
+    // 会泄漏给后续 run；本场景两 run 都无条件消费，排位仍按区间注释）。
+    // run1（t0-t4）T1+T2：bigfile ~20K 读两次 + other/other2 两个小文件各一次。
+    //   t0-t3 响应全部注入 usage input=100000（util = 100500/108000 ≈ 0.93 >
+    //   0.75 热覆盖线——mock 请求间隔毫秒级缓存恒热，T2 只有越过 SNIP_HOT_OVERRIDE
+    //   才肯动改写）。关键：T2 在 results.length <= KEEP_RECENT_RESULTS(3) 时
+    //   提前 return——前 3 条结果期间同文件去重也不跑（src 语义）。所以必须凑到
+    //   第 4 次读，t4 请求才同时触发"保 3 剪最老"和"同文件旧读去重"（都指向 r0）：
+    //   t1 请求：T1 先跑 → r0 被 budget 化（T2 只有 1 条结果，不剪）
+    //   t2 请求：r1 也被 budget 化；T2 仍只有 2 条，不剪
+    //   t4 请求：r0 整条换成 placeholder；r1（同文件最新读）存活；小结果原样
+    // run2（t5-t6）persist：huge ~45KB、1000 行（预览 200 行 << 全量——单行超长
+    //   文件会把"预览"变"全文"，夹具必须多行）；usage 默认 → 压缩门全关，
+    //   纯测 persist：>30KB 落盘 HOME 沙箱 tool-results/，上下文只剩预览。
+    // T3 microcompact 在 mock 里无法自然触发（要求缓存冷 5 分钟），靠 review 兜底。
+    needsLog: true,
+    setup: (dir) => {
+      writeFileSync(join(dir, "bigfile.txt"), "BIGDATA-0\n" + "x".repeat(20000));
+      writeFileSync(join(dir, "other.txt"), "other-alpha-content");
+      writeFileSync(join(dir, "other2.txt"), "other-beta-content");
+      const lines = Array.from({ length: 1000 }, (_, i) => `HUGELINE-${String(i).padStart(4, "0")}-abcdefghijklmnopqrstuvwxyz`);
+      writeFileSync(join(dir, "huge.txt"), lines.join("\n"));
+    },
+    runs: [
+      { argv: ["Read bigfile.txt, then bigfile.txt again, then other.txt, then other2.txt, then tell me bigfile's first line."] },
+      { argv: ["Read huge.txt and tell me its first line."] },
+    ],
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "read_file", input: { file_path: "bigfile.txt" } }], usage: { input_tokens: 100000, output_tokens: 500 } },
+          { tools: [{ name: "read_file", input: { file_path: "bigfile.txt" } }], usage: { input_tokens: 100000, output_tokens: 500 } },
+          { tools: [{ name: "read_file", input: { file_path: "other.txt" } }], usage: { input_tokens: 100000, output_tokens: 500 } },
+          { tools: [{ name: "read_file", input: { file_path: "other2.txt" } }], usage: { input_tokens: 100000, output_tokens: 500 } },
+          { text: "The first line of bigfile.txt is BIGDATA-0." },
+          { tools: [{ name: "read_file", input: { file_path: "huge.txt" } }] },
+          { text: "The first line of huge.txt is HUGELINE-0000." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const SNIP = "[Content snipped - re-read if needed]";
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request").filter((e) => e.track === "main");
+      const tr = (i) => (reqs[i]?.toolResults || []);
+      check("run1: T1 budgeted the first big result already by the 2nd request",
+        tr(1).length >= 1 && tr(1)[0].content.includes("[... budgeted:"));
+      check("run1: both bigfile reads budgeted by the 3rd request (T1 runs every loop)",
+        tr(2).length >= 2 && tr(2)[0].content.includes("[... budgeted:") && tr(2)[1].content.includes("[... budgeted:"));
+      check("run1: T2 stayed silent while results <= KEEP_RECENT (3rd request intact)",
+        tr(2).length >= 2 && tr(2).every((t) => t.content !== SNIP));
+      check("run1: T2 snipped the stale same-file read at the 5th request",
+        tr(4).length >= 4 && tr(4)[0].content === SNIP);
+      check("run1: the latest same-file read survived (kept as recent)",
+        tr(4)[1].content.includes("[... budgeted:"));
+      check("run1: small fresh results stayed real content",
+        tr(4)[2].content.includes("other-alpha") && tr(4)[3].content.includes("other-beta"));
+      check("run2: context does NOT carry the full 45KB result",
+        tr(6).length >= 1 && !tr(6)[0].content.includes("HUGELINE-0999"));
+      check("run2: context carries the persisted preview instead",
+        tr(6).length >= 1 && tr(6)[0].content.includes("[Result too large (")
+        && tr(6)[0].content.includes("Preview (first 200 lines):")
+        && tr(6)[0].content.includes("HUGELINE-0000"));
+      let persisted = [];
+      try {
+        persisted = readdirSync(join(dir, ".mini-claude", "tool-results")).filter((f) => f.endsWith(".txt"));
+      } catch {}
+      check("run2: full output landed in HOME-sandbox tool-results/", persisted.length >= 1);
+      if (persisted.length >= 1) {
+        const saved = readFileSync(join(dir, ".mini-claude", "tool-results", persisted[0]), "utf-8");
+        check("run2: saved file holds the FULL output (no loss, incl. the tail)",
+          saved.includes("HUGELINE-0000") && saved.includes("HUGELINE-0999"));
+      }
       if (!ok) process.exitCode = 1;
     },
   },
