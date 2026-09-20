@@ -1,9 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "readline";
 import { executeTool, toolDefinitions, truncateResult } from "./tools.js";
-import { buildSystemPrompt, buildUserContextReminder } from "./prompt.js";
+import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder } from "./prompt.js";
 import { checkPermission, type PermissionMode } from "./permissions.js";
-import { recallMemories } from "./memory.js";
+import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
 import { runSubAgent } from "./subagent.js";
 import { McpManager } from "./mcp.js";
 import { withRetry } from "./retry.js";
@@ -64,6 +64,10 @@ export class Agent {
     private lastApiCallTime = 0;
     // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
     private effectiveWindow: number;
+    // ch22 语义召回：prefetch 句柄 + 防重复注入簿记（按记忆文件绝对路径）
+    private memoryPrefetch: MemoryPrefetch | null = null;
+    private alreadySurfacedMemories: Set<string> = new Set();
+    private sessionMemoryBytes = 0;
 
     constructor() {
         // 可选：封 SDK 自带的重试层（默认 2）。MINI_CLAUDE_SDK_MAX_RETRIES=0
@@ -363,16 +367,70 @@ export class Agent {
         await this.mcpManager.disconnectAll();
     }
 
+    // ─── Memory prefetch 生命周期（ch22）────────────────────────
+
+    // 旁路查询：独立小请求（非流式、temperature 0、256 token 上限），
+    // 给 memory selector 这类"让模型做决策"的辅助调用用，主对话历史不掺和
+    private buildSideQuery(): SideQueryFn {
+        const client = this.client;
+        const model = MODEL;
+        return async (system, userMessage) => {
+            const resp = await client.messages.create({
+                model, max_tokens: 256, system, temperature: 0,
+                messages: [{ role: "user", content: userMessage }],
+            });
+            return resp.content
+                .filter((b): b is Anthropic.TextBlock => b.type === "text")
+                .map((b) => b.text).join("");
+        };
+    }
+
+    // 消费已落定的 prefetch：把召回的记忆追加进最后一条 user 消息（保持
+    // user/assistant 交替不变式），并记入已曝光集合——同一条记忆一个会话只注入一次
+    private async consumeMemoryPrefetchIfReady(messages: Anthropic.MessageParam[]): Promise<void> {
+        const pf = this.memoryPrefetch;
+        if (!pf || !pf.settled || pf.consumed) return;
+        pf.consumed = true;
+        const memories = await pf.promise;
+        if (memories.length === 0) return;
+        const injectionText = formatMemoriesForInjection(memories);
+        const last = messages[messages.length - 1];
+        if (last && last.role === "user") {
+            if (typeof last.content === "string" || last.content == null) {
+                last.content = (last.content || "") + "\n\n" + injectionText;
+            } else if (Array.isArray(last.content)) {
+                (last.content as any[]).push({ type: "text", text: injectionText });
+            }
+        } else {
+            messages.push({ role: "user", content: injectionText });
+        }
+        for (const m of memories) {
+            this.alreadySurfacedMemories.add(m.path);
+            this.sessionMemoryBytes += Buffer.byteLength(m.content);
+        }
+    }
+
+    // turn 边界调用（chat() 开头）：先排掉上一轮遗留的 prefetch——若它在上一轮
+    // 最后一次 API 调用之后才落定，不排走就永久丢失；再为本轮发起新的召回
+    private async startMemoryPrefetchForTurn(userMessage: string, messages: Anthropic.MessageParam[]): Promise<void> {
+        await this.consumeMemoryPrefetchIfReady(messages);
+        const sq = this.buildSideQuery();
+        this.memoryPrefetch = startMemoryPrefetch(
+            userMessage, sq,
+            this.alreadySurfacedMemories, this.sessionMemoryBytes,
+        );
+    }
+
     // ─── Prefix caching（Anthropic）────────────────────────────
-    // system 拆成块数组：静态主体（指令+环境）打 cache_control 断点，
-    // 动态尾巴（memory 召回）放断点之后。断点前的所有内容（含工具 schema，
-    // 它们在 system 之前渲染）命中服务端前缀缓存
-    private buildAnthropicSystem(userText: string): Anthropic.TextBlockParam[] {
+    // system 拆成两个块：静态主体打 cache_control 断点（断点前的所有内容，
+    // 含工具 schema，命中服务端前缀缓存）；动态上下文（环境 + memory 索引）
+    // 放断点之后——模型写一条记忆索引就变，进了静态块等于每次写记忆都作废缓存
+    private buildAnthropicSystem(): Anthropic.TextBlockParam[] {
+        const dynamicText = buildDynamicSystemContext().trim();
         const blocks: Anthropic.TextBlockParam[] = [
-            { type: "text", text: buildSystemPrompt(), cache_control: { type: "ephemeral" } },
+            { type: "text", text: buildStaticSystemPrompt(), cache_control: { type: "ephemeral" } },
         ];
-        const mem = recallMemories(userText).trim();
-        if (mem) blocks.push({ type: "text", text: mem });
+        if (dynamicText) blocks.push({ type: "text", text: dynamicText });
         return blocks;
     }
 
@@ -441,11 +499,15 @@ export class Agent {
         // slice 不变式才成立。放进 while 顶的话，工具轮的末尾是 tool_result——
         // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发（ch14 真机发现 5）
         await this.checkAndCompact();
+        // 语义召回：turn 边界发起异步 prefetch，不挡主循环；每轮请求前轮询一次，
+        // selector 一落定立刻注入，模型尽早看到记忆
+        await this.startMemoryPrefetchForTurn(userText, this.messages);
         await this.ensureMcp();
         const mcpTools: Anthropic.Tool[] = this.mcpManager.getToolDefinitions();
         while (true) {
             // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
             this.runCompressionPipeline();
+            await this.consumeMemoryPrefetchIfReady(this.messages);
             startSpinner();
             let firstText = true;
             let response: Anthropic.Message;
@@ -456,7 +518,7 @@ export class Agent {
                     const stream = this.client.messages.stream({
                         model: MODEL,
                         max_tokens: 4096,
-                        system: this.buildAnthropicSystem(userText),
+                        system: this.buildAnthropicSystem(),
                         tools: [...toolDefinitions, ...mcpTools],
                         messages: this.withCacheBreakpoints(this.messages),
                     });

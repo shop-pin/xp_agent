@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "path";
 import { execFileSync, execSync } from "child_process";
 import { glob } from "glob";
 import type Anthropic from "@anthropic-ai/sdk";
+import { getMemoryDir, updateMemoryIndex } from "./memory.js";
 
 export const toolDefinitions: Anthropic.Tool[] = [
     {
@@ -209,6 +210,7 @@ function writeFile(input: { file_path: string; content: string }, readFileState?
             mkdirSync(dir, { recursive: true });
         }
         writeFileSync(input.file_path, input.content);
+        autoUpdateMemoryIndex(absPath);
         // 更新（防自伤）：不回写的话下次写/编辑会把自己上次写入误判成"外部修改"
         if (readFileState) {
             try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
@@ -218,6 +220,17 @@ function writeFile(input: { file_path: string; content: string }, readFileState?
     } catch (e: any) {
         return `Error writing file: ${e.message}`;
     }
+}
+
+// write_file 落进记忆目录时自动重建 MEMORY.md 索引——模型只管写记忆文件，
+// 索引永远机器维护。解析失败/非记忆写入全部静默跳过（非关键路径）
+function autoUpdateMemoryIndex(filePath: string): void {
+    try {
+        const memDir = getMemoryDir();
+        if (filePath.startsWith(memDir) && filePath.endsWith(".md") && !filePath.endsWith("MEMORY.md")) {
+            updateMemoryIndex();
+        }
+    } catch { /* non-critical */ }
 }
 
 function editFile(

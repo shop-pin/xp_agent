@@ -5,6 +5,7 @@
 //   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
 import { startMock } from "../steps/mock-anthropic.mjs";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync } from "fs";
+import { createHash } from "crypto";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { pathToFileURL, fileURLToPath } from "url";
@@ -110,34 +111,95 @@ const scenarios = {
     },
   },
   "8": {
-    // chapter 8: a memory dir on disk holds two files; the user asks about
-    // deployment. recallMemories() must score the deploy memory above zero and
-    // inject it into the SYSTEM prompt — while the irrelevant one stays out.
+    // ch22 迁移：memory 重构为"4 类型 + 项目隔离 + 语义召回 + 异步 prefetch 注入"。
+    // 旧机制（cwd 下 .mini-memory 关键词打分 → 注入 system）已退役：
+    //   ① 记忆挪到 HOME 沙箱 ~/.mini-claude/projects/<sha256(cwd)前16>/memory/
+    //     （项目隔离），setup 按运行时同款 hash 预置两条记忆
+    //   ② 召回走 sideQuery selector（aux track：非流式 / temperature 0 / 256tok），
+    //     JSON 契约 {"selected_memories": [...]}，≤5 条
+    //   ③ 注入进最后一条 user 消息（<system-reminder> 包裹），不再进 system；
+    //     system 里只留 Memory System 说明 + 索引（name/type/description）
+    // t0 是工具轮：给 selector 留出确定的落定窗口——t0 请求发出时的 poll 必然
+    // settled=false（回环 RTT >> 微任务间隔），t0 响应 + 工具执行的时间足够
+    // selector 回来，t1 的 while 顶 poll 才稳定注入。t0 顺手让模型写一条新记忆，
+    // 断言下一请求 system 里索引被自动重建（写时重建 MEMORY.md）。
     prompt: "Where should I deploy my changes to test them?",
     needsLog: true,
+    autoConfirm: true,
     setup: (dir) => {
-      mkdirSync(join(dir, ".mini-memory"));
-      writeFileSync(
-        join(dir, ".mini-memory", "deploy.md"),
-        "Deploy target: the staging server at staging.example.com. Deploy there to test changes.\n"
-      );
-      writeFileSync(
-        join(dir, ".mini-memory", "color.md"),
-        "The user's favorite color is blue.\n"
-      );
+      writeFileSync(join(dir, "dummy.txt"), "just a file to read.");
+      const hash = createHash("sha256").update(dir).digest("hex").slice(0, 16);
+      const memDir = join(dir, ".mini-claude", "projects", hash, "memory");
+      mkdirSync(memDir, { recursive: true });
+      writeFileSync(join(memDir, "project_deploy.md"),
+        `---\nname: Deploy target\ndescription: Where to deploy changes for testing\ntype: project\n---\nDeploy target: the staging server at staging.example.com. Deploy there to test changes.\n`);
+      writeFileSync(join(memDir, "user_color.md"),
+        `---\nname: Favorite color\ndescription: User's preferred color\ntype: user\n---\nThe user's favorite color is blue.\n`);
     },
-    turns: [{ text: "Deploy to staging.example.com." }],
+    tracks: (dir) => {
+      const hash = createHash("sha256").update(dir).digest("hex").slice(0, 16);
+      const memDir = join(dir, ".mini-claude", "projects", hash, "memory");
+      return {
+        main: {
+          turns: [
+            {
+              tools: [
+                {
+                  name: "write_file",
+                  input: {
+                    file_path: join(memDir, "user_editor.md"),
+                    content: `---\nname: My favorite editor\ndescription: The editor the user prefers\ntype: user\n---\nThe user's favorite editor is Vim.\n`,
+                  },
+                },
+                { name: "read_file", input: { file_path: "dummy.txt" } },
+              ],
+            },
+            { text: "Deploy to staging.example.com for testing." },
+          ],
+        },
+        memory: {
+          match: "selecting memories",
+          turns: [{ text: '{"selected_memories": ["project_deploy.md"]}' }],
+        },
+      };
+    },
     verify: (dir, logPath) => {
       let ok = true;
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const hash = createHash("sha256").update(dir).digest("hex").slice(0, 16);
+      const memDir = join(dir, ".mini-claude", "projects", hash, "memory");
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request");
-      check("one model call", reqs.length === 1);
-      check("relevant memory recalled into system", reqs[0]?.system.includes("staging.example.com"));
-      check("memory section header present", reqs[0]?.system.includes("# Memory"));
-      check("irrelevant memory filtered out", !reqs[0]?.system.includes("favorite color"));
-      check("recall lands in system, not the user message",
-        !reqs[0]?.firstUserText.includes("staging.example.com"));
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const memReqs = reqs.filter((e) => e.track === "memory");
+      check("selector side call went out once (non-streaming, single user message)",
+        memReqs.length === 1 && memReqs[0]?.stream === false && memReqs[0]?.messageCount === 1);
+      check("selector got the manifest (query + both candidate memories)",
+        memReqs[0]?.firstUserText.includes("Where should I deploy")
+        && memReqs[0]?.firstUserText.includes("project_deploy.md")
+        && memReqs[0]?.firstUserText.includes("user_color.md"));
+      check("system keeps the memory section (no index yet — MEMORY.md is born on first write)",
+        mainReqs[0]?.system.includes("# Memory System")
+        && mainReqs[0]?.system.includes("No memories saved yet"));
+      check("t0 request has no injection yet (prefetch still in flight)",
+        !mainReqs[0]?.lastUserText.includes("Memory (saved today)"));
+      check("selected memory injected into the last user message, not the system",
+        !mainReqs[1]?.system.includes("staging.example.com")
+        && mainReqs[1]?.lastUserText.includes("staging.example.com")
+        && mainReqs[1]?.lastUserText.includes("<system-reminder>")
+        && mainReqs[1]?.lastUserText.includes("Memory (saved today)"));
+      check("unselected memory content never enters context",
+        !mainReqs[1]?.lastUserText.includes("favorite color is blue")
+        && !mainReqs[1]?.system.includes("favorite color is blue"));
+      check("model-written memory file landed in the project memory dir",
+        existsSync(join(memDir, "user_editor.md")));
+      check("MEMORY.md auto-rebuilt: new entry + pre-existing memories show in next request's system",
+        mainReqs[1]?.system.includes("My favorite editor")
+        && mainReqs[1]?.system.includes("Deploy target"));
+      let indexOnDisk = "";
+      try { indexOnDisk = readFileSync(join(memDir, "MEMORY.md"), "utf-8"); } catch {}
+      check("MEMORY.md on disk lists the new memory",
+        indexOnDisk.includes("**[My favorite editor](user_editor.md)** (user)"));
       if (!ok) process.exitCode = 1;
     },
   },
@@ -754,8 +816,11 @@ const workdir = mkdtempSync(join(tmpdir(), `my-ch${chapter}-`));
 s.setup(workdir);
 
 const logPath = s.needsLog ? join(tmpdir(), `my-ch${chapter}-log-${process.pid}.jsonl`) : undefined;
-const scenario = s.tracks
-  ? { id: `ch${chapter}`, tracks: s.tracks }
+// tracks 支持函数形式 (dir) => tracks——ch22 记忆目录含 sha256(cwd) 动态段，
+// 脚本化的 write_file 路径必须等 workdir 生成后才能算出来
+const tracks = typeof s.tracks === "function" ? s.tracks(workdir) : s.tracks;
+const scenario = tracks
+  ? { id: `ch${chapter}`, tracks }
   : { id: `ch${chapter}`, turns: s.turns };
 const mock = await startMock({ scenario, logPath });
 process.env.ANTHROPIC_BASE_URL = mock.url;

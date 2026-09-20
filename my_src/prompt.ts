@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync } from "fs";
 import { execSync } from "child_process";
 import { join, dirname } from "path";
 import * as os from "os";
+import { buildMemoryPromptSection } from "./memory.js";
 
 const REGEXP = /^@(\S+)[ \t]*$/gm;
 const MAX_DEPTH = 5;
@@ -102,10 +103,14 @@ function getGitContext(): string {
     }
 }
 
+// 动态上下文（含 memory 索引）：随项目/机器而变，且模型写记忆的瞬间索引会变——
+// 所以绝不进 cache_control 静态块，单独作为第二个 system 块
 export function buildDynamicSystemContext(): string {
-    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}`;
+    const memorySection = buildMemoryPromptSection();
+    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}${memorySection}`;
 }
 
-export function buildSystemPrompt(): string {
-    return `${STATIC_CORE}\n\n${buildDynamicSystemContext()}`;
+// 缓存的静态主体：所有用户、所有会话都完全一致，才能吃到前缀缓存
+export function buildStaticSystemPrompt(): string {
+    return STATIC_CORE;
 }
