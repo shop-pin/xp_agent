@@ -204,40 +204,38 @@ const scenarios = {
     },
   },
   "9": {
-    // chapter 9: a skill file in .mini-skills/. "/commit <args>" resolves to the
-    // file's prompt with args appended; an unknown /name falls through as a
-    // plain message; a non-slash message is untouched.
+    // chapter 9 → ch23 迁移：SKILL.md 新结构（.claude/skills/<name>/SKILL.md + frontmatter
+    // + $ARGUMENTS 占位符）。模型经 skill 工具 inline 调用：executeSkill 解析模板，
+    // tool_result 以 "[Skill activated]" 前缀注入主对话。CLI 的 /<name> 入口由 ch23b
+    // 覆盖（对齐 src 后 one-shot 不再解析斜杠命令）。
     needsLog: true,
     setup: (dir) => {
-      mkdirSync(join(dir, ".mini-skills"));
+      mkdirSync(join(dir, ".claude", "skills", "commit"), { recursive: true });
       writeFileSync(
-        join(dir, ".mini-skills", "commit.md"),
-        "Write a conventional commit message for the current diff.\n"
+        join(dir, ".claude", "skills", "commit", "SKILL.md"),
+        "---\nname: commit\ndescription: Create a conventional commit message\n---\nWrite a conventional commit message for: $ARGUMENTS\n"
       );
     },
-    runs: [
-      { argv: ["/commit fix the login bug"] },
-      { argv: ["/nosuchskill hello there"] },
-      { argv: ["just a plain message"] },
-    ],
+    prompt: "Invoke the commit skill with args: fix the login bug. Then invoke the nosuch skill.",
     turns: [
-      { text: "feat: fix the login bug" },
-      { text: "I don't know that skill." },
-      { text: "Plain message received." },
+      { tools: [{ name: "skill", input: { skill_name: "commit", args: "fix the login bug" } }] },
+      { tools: [{ name: "skill", input: { skill_name: "nosuch", args: "" } }] },
+      { text: "Done." },
     ],
     verify: (dir, logPath) => {
       let ok = true;
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request");
-      check("three model calls (one per run)", reqs.length === 3);
-      check("skill prompt replaces the /command",
-        reqs[0]?.firstUserText.includes("Write a conventional commit message")
-        && !reqs[0]?.firstUserText.includes("/commit"));
-      check("args appended to skill prompt", reqs[0]?.firstUserText.includes("fix the login bug"));
-      check("unknown /name passes through as plain text",
-        reqs[1]?.firstUserText.includes("/nosuchskill hello there"));
-      check("non-slash message untouched", reqs[2]?.firstUserText.includes("just a plain message"));
+      check("three model calls (two skill invocations + finish)", reqs.length === 3);
+      check("skill tool returns the activated template",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes('[Skill "commit" activated]')
+          && t.content.includes("Write a conventional commit message")));
+      check("$ARGUMENTS replaced with the args",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("for: fix the login bug")
+          && !t.content.includes("$ARGUMENTS")));
+      check("unknown skill reports Unknown skill",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("Unknown skill: nosuch")));
       if (!ok) process.exitCode = 1;
     },
   },
@@ -268,26 +266,25 @@ const scenarios = {
     },
   },
   "11": {
-    // chapter 11: the main agent forks a read-only sub-agent via the `agent`
-    // tool. The sub-agent runs its own loop on a separate track (own system
-    // prompt, fresh context, read-only tools, non-streaming), denies a write
-    // attempt in-loop, and its final text returns to the main loop as a
-    // tool_result.
-    prompt: "Use a sub-agent to find out what greeting.txt says.",
+    // chapter 11 → ch23 迁移：fork-return 新架构。父 Agent new 一个子 Agent
+    // （customSystemPrompt=EXPLORE_PROMPT、customTools=只读三件套、isSubAgent=true），
+    // 子对话独立跑 loop，最终文本作为 tool_result 回父级。对齐 src 后子 agent 与
+    // 主循环一样走流式；白名单只管 schema 广告（软约束），硬防线是权限层——
+    // 旧版 "Denied: read-only" 执行拦截随 runSubAgent 退役。
+    prompt: "Use an explore agent to find out what greeting.txt says.",
     needsLog: true,
     setup: (dir) => writeFileSync(join(dir, "greeting.txt"), "hello from the subagent demo."),
     tracks: {
       main: {
         turns: [
-          { tools: [{ name: "agent", input: { task: "Read greeting.txt and report its contents." } }] },
+          { tools: [{ name: "agent", input: { description: "Read greeting", prompt: "Read greeting.txt and report its contents.", type: "explore" } }] },
           { text: "The sub-agent reports: hello from the subagent demo." },
         ],
       },
       sub: {
-        match: "explore sub-agent",
+        match: "file search specialist",
         turns: [
           { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }] },
-          { tools: [{ name: "write_file", input: { file_path: "evil.txt", content: "mwahaha" } }] },
           { text: "greeting.txt says: hello from the subagent demo." },
         ],
       },
@@ -300,20 +297,17 @@ const scenarios = {
       const mainReqs = reqs.filter((e) => e.track === "main");
       const subReqs = reqs.filter((e) => e.track === "sub");
       check("2 main-loop calls (fork + continue)", mainReqs.length === 2);
-      check("sub-agent ran its own 3-call loop", subReqs.length === 3);
-      check("sub-agent tools are read-only",
+      check("sub-agent ran its own 2-call loop", subReqs.length === 2);
+      check("explore agent advertises read-only tools only",
         subReqs[0]?.tools.includes("read_file") && subReqs[0]?.tools.includes("list_files")
         && subReqs[0]?.tools.includes("grep_search")
-        && !subReqs[0]?.tools.includes("write_file") && !subReqs[0]?.tools.includes("run_shell"));
+        && !subReqs[0]?.tools.includes("write_file") && !subReqs[0]?.tools.includes("run_shell")
+        && !subReqs[0]?.tools.includes("agent"));
       check("sub-agent context is fresh (1 message, not the main history)", subReqs[0]?.messageCount === 1);
-      check("sub-agent has its own system prompt",
-        subReqs[0]?.system.includes("explore sub-agent")
-        && !subReqs[0]?.system.includes("Mini Claude Code"));
-      check("main loop streams, sub-agent does not",
-        mainReqs[0]?.stream === true && subReqs[0]?.stream === false);
-      check("sub-agent write attempt denied in-loop",
-        (subReqs[2]?.toolResults || []).some((t) => t.content.includes("Denied"))
-        && !existsSync(join(dir, "evil.txt")));
+      check("sub-agent runs on the explore system prompt",
+        subReqs[0]?.system.includes("file search specialist"));
+      check("both main and sub stream (aligned with src)",
+        mainReqs[0]?.stream === true && subReqs[0]?.stream === true);
       check("sub-agent summary reached main as tool_result",
         (mainReqs[1]?.toolResults || []).some((t) => t.content.includes("hello from the subagent demo")));
       if (!ok) process.exitCode = 1;
@@ -801,6 +795,100 @@ const scenarios = {
         check("run2: saved file holds the FULL output (no loss, incl. the tail)",
           saved.includes("HUGELINE-0000") && saved.includes("HUGELINE-0999"));
       }
+      if (!ok) process.exitCode = 1;
+    },
+  },
+  "23": {
+    // ch23 新场景：自定义 agent 类型。project 层 .claude/agents/researcher.md
+    // （frontmatter name/description/allowed-tools，body=system prompt）→
+    // getSubAgentConfig custom 优先 + 白名单过滤（toolDefinitions 里只留白名单工具）。
+    // 注意 agent 工具 schema 的 type enum 只列内置三类型——自定义名靠宽容兜底，
+    // schema enum 不含它们是 src 的已知粗糙点（见 my_docs/23 思考题）
+    prompt: "Use a researcher agent to read docs.txt and report.",
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".claude", "agents"), { recursive: true });
+      writeFileSync(
+        join(dir, ".claude", "agents", "researcher.md"),
+        "---\nname: researcher\ndescription: Deep research assistant\nallowed-tools: read_file, grep_search\n---\nYou are a research specialist. Dig deep and cite sources.\n"
+      );
+    },
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "agent", input: { description: "Read docs", prompt: "Read docs.txt and report.", type: "researcher" } }] },
+          { text: "Researcher reports: docs.txt says hello." },
+        ],
+      },
+      sub: {
+        match: "research specialist",
+        turns: [{ text: "docs.txt says hello." }],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const subReqs = reqs.filter((e) => e.track === "sub");
+      check("2 main-loop calls (fork + continue)", mainReqs.length === 2);
+      check("custom agent ran on its own loop", subReqs.length === 1);
+      check("custom body became the sub-agent system prompt (not a built-in prompt)",
+        subReqs[0]?.system.includes("research specialist")
+        && !subReqs[0]?.system.includes("file search specialist"));
+      check("allowed-tools whitelist enforced (exactly read_file + grep_search)",
+        subReqs[0]?.tools.includes("read_file") && subReqs[0]?.tools.includes("grep_search")
+        && subReqs[0]?.tools.length === 2);
+      check("sub-agent context is fresh", subReqs[0]?.messageCount === 1);
+      check("custom agent report reached main as tool_result",
+        (mainReqs[1]?.toolResults || []).some((t) => t.content.includes("docs.txt says hello")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
+  "23b": {
+    // ch23 新场景：skill 的 fork 模式。context: fork 的 SKILL.md → executeSkillTool
+    // 派发隔离子 agent（system=解析后模板含 $ARGUMENTS 替换，tools=allowed-tools 白名单
+    // 过滤父工具集）。inline 路径由 ch9 覆盖；CLI 的 /<name> 斜杠入口走 REPL（mock
+    // 驱动只测 agent 层），靠真机冒烟验证。
+    prompt: "Invoke the heavytask skill with args: audit the repo.",
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".claude", "skills", "heavytask"), { recursive: true });
+      writeFileSync(
+        join(dir, ".claude", "skills", "heavytask", "SKILL.md"),
+        "---\nname: heavytask\ndescription: Run a heavy audit\ncontext: fork\nallowed-tools: read_file, grep_search\n---\nAudit task: $ARGUMENTS. Report findings concisely.\n"
+      );
+    },
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "skill", input: { skill_name: "heavytask", args: "audit the repo" } }] },
+          { text: "Audit complete: no issues found." },
+        ],
+      },
+      fork: {
+        match: "Audit task",
+        turns: [{ text: "Findings: everything looks fine." }],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const forkReqs = reqs.filter((e) => e.track === "fork");
+      check("2 main-loop calls (fork + continue)", mainReqs.length === 2);
+      check("fork skill ran in an isolated sub-agent", forkReqs.length === 1);
+      check("resolved template became the fork system prompt ($ARGUMENTS substituted)",
+        forkReqs[0]?.system.includes("Audit task: audit the repo")
+        && !forkReqs[0]?.system.includes("$ARGUMENTS"));
+      check("fork tools limited to the skill whitelist",
+        forkReqs[0]?.tools.includes("read_file") && forkReqs[0]?.tools.includes("grep_search")
+        && forkReqs[0]?.tools.length === 2);
+      check("fork result returned to main as tool_result",
+        (mainReqs[1]?.toolResults || []).some((t) => t.content.includes("everything looks fine")));
       if (!ok) process.exitCode = 1;
     },
   },

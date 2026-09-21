@@ -128,18 +128,49 @@ export const toolDefinitions: Anthropic.Tool[] = [
             required: ["url"],
         },
     },
+    // ─── Skill tool ─────────────────────────────────────────────
     {
-        name: "agent",
-        description: "Fork a read-only explore sub-agent to investigate a task in an isolated context. It can read files, list directories, and grep, and returns a concise summary. Use it for broad searches that would otherwise flood the main conversation.",
+        name: "skill",
+        description:
+            "Invoke a registered skill by name. Skills are prompt templates loaded from .claude/skills/. Returns the skill's resolved prompt to follow.",
         input_schema: {
             type: "object",
             properties: {
-                task: {
+                skill_name: {
                     type: "string",
-                    description: "The task for the sub-agent to investigate",
+                    description: "The name of the skill to invoke",
+                },
+                args: {
+                    type: "string",
+                    description: "Optional arguments to pass to the skill",
                 },
             },
-            required: ["task"],
+            required: ["skill_name"],
+        },
+    },
+    // ─── Agent tool ─────────────────────────────────────────────
+    {
+        name: "agent",
+        description:
+            "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only, fast search), 'plan' (read-only, structured planning), 'general' (full tools).",
+        input_schema: {
+            type: "object",
+            properties: {
+                description: {
+                    type: "string",
+                    description: "Short (3-5 word) description of the sub-agent's task",
+                },
+                prompt: {
+                    type: "string",
+                    description: "Detailed task instructions for the sub-agent",
+                },
+                type: {
+                    type: "string",
+                    enum: ["explore", "plan", "general"],
+                    description: "Agent type: explore (read-only), plan (planning), general (full tools). Default: general",
+                },
+            },
+            required: ["description", "prompt"],
         },
     },
 ];

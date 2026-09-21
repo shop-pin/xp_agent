@@ -1,34 +1,178 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { toolDefinitions, executeTool } from "./tools.js";
+import { existsSync, readdirSync, readFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+import { parseFrontmatter } from "./frontmatter.js";
+import { toolDefinitions } from "./tools.js";
 
-const EXPLORE_TOOLS = ["read_file", "list_files", "grep_search"];
+export type SubAgentType = string;
 
-export async function runSubAgent(task: string, client: Anthropic, model: string): Promise<string> {
-    const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
-    const tools = toolDefinitions.filter((t) => EXPLORE_TOOLS.includes(t.name));
+export interface SubAgentConfig {
+    systemPrompt: string;
+    tools: Anthropic.Tool[];
+}
 
-    while (true) {
-        const reply = await client.messages.create({
-            model,
-            max_tokens: 4096,
-            system: "You are an explore sub-agent. Investigate read-only and report back a concise summary.",
-            tools,
-            messages,
-        });
-        messages.push({ role: "assistant", content: reply.content });
+interface CustomAgentDef {
+    name: string;
+    description: string;
+    allowedTools?: string[];
+    systemPrompt: string;
+}
 
-        const toolUses: Anthropic.ToolUseBlock[] = reply.content.filter((b) => b.type === "tool_use");
-        if (toolUses.length === 0) {
-            return reply.content.filter((b) => b.type === "text").map((b: any) => b.text).join("");
-        }
+const READ_ONLY_TOOLS = new Set(["read_file", "list_files", "grep_search"]);
 
-        const results: Anthropic.ToolResultBlockParam[] = [];
-        for (const tu of toolUses) {
-            const output = EXPLORE_TOOLS.includes(tu.name)
-                ? await executeTool(tu.name, tu.input as Record<string, any>)
-                : `Denied: the sub-agent is read-only.`;
-            results.push({ type: "tool_result", tool_use_id: tu.id, content: output });
-        }
-        messages.push({ role: "user", content: results });
+const EXPLORE_PROMPT = `You are a file search specialist for Mini Claude Code. You excel at thoroughly navigating and exploring codebases.
+
+=== CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
+This is a READ-ONLY exploration task. You are STRICTLY PROHIBITED from:
+- Creating new files (no write_file, touch, or file creation of any kind)
+- Modifying existing files (no edit_file operations)
+- Deleting files (no rm or deletion)
+- Running ANY commands that change system state
+
+Your role is EXCLUSIVELY to search and analyze existing code.
+
+Your strengths:
+- Rapidly finding files using glob patterns
+- Searching code and text with powerful regex patterns
+- Reading and analyzing file contents
+
+Guidelines:
+- Use list_files for broad file pattern matching
+- Use grep_search for searching file contents with regex
+- Use read_file when you know the specific file path you need to read
+- Adapt your search approach based on the thoroughness level specified by the caller
+
+NOTE: You are meant to be a fast agent that returns output as quickly as possible. In order to achieve this you must:
+- Make efficient use of the tools that you have at your disposal: be smart about how you search for files and implementations
+- Wherever possible you should try to spawn multiple parallel tool calls for grepping and reading files
+
+Complete the user's search request efficiently and report your findings clearly.`;
+
+const PLAN_PROMPT = `You are a Plan agent — a READ-ONLY sub-agent specialized for designing implementation plans.
+
+IMPORTANT CONSTRAINTS:
+- You are READ-ONLY. You only have access to read_file, list_files, and grep_search.
+- Do NOT attempt to modify any files.
+
+Your job:
+- Analyze the codebase to understand the current architecture
+- Design a step-by-step implementation plan
+- Identify critical files that need modification
+- Consider architectural trade-offs
+
+Return a structured plan with:
+1. Summary of current state
+2. Step-by-step implementation steps
+3. Critical files for implementation
+4. Potential risks or considerations`;
+
+const GENERAL_PROMPT = `You are an agent for Mini Claude Code. Given the user's message, you should use the tools available to complete the task. Complete the task fully—don't gold-plate, but don't leave it half-done. When you complete the task, respond with a concise report covering what was done and any key findings — the caller will relay this to the user, so it only needs the essentials.
+
+Your strengths:
+- Searching for code, configurations, and patterns across large codebases
+- Analyzing multiple files to understand system architecture
+- Investigating complex questions that require exploring many files
+- Performing multi-step research tasks
+
+Guidelines:
+- For file searches: search broadly when you don't know where something lives. Use read_file when you know the specific file path.
+- For analysis: Start broad and narrow down. Use multiple search strategies if the first doesn't yield results.
+- Be thorough: Check multiple locations, consider different naming conventions, look for related files.
+- NEVER create files unless they're absolutely necessary for achieving your goal. ALWAYS prefer editing an existing file to creating a new one.`;
+
+function getReadOnlyTools(): Anthropic.Tool[] {
+    return toolDefinitions.filter((t) => READ_ONLY_TOOLS.has(t.name));
+}
+
+let cachedCustomAgents: Map<string, CustomAgentDef> | null = null;
+
+function loadAgentsFromDir(dir: string, agents: Map<string, CustomAgentDef>) {
+    if (!existsSync(dir)) return;
+    let entries: string[];
+    try {
+        entries = readdirSync(dir);
+    } catch {
+        return;
     }
+
+    for (const entry of entries) {
+        if (!entry.endsWith(".md")) continue;
+        const filePath = join(dir, entry);
+        try {
+            const raw = readFileSync(filePath, "utf-8");
+            const { meta, body } = parseFrontmatter(raw);
+            const name = meta.name || entry.replace(/\.md$/, "");
+            const allowedTools = meta["allowed-tools"]
+                ? meta["allowed-tools"].split(",").map((t: string) => t.trim())
+                : undefined;
+            agents.set(name, {
+                name,
+                description: meta.description || "",
+                allowedTools,
+                systemPrompt: body,
+            });
+        } catch { }
+    }
+}
+
+function discoverCustomAgents(): Map<string, CustomAgentDef> {
+    if (cachedCustomAgents) return cachedCustomAgents;
+    const agents = new Map<string, CustomAgentDef>();
+
+    loadAgentsFromDir(join(homedir(), ".claude", "agents"), agents);
+    loadAgentsFromDir(join(process.cwd(), ".claude", "agents"), agents);
+
+    cachedCustomAgents = agents;
+    return agents;
+}
+
+export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
+    const custom = discoverCustomAgents().get(type);
+    if (custom) {
+        const tools = custom.allowedTools
+            ? toolDefinitions.filter((t) => custom.allowedTools!.includes(t.name))
+            : toolDefinitions.filter((t) => t.name !== "agent");
+        return { systemPrompt: custom.systemPrompt, tools };
+    }
+
+    switch (type) {
+        case "explore":
+            return { systemPrompt: EXPLORE_PROMPT, tools: getReadOnlyTools() };
+        case "plan":
+            return { systemPrompt: PLAN_PROMPT, tools: getReadOnlyTools() };
+        default:
+            return {
+                systemPrompt: GENERAL_PROMPT,
+                tools: toolDefinitions.filter((t) => t.name !== "agent"),
+            };
+    }
+}
+
+export function getAvailableAgentTypes(): { name: string; description: string }[] {
+    const types: { name: string; description: string }[] = [
+        { name: "explore", description: "Fast, read-only codebase search and exploration" },
+        { name: "plan", description: "Read-only analysis with structured implementation plans" },
+        { name: "general", description: "Full tools for independent tasks" },
+    ];
+
+    for (const [name, def] of discoverCustomAgents()) {
+        types.push({ name, description: def.description });
+    }
+    return types;
+}
+
+export function buildAgentDescriptions(): string {
+    const types = getAvailableAgentTypes();
+    if (types.length <= 3) return "";
+    const custom = types.slice(3);
+    const lines = ["\n# Custom Agent Types", ""];
+    for (const t of custom) {
+        lines.push(`- **${t.name}**: ${t.description}`);
+    }
+    return lines.join("\n");
+}
+
+export function resetAgentCache(): void {
+    cachedCustomAgents = null;
 }

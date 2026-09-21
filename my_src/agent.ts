@@ -4,7 +4,7 @@ import { executeTool, toolDefinitions, truncateResult } from "./tools.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder } from "./prompt.js";
 import { checkPermission, type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
-import { runSubAgent } from "./subagent.js";
+import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
 import { McpManager } from "./mcp.js";
 import { withRetry } from "./retry.js";
 import { evaluateGoal, classifyAction } from "./autonomy.js";
@@ -13,7 +13,7 @@ import { randomUUID } from "crypto";
 import { mkdirSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { printToolCall, printAssistantText, printInfo, printConfirmation, printCost, startSpinner, stopSpinner } from "./ui.js";
+import { printToolCall, printAssistantText, printInfo, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -38,10 +38,25 @@ function getContextWindow(model: string): number {
     return MODEL_CONTEXT[model] || 200000;
 }
 
+export interface AgentOptions {
+    permissionMode?: PermissionMode;
+    // 子 agent 三件套：整个 system 视为静态块（跳过 dynamic 段与首条消息 reminder）、
+    // 裁剪过的工具集、行为开关（不连 MCP、不 autoSave、不打 spinner/cost）
+    customSystemPrompt?: string;
+    customTools?: Anthropic.Tool[];
+    isSubAgent?: boolean;
+}
+
 export class Agent {
     private client: Anthropic;
     private messages: Anthropic.MessageParam[] = [];
     private mode: PermissionMode = "default";
+    private tools: Anthropic.Tool[];
+    private staticSystemPrompt: string;
+    private hasCustomPrompt: boolean;
+    private isSubAgent: boolean;
+    // 子 agent 的最终文本收进 buffer 而非打印，runOnce 拼出来回传父级
+    private outputBuffer: string[] | null = null;
     private mcpManager = new McpManager();
     private readFileState: Map<string, number> = new Map();
     private confirmedPaths: Set<string> = new Set();
@@ -69,7 +84,12 @@ export class Agent {
     private alreadySurfacedMemories: Set<string> = new Set();
     private sessionMemoryBytes = 0;
 
-    constructor() {
+    constructor(options: AgentOptions = {}) {
+        this.mode = options.permissionMode || "default";
+        this.isSubAgent = options.isSubAgent || false;
+        this.tools = options.customTools || toolDefinitions;
+        this.hasCustomPrompt = !!options.customSystemPrompt;
+        this.staticSystemPrompt = options.customSystemPrompt || buildStaticSystemPrompt();
         // 可选：封 SDK 自带的重试层（默认 2）。MINI_CLAUDE_SDK_MAX_RETRIES=0
         // 用于在测试里隔离我们自己的 withRetry——否则 SDK 先吞掉失败，
         // mock 注入的 429 永远到不了用户代码
@@ -411,8 +431,10 @@ export class Agent {
     }
 
     // turn 边界调用（chat() 开头）：先排掉上一轮遗留的 prefetch——若它在上一轮
-    // 最后一次 API 调用之后才落定，不排走就永久丢失；再为本轮发起新的召回
+    // 最后一次 API 调用之后才落定，不排走就永久丢失；再为本轮发起新的召回。
+    // 子 agent 跳过：记忆召回是主对话的机制，隔离子任务不该触发旁路查询
     private async startMemoryPrefetchForTurn(userMessage: string, messages: Anthropic.MessageParam[]): Promise<void> {
+        if (this.isSubAgent) return;
         await this.consumeMemoryPrefetchIfReady(messages);
         const sq = this.buildSideQuery();
         this.memoryPrefetch = startMemoryPrefetch(
@@ -426,9 +448,10 @@ export class Agent {
     // 含工具 schema，命中服务端前缀缓存）；动态上下文（环境 + memory 索引）
     // 放断点之后——模型写一条记忆索引就变，进了静态块等于每次写记忆都作废缓存
     private buildAnthropicSystem(): Anthropic.TextBlockParam[] {
-        const dynamicText = buildDynamicSystemContext().trim();
+        // 子 agent（customSystemPrompt）：整个 system 当静态块，dynamic 段是主对话的环境噪音
+        const dynamicText = this.hasCustomPrompt ? "" : buildDynamicSystemContext().trim();
         const blocks: Anthropic.TextBlockParam[] = [
-            { type: "text", text: buildStaticSystemPrompt(), cache_control: { type: "ephemeral" } },
+            { type: "text", text: this.staticSystemPrompt, cache_control: { type: "ephemeral" } },
         ];
         if (dynamicText) blocks.push({ type: "text", text: dynamicText });
         return blocks;
@@ -491,7 +514,7 @@ export class Agent {
     }
 
     async chat(userText: string): Promise<void> {
-        const content = this.messages.length === 0
+        const content = this.messages.length === 0 && !this.hasCustomPrompt
             ? `${userText}\n\n${buildUserContextReminder()}`
             : userText;
         this.messages.push({ role: "user", content: content });
@@ -502,13 +525,13 @@ export class Agent {
         // 语义召回：turn 边界发起异步 prefetch，不挡主循环；每轮请求前轮询一次，
         // selector 一落定立刻注入，模型尽早看到记忆
         await this.startMemoryPrefetchForTurn(userText, this.messages);
-        await this.ensureMcp();
-        const mcpTools: Anthropic.Tool[] = this.mcpManager.getToolDefinitions();
+        if (!this.isSubAgent) await this.ensureMcp();
+        const mcpTools: Anthropic.Tool[] = this.isSubAgent ? [] : this.mcpManager.getToolDefinitions();
         while (true) {
             // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
             this.runCompressionPipeline();
             await this.consumeMemoryPrefetchIfReady(this.messages);
-            startSpinner();
+            if (!this.isSubAgent) startSpinner();
             let firstText = true;
             let response: Anthropic.Message;
             try {
@@ -519,21 +542,21 @@ export class Agent {
                         model: MODEL,
                         max_tokens: 4096,
                         system: this.buildAnthropicSystem(),
-                        tools: [...toolDefinitions, ...mcpTools],
+                        tools: [...this.tools, ...mcpTools],
                         messages: this.withCacheBreakpoints(this.messages),
                     });
                     // src 同款协调：首个 text 事件先停 spinner 再打印，避免 \r 重画吃掉流式输出；
                     // 纯工具调用响应没有 text 事件，靠 finally 兜底
                     stream.on("text", (t) => {
-                        if (firstText) { stopSpinner(); firstText = false; }
-                        printAssistantText(t);
+                        if (!this.isSubAgent && firstText) { stopSpinner(); firstText = false; }
+                        this.emitText(t);
                     });
                     return await stream.finalMessage();
                 });
             } finally {
-                stopSpinner();
+                if (!this.isSubAgent) stopSpinner();
             }
-            printAssistantText("\n");
+            this.emitText("\n");
             // 四计数：缓存读/写分开累计；lastInputTokenCount = 本次 prompt 全量 + 输出
             // （输出会成为下一次请求的一部分），ch21 压缩仪表读它
             const u: any = response.usage;
@@ -550,8 +573,10 @@ export class Agent {
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 
             if (toolUses.length === 0) {
-                printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
-                this.autoSave();
+                if (!this.isSubAgent) {
+                    printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
+                    this.autoSave();
+                }
                 return;
             }
 
@@ -577,22 +602,6 @@ export class Agent {
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             for (const tu of toolUses) {
                 printToolCall(tu.name, tu.input as Record<string, any>);
-                if (tu.name === "agent") {
-                    const summary = await runSubAgent(String((tu.input as any).task || ""), this.client, MODEL);
-                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: summary });
-                    continue;
-                }
-                if (tu.name.startsWith("mcp__")) {
-                    let output: string;
-                    try {
-                        output = await this.mcpManager.callTool(tu.name, tu.input as Record<string, any>);
-                    } catch (e: any) {
-                        // server 掉线/名字拆错等——作为 tool_result 回给模型自行处置，不在主循环里炸
-                        output = `Error: ${e.message ?? e}`;
-                    }
-                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
-                    continue;
-                }
                 if (this.mode === "auto" && ["write_file", "edit_file", "run_shell"].includes(tu.name)) {
                     // auto 的闸门只有分类器，静态流水线不再叠加（对齐 src）
                     const verdict = await classifyAction(tu.name, tu.input as Record<string, any>, this.transcriptText(), this.client, MODEL);
@@ -600,7 +609,7 @@ export class Agent {
                         toolResult.push({type: "tool_result", tool_use_id:tu.id, content: `Blocked by auto-mode monitor: ${verdict.reason}`});
                         continue;
                     }
-                    const output = this.persistLargeResult(tu.name, await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState));
+                    const output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
                     continue;
                 }
@@ -621,10 +630,127 @@ export class Agent {
                         this.confirmedPaths.add(perm.message);
                     }
                 }
-                const output = this.persistLargeResult(tu.name, await executeTool(tu.name, tu.input as Record<string, any>, this.readFileState));
+                const output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }
             this.messages.push({ role: "user", content: toolResult });
+        }
+    }
+
+    // ─── 工具分发（ch23 重构）：普通工具落 executeTool；agent/skill/mcp 走各自通道 ───
+
+    private async executeToolCall(name: string, input: Record<string, any>): Promise<string> {
+        if (name === "agent") return this.executeAgentTool(input);
+        if (name === "skill") return this.executeSkillTool(input);
+        if (name.startsWith("mcp__")) {
+            // server 掉线/名字拆错等——作为 tool_result 回给模型自行处置，不在主循环里炸
+            try {
+                return await this.mcpManager.callTool(name, input);
+            } catch (e: any) {
+                return `Error: ${e.message ?? e}`;
+            }
+        }
+        return executeTool(name, input, this.readFileState);
+    }
+
+    // ─── Sub-agent fork（ch23）────────────────────────────────
+
+    // 权限模式子 agent 继承规则：plan/auto 必须穿透——否则主对话里被拦的操作可以
+    // 借 agent(prompt="rm -rf /") 让 bypassPermissions 的子 agent 绕过闸门（权限洗白）。
+    // 其余模式落 bypassPermissions：子 agent 的危险动作由父层工具集与白名单约束
+    private childPermissionMode(): PermissionMode {
+        if (this.mode === "plan") return "plan";
+        if (this.mode === "auto") return "auto";
+        return "bypassPermissions";
+    }
+
+    private async executeAgentTool(input: Record<string, any>): Promise<string> {
+        const type = (input.type || "general") as SubAgentType;
+        const description = input.description || "sub-agent task";
+        const prompt = input.prompt || "";
+
+        printSubAgentStart(type, description);
+
+        const config = getSubAgentConfig(type);
+        const subAgent = new Agent({
+            customSystemPrompt: config.systemPrompt,
+            customTools: config.tools,
+            isSubAgent: true,
+            permissionMode: this.childPermissionMode(),
+        });
+
+        try {
+            const result = await subAgent.runOnce(prompt);
+            // 子对话的消耗也是真实成本：token 增量记回父级，费用统计才完整
+            this.totalInputTokens += result.tokens.input;
+            this.totalOutputTokens += result.tokens.output;
+            printSubAgentEnd(type, description);
+            return result.text || "(Sub-agent produced no output)";
+        } catch (e: any) {
+            printSubAgentEnd(type, description);
+            return `Sub-agent error: ${e.message}`;
+        }
+    }
+
+    // skill 的双入口分流：fork 派给隔离子 agent（system=解析后模板，tools=白名单过滤
+    // 父工具集）；inline 把解析后文本作为 tool_result 注入主对话，模型看到后照做
+    private async executeSkillTool(input: Record<string, any>): Promise<string> {
+        const { executeSkill } = await import("./skills.js");
+        const result = executeSkill(input.skill_name, input.args || "");
+        if (!result) return `Unknown skill: ${input.skill_name}`;
+
+        if (result.context === "fork") {
+            const tools = result.allowedTools
+                ? this.tools.filter(t => result.allowedTools!.includes(t.name))
+                : this.tools.filter(t => t.name !== "agent");
+
+            printSubAgentStart("skill-fork", input.skill_name);
+            const subAgent = new Agent({
+                customSystemPrompt: result.prompt,
+                customTools: tools,
+                isSubAgent: true,
+                permissionMode: this.childPermissionMode(),
+            });
+
+            try {
+                const subResult = await subAgent.runOnce(input.args || "Execute this skill task.");
+                this.totalInputTokens += subResult.tokens.input;
+                this.totalOutputTokens += subResult.tokens.output;
+                printSubAgentEnd("skill-fork", input.skill_name);
+                return subResult.text || "(Skill produced no output)";
+            } catch (e: any) {
+                printSubAgentEnd("skill-fork", input.skill_name);
+                return `Skill fork error: ${e.message}`;
+            }
+        }
+
+        return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
+    }
+
+    // ─── 子 agent 入口：跑一次完整任务，回传最终文本 + token 增量（差值法）───
+
+    async runOnce(prompt: string): Promise<{ text: string; tokens: { input: number; output: number } }> {
+        this.outputBuffer = [];
+        const prevInput = this.totalInputTokens;
+        const prevOutput = this.totalOutputTokens;
+        await this.chat(prompt);
+        const text = this.outputBuffer.join("");
+        this.outputBuffer = null;
+        return {
+            text,
+            tokens: {
+                input: this.totalInputTokens - prevInput,
+                output: this.totalOutputTokens - prevOutput,
+            },
+        };
+    }
+
+    // 输出统一出口：主对话打印，子 agent 收进 buffer
+    private emitText(text: string): void {
+        if (this.outputBuffer) {
+            this.outputBuffer.push(text);
+        } else {
+            printAssistantText(text);
         }
     }
 }

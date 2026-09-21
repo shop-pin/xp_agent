@@ -3,6 +3,8 @@ import { execSync } from "child_process";
 import { join, dirname } from "path";
 import * as os from "os";
 import { buildMemoryPromptSection } from "./memory.js";
+import { buildSkillDescriptions } from "./skills.js";
+import { buildAgentDescriptions } from "./subagent.js";
 
 const REGEXP = /^@(\S+)[ \t]*$/gm;
 const MAX_DEPTH = 5;
@@ -107,7 +109,9 @@ function getGitContext(): string {
 // 所以绝不进 cache_control 静态块，单独作为第二个 system 块
 export function buildDynamicSystemContext(): string {
     const memorySection = buildMemoryPromptSection();
-    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}${memorySection}`;
+    const skillsSection = buildSkillDescriptions();
+    const agentSection = buildAgentDescriptions();
+    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}${memorySection}${skillsSection}${agentSection}`;
 }
 
 // 缓存的静态主体：所有用户、所有会话都完全一致，才能吃到前缀缓存

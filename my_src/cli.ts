@@ -2,7 +2,7 @@ import * as readline from "readline";
 import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
 import { loadSession, getLatestSessionId } from "./session.js";
-import { resolveSkill } from "./skills.js";
+import { discoverSkills, getSkillByName, resolveSkillPrompt } from "./skills.js";
 import { printWelcome, printError, printInfo } from "./ui.js";
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -83,7 +83,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         return;
     }
     if (oneshot) {
-        await agent.chat(resolveSkill(oneshot) ?? oneshot);
+        await agent.chat(oneshot);
         await agent.close(); // MCP 子进程 stdio 会挂住事件循环，one-shot 结束必须显式关闭
         return;
     }
@@ -122,9 +122,46 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     ask();
                     return;
                 }
+                if (input === "/skills") {
+                    const skills = discoverSkills();
+                    if (skills.length === 0) {
+                        printInfo("No skills found. Add skills to .claude/skills/<name>/SKILL.md");
+                    } else {
+                        printInfo(`${skills.length} skills:`);
+                        for (const s of skills) {
+                            const tag = s.userInvocable ? `/${s.name}` : s.name;
+                            console.log(`    ${tag} (${s.source}) — ${s.description}`);
+                        }
+                    }
+                    ask();
+                    return;
+                }
+                // Skill invocation: /<skill-name> [args]——inline 直接注入解析后的模板；
+                // fork 借模型之手走 skill 工具，由 executeSkillTool 派发隔离子 agent
+                if (input.startsWith("/")) {
+                    const spaceIdx = input.indexOf(" ");
+                    const cmdName = spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
+                    const cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : "";
+                    const skill = getSkillByName(cmdName);
+                    if (skill && skill.userInvocable) {
+                        printInfo(`Invoking skill: ${skill.name}`);
+                        try {
+                            if (skill.context === "fork") {
+                                await agent.chat(`Use the skill tool to invoke "${skill.name}" with args: ${cmdArgs || "(none)"}`);
+                            } else {
+                                await agent.chat(resolveSkillPrompt(skill, cmdArgs));
+                            }
+                        } catch (e: any) {
+                            printError(String(e.message ?? e));
+                        }
+                        ask();
+                        return;
+                    }
+                    // 未知命令——按普通输入透传
+                }
                 if (input) {
                     try {
-                        await agent.chat(resolveSkill(input) ?? input);
+                        await agent.chat(input);
                     } catch (e: any) {
                         printError(String(e.message ?? e));
                     }
