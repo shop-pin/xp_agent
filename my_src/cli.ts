@@ -78,7 +78,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
 
     const oneshot = argv.join(" ").trim()
     if (goalCondition) {
-        await agent.pursueGoal(goalCondition, oneshot);
+        const directive = agent.setGoal(goalCondition);
+        await agent.pursueGoal(directive);
         await agent.close(); // 同 one-shot：MCP 子进程 stdio 会挂住事件循环
         return;
     }
@@ -119,6 +120,32 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                 if (input === "/clear") {
                     agent.clearHistory();
                     console.log(`(history cleared)`);
+                    ask();
+                    return;
+                }
+                if (input === "/goal" || input.startsWith("/goal ")) {
+                    const condition = input.slice("/goal".length).trim();
+                    if (!condition) {
+                        agent.showGoal();
+                        ask();
+                        return;
+                    }
+                    const directive = agent.setGoal(condition);
+                    try {
+                        await agent.pursueGoal(directive);
+                    } catch (e: any) {
+                        printError(String(e.message ?? e));
+                    }
+                    ask();
+                    return;
+                }
+                if (input === "/loop" || input.startsWith("/loop ")) {
+                    const rest = input.slice("/loop".length).trim();
+                    try {
+                        await agent.runLoop(rest);
+                    } catch (e: any) {
+                        printError(String(e.message ?? e));
+                    }
                     ask();
                     return;
                 }

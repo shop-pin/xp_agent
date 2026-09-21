@@ -6,7 +6,10 @@ export function printWelcome() {
         chalk.gray(" — A minimal coding agent\n")
     );
     console.log(chalk.gray("  Type your request, or 'exit' to quit."));
-    console.log(chalk.gray("  Commands: /clear /plan /cost /compact /memory /skills\n"));
+    console.log(chalk.gray("  Commands: /clear /plan /cost /compact /memory /skills"));
+    console.log(chalk.gray("  /goal <condition>  Pursue a goal across turns until an evaluator judges it met"));
+    console.log(chalk.gray("  /goal              Show the active goal's status"));
+    console.log(chalk.gray("  /loop [interval] <prompt>  Re-run a prompt on an interval (5m/2h) or self-paced\n"));
 }
 
 export function printUserPrompt() {

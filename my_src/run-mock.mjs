@@ -78,11 +78,12 @@ const scenarios = {
         match: "conversation summarizer",
         turns: [{ text: "Earlier: a.txt=alpha, b.txt=beta, c.txt=gamma." }],
       },
+      // ch24 迁移：goal 评估器三态 JSON 契约（锚换 "evaluating a hook condition"）
       goal: {
-        match: "goal evaluator",
+        match: "evaluating a hook condition",
         turns: [
-          { text: "NOT_MET: the files have not been read yet." },
-          { text: "MET" },
+          { text: '{"ok": false, "reason": "the files have not been read yet."}' },
+          { text: '{"ok": true, "reason": "transcript shows all three files read: alpha, beta, gamma."}' },
         ],
       },
     },
@@ -344,20 +345,21 @@ const scenarios = {
     },
   },
   "15": {
-    // chapter 15: autonomy. Run 1 (--goal): the evaluator judges "done.txt
-    // exists" — first NOT_MET (reason gets reinjected as the next turn), the
-    // model writes the file, second evaluation says MET. Run 2 (--auto): the
-    // classifier reads the transcript and blocks the secret.txt write with
-    // <block>yes</block>; the model sees "Blocked" as the tool_result.
-    // Both side-calls are routed by their system prompts — the exact phrases
-    // "goal evaluator" and "security monitor" are contract anchors: keep them
-    // verbatim in autonomy.ts, and keep them out of the main system prompt.
+    // chapter 15 → ch24 迁移：goal 评估器升三态 JSON 契约。系统提示换新
+    // （锚 "evaluating a hook condition"），回复从 MET/NOT_MET 文本变为
+    // {"ok":...} JSON；请求形状从单 user 消息变为角色分离三消息
+    // （framing user / transcript assistant / judge user）——防注入的关键。
+    // 语义变化：--goal 后的任务文本不再作为首轮（对齐 src：condition 即指令，
+    // goalDirective 承载首轮）。run4 新增 impossible 停机：评估器判
+    // {"ok":false,"impossible":true} 后 pursueGoal 直接停，无第二次评估。
+    // auto 分类器（ch26 才换 transcript 双段版）保持 <block> 协议不变。
     needsLog: true,
     setup: () => {},
     runs: [
       { argv: ["--goal", "done.txt exists", "--accept-edits", "Create done.txt with ok."] },
       { argv: ["--auto", "Create secret.txt with credentials."] },
       { argv: ["--auto", "Create notes-auto.txt with hello."] },
+      { argv: ["--goal", "the moon is made of cheese", "Try to prove the moon is cheese."] },
     ],
     tracks: {
       main: {
@@ -369,13 +371,15 @@ const scenarios = {
           { text: "That write was blocked by the auto-mode monitor." },
           { tools: [{ name: "write_file", input: { file_path: "notes-auto.txt", content: "hello" } }] },
           { text: "Created notes-auto.txt." },
+          { text: "The moon is not made of cheese — no evidence can ever change that." },
         ],
       },
       goal: {
-        match: "goal evaluator",
+        match: "evaluating a hook condition",
         turns: [
-          { text: "NOT_MET: done.txt has not been created yet." },
-          { text: "MET" },
+          { text: '{"ok": false, "reason": "done.txt has not been created yet."}' },
+          { text: '{"ok": true, "reason": "transcript shows a write_file to done.txt succeeded."}' },
+          { text: '{"ok": false, "impossible": true, "reason": "no transcript evidence could ever make the moon cheese."}' },
         ],
       },
       auto: {
@@ -397,18 +401,27 @@ const scenarios = {
       const mainReqs = reqs.filter((e) => e.track === "main");
       const goalReqs = reqs.filter((e) => e.track === "goal");
       const autoReqs = reqs.filter((e) => e.track === "auto");
-      check("7 main-loop calls (3 goal + 4 auto)", mainReqs.length === 7);
-      check("2 evaluator calls (NOT_MET then MET)", goalReqs.length === 2);
+      check("8 main-loop calls (3 goal + 4 auto + 1 impossible-goal)", mainReqs.length === 8);
+      check("3 evaluator calls (NOT_MET, MET, impossible)", goalReqs.length === 3);
       check("2 classifier calls (block then allow)", autoReqs.length === 2);
-      check("evaluator is a side call: single message, not streamed",
-        goalReqs[0]?.messageCount === 1 && goalReqs[0]?.stream === false);
-      check("evaluator receives condition + transcript",
+      check("evaluator is a side call: 3 role-separated messages, not streamed",
+        goalReqs[0]?.messageCount === 3 && goalReqs[0]?.stream === false);
+      check("framing user message marks the transcript as data (anti-smuggling)",
         typeof goalReqs[0]?.firstUserText === "string"
-        && goalReqs[0].firstUserText.includes("done.txt exists"));
+        && goalReqs[0].firstUserText.includes("The next message is the assistant transcript to evaluate"));
+      check("judge question + condition ride in the final user message",
+        typeof goalReqs[0]?.lastUserText === "string"
+        && goalReqs[0].lastUserText.includes("stopping condition")
+        && goalReqs[0].lastUserText.includes("done.txt exists"));
       check("reinjection grew history (1 -> 3 msgs by 2nd main call)",
         mainReqs[0]?.messageCount === 1 && mainReqs[1]?.messageCount === 3);
       check("write tool_result fed back before final eval (5 msgs)",
         mainReqs[2]?.messageCount === 5);
+      check("impossible run: directive-only first turn (condition is the directive)",
+        mainReqs[7]?.messageCount === 1
+        && mainReqs[7]?.firstUserText.includes("the moon is made of cheese"));
+      check("impossible verdict stopped the pursuit (no 4th evaluator call)",
+        goalReqs.length === 3 && mainReqs.length === 8);
       check("classifier is a side call: single message, not streamed",
         autoReqs[0]?.messageCount === 1 && autoReqs[0]?.stream === false);
       check("classifier transcript includes what it judges (secret.txt)",
@@ -892,6 +905,59 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "24": {
+    // ch24 新场景：/loop 两模式，三个 run 直调 agent.runLoop（/loop 是 REPL 命令，
+    // 对齐 src 后 one-shot 不解析斜杠命令，mock 只能驱动 agent 层）。
+    // run1 interval（"1s report the clock"）：前导 token 是间隔 → 剥掉后跑 prompt，
+    //   2 tick 后 --max-turns 上限停（tick 序列断言靠"run2 的首个请求不含 clock"）。
+    // run2 dynamic：模型调 schedule_wakeup（delaySeconds 5 → clamp 到 60），
+    //   工具结果回显 "Wakeup scheduled in 60s"；随后 60s 睡眠被驱动器 400ms 时的
+    //   stopLoop 提前打断（interruptibleSleep 语义）——没有第二个 tick。
+    // run3 dynamic 收敛：模型不调 schedule_wakeup → "converged after 1 tick"。
+    // schedule_wakeup 广告门控：interval run 不广告；dynamic run（含 tick1）广告。
+    needsLog: true,
+    setup: () => {},
+    runs: [
+      { loop: "1s report the clock", maxTurns: 2 },
+      { loop: "check the deploy", stopLoopAfterMs: 400 },
+      { loop: "check the window" },
+    ],
+    tracks: {
+      main: {
+        turns: [
+          { text: "tick 1: clock reported." },
+          { text: "tick 2: clock reported again." },
+          { tools: [{ name: "schedule_wakeup", input: { delaySeconds: 5, reason: "wait for rollout", prompt: "check the deploy again" } }] },
+          { text: "deploy check done; wakeup scheduled." },
+          { text: "window checked; nothing to schedule." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request").filter((e) => e.track === "main");
+      const firstText = (i) => (typeof reqs[i]?.firstUserText === "string" ? reqs[i].firstUserText : "");
+      const tr = (i) => (reqs[i]?.toolResults || []).map((t) => t.content).join("\n");
+      check("5 main-track requests total (2 + 2 + 1)", reqs.length === 5);
+      check("run1 interval: leading 1s token stripped, prompt passed through",
+        firstText(0).includes("report the clock") && !firstText(0).includes("1s "));
+      check("run1 interval: schedule_wakeup NOT advertised",
+        !reqs[0]?.tools.includes("schedule_wakeup"));
+      check("run1 stopped at the 2-tick limit (3rd request belongs to run2)",
+        firstText(2).includes("check the deploy"));
+      check("run2 dynamic: schedule_wakeup advertised during the loop",
+        reqs[2]?.tools.includes("schedule_wakeup"));
+      check("run2: wakeup tool_result echoes the clamped delay (5s -> 60s)",
+        tr(3).includes("Wakeup scheduled in 60s"));
+      check("run2: interrupted sleep prevented tick 2 (4th request belongs to run3)",
+        firstText(4).includes("check the window"));
+      check("run3 converged: dynamic mode still advertises schedule_wakeup on its tick",
+        reqs[4]?.tools.includes("schedule_wakeup"));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -932,9 +998,21 @@ if (s.runs) {
   const mod = await import(pathToFileURL(join(HERE, "dist", "cli.js")).href);
   let crashed = false;
   for (const r of s.runs) {
-    console.log(`  you: ${r.argv.join(" ")}\n`);
+    console.log(`  you: ${r.argv ? r.argv.join(" ") : `(loop) ${r.loop}`}\n`);
     try {
-      await mod.runCli(r.argv);
+      if (r.loop !== undefined) {
+        // ch24：/loop 是 REPL 命令（对齐 src 后 one-shot 不解析斜杠命令），
+        // mock 直接驱动 agent 层。stopLoopAfterMs 模拟 Ctrl+C 中断——
+        // dynamic 唤醒延迟钳到 60s 起，真等不现实，靠 loopStop 提前退出睡眠
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        if (r.maxTurns) a.setMaxTurns(r.maxTurns);
+        if (r.stopLoopAfterMs) setTimeout(() => a.stopLoop(), r.stopLoopAfterMs);
+        await a.runLoop(r.loop);
+        if (a.close) await a.close();
+      } else {
+        await mod.runCli(r.argv);
+      }
     } catch (e) {
       console.log(`  run crashed: ${e?.message ?? e}`);
       crashed = true;

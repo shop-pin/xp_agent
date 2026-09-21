@@ -7,7 +7,13 @@ import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, t
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
 import { McpManager } from "./mcp.js";
 import { withRetry } from "./retry.js";
-import { evaluateGoal, classifyAction } from "./autonomy.js";
+import {
+    goalDirective, GOAL_EVALUATOR_SYSTEM, GOAL_TRANSCRIPT_FRAMING, goalJudgeUserMessage,
+    parseGoalVerdict, GOAL_MAX_ITERATIONS, type GoalVerdict,
+    parseLoopInput, isDailyWording, OFFER_CLOUD_THRESHOLD_SECONDS,
+    SCHEDULE_WAKEUP_TOOL, clampWakeupDelay, dynamicLoopDirective, LOOP_MAX_ITERATIONS, type LoopSpec,
+    classifyAction,
+} from "./autonomy.js";
 import { saveSession } from "./session.js";
 import { randomUUID } from "crypto";
 import { mkdirSync, writeFileSync } from "fs";
@@ -83,6 +89,22 @@ export class Agent {
     private memoryPrefetch: MemoryPrefetch | null = null;
     private alreadySurfacedMemories: Set<string> = new Set();
     private sessionMemoryBytes = 0;
+
+    // ─── ch24：/goal 三态与 /loop 两模式 ─────────────────────────
+    // /goal——会话级 Stop hook 条件，跨 turn 追逐
+    private activeGoal: {
+        condition: string;
+        iterations: number;
+        startedAt: number;
+        lastReason?: string;
+    } | null = null;
+    private goalStop = false; // 中断时置位，跳出 goal 追逐
+    // /loop dynamic——模型调 schedule_wakeup 时写入，loop 驱动在 turn 收敛后读取并清空
+    private pendingWakeup: { delaySeconds: number; reason: string; prompt: string } | null = null;
+    private loopStop = false; // 中断时置位，跳出运行中的 loop
+    // schedule_wakeup 只在 dynamic loop 活跃期间路由到内部执行器——
+    // 防止裸调或同名外部工具
+    private scheduleWakeupEnabled = false;
 
     constructor(options: AgentOptions = {}) {
         this.mode = options.permissionMode || "default";
@@ -499,18 +521,251 @@ export class Agent {
             .join("\n");
     }
 
-    async pursueGoal(condition: string, prompt: string): Promise<void> {
-        await this.chat(prompt);
-        for (let i = 0; i < 5; i++) {
-            const verdict = await evaluateGoal(condition, this.transcriptText(), this.client, MODEL);
-            if (verdict.met) {
-                console.log(`✓ goal met: ${condition}`);
-                return;
-            }
-            console.log(`  (goal not met — ${verdict.reason}; continuing)`);
-            await this.chat(`The goal "${condition}" is not met yet: ${verdict.reason}. Keep working toward it.`);
+    // ─── /goal — prompt 版 Stop-hook（ch24：三态 JSON 契约）───────
+
+    /** 设定活跃 goal 并返回首轮指令（设定 goal 本身就开启一个 turn）。 */
+    setGoal(condition: string): string {
+        this.activeGoal = { condition, iterations: 0, startedAt: Date.now() };
+        printInfo(`◎ /goal active — Stop hook condition: "${condition}"`);
+        return goalDirective(condition);
+    }
+
+    /** /goal 无参数：打印当前 goal 状态。 */
+    showGoal(): void {
+        if (!this.activeGoal) {
+            printInfo("No active goal. Set one with /goal <condition>.");
+            return;
         }
-        console.log(`  (gave up after 5 iterations without meeting: ${condition})`);
+        const secs = ((Date.now() - this.activeGoal.startedAt) / 1000).toFixed(1);
+        const last = this.activeGoal.lastReason ? `\n  last reason: ${this.activeGoal.lastReason}` : "";
+        printInfo(
+            `◎ /goal active\n  condition: ${this.activeGoal.condition}\n  iterations: ${this.activeGoal.iterations}\n  elapsed: ${secs}s${last}`
+        );
+    }
+
+    /** 追逐活跃 goal：跑指令轮，然后循环 评估→(未达)回灌 reason→下一轮，
+     *  直到 met / impossible / 预算或迭代上限 / goalStop。 */
+    async pursueGoal(directive: string): Promise<void> {
+        if (!this.activeGoal) return;
+        this.goalStop = false;
+        try {
+            await this.chat(directive);
+            // 刚结束的 turn 在任何上限/续轮决策**之前**先评审——最终轮的输出不能漏判
+            while (this.activeGoal && !this.goalStop) {
+                const verdict = await this.evaluateGoal(this.activeGoal.condition);
+                if (verdict.ok) {
+                    const turns = this.activeGoal.iterations + 1;
+                    const secs = ((Date.now() - this.activeGoal.startedAt) / 1000).toFixed(1);
+                    printInfo(`✓ Goal achieved (${turns} turn${turns === 1 ? "" : "s"}, ${secs}s): ${verdict.reason}`);
+                    break;
+                }
+                if (verdict.impossible) {
+                    printInfo(`Hooks: Prompt hook condition judged impossible: ${verdict.reason}`);
+                    break;
+                }
+
+                // 未达：记录并决定是否还允许下一轮
+                this.activeGoal.iterations++;
+                this.activeGoal.lastReason = verdict.reason;
+                printInfo(`Hooks: Prompt hook condition was not met: ${verdict.reason}`);
+
+                const budget = this.checkBudget();
+                if (budget.exceeded) { printInfo(`Goal stopped: ${budget.reason}`); break; }
+                // 与 --max-turns 无关的硬顶：--max-turns 只数工具轮（checkBudget），
+                // 无工具的 goal 循环需要自己的无条件保险丝
+                if (this.activeGoal.iterations >= GOAL_MAX_ITERATIONS) {
+                    printInfo(`Goal stopped: reached ${GOAL_MAX_ITERATIONS} iterations without meeting the condition.`);
+                    break;
+                }
+                if (this.goalStop) break;
+
+                await this.chat(
+                    `Hooks: Prompt hook condition was not met: ${verdict.reason}\n\nKeep working toward the goal.`
+                );
+            }
+            if (this.goalStop) printInfo("Goal pursuit interrupted.");
+        } finally {
+            // 任何出口（met / impossible / 上限 / 中断）都清掉——stale goal 不能留着
+            this.activeGoal = null;
+        }
+    }
+
+    /** 对刚结束的 turn 做一次评估。transcript 以独立 assistant 消息发送
+     *  （前置 framing user 消息把它定性为数据）——被评审的 turn 无法伪造
+     *  user/judge 文本混进评估上下文，这是防注入的关键。 */
+    private async evaluateGoal(condition: string): Promise<GoalVerdict> {
+        const transcript = this.extractLastAssistantText();
+        const messages = [
+            { role: "user" as const, content: GOAL_TRANSCRIPT_FRAMING },
+            { role: "assistant" as const, content: transcript || "(no assistant output)" },
+            { role: "user" as const, content: goalJudgeUserMessage(condition) },
+        ];
+        try {
+            const raw = await this.runEvaluatorQuery(GOAL_EVALUATOR_SYSTEM, messages);
+            return parseGoalVerdict(raw);
+        } catch (e: any) {
+            // 评估器出错 → 按未达处理（fail-closed，绝不能误清 goal）
+            return { ok: false, reason: `evaluator error: ${e?.message ?? e}` };
+        }
+    }
+
+    /** 角色分离的评估器查询，返回模型文本。与 buildSideQuery 的差别：收完整
+     *  messages 数组（buildSideQuery 是单 user 消息，供 memory 召回用）。 */
+    private async runEvaluatorQuery(
+        system: string,
+        messages: { role: "user" | "assistant"; content: string }[],
+    ): Promise<string> {
+        const resp = await this.client.messages.create({
+            model: MODEL, max_tokens: 512, system, temperature: 0, messages,
+        });
+        return resp.content
+            .filter((b): b is Anthropic.TextBlock => b.type === "text")
+            .map((b) => b.text).join("");
+    }
+
+    /** 最近一条 assistant turn 的文本，供评审。 */
+    private extractLastAssistantText(): string {
+        for (let i = this.messages.length - 1; i >= 0; i--) {
+            const m: any = this.messages[i];
+            if (m.role !== "assistant") continue;
+            if (typeof m.content === "string") return m.content;
+            if (Array.isArray(m.content)) {
+                return m.content
+                    .filter((b: any) => b.type === "text")
+                    .map((b: any) => b.text)
+                    .join("");
+            }
+        }
+        return "";
+    }
+
+    // ─── /loop — 周期或自排程 prompt ─────────────────────────────
+    // /goal 是被动闸门（每轮评估），/loop 相反：主动自排程。/goal 决定
+    // *要不要*继续，/loop 决定*何时*开下一轮——固定间隔，或主模型经
+    // schedule_wakeup 自选节奏。
+
+    /** /loop 入口：解析输入，然后驱动对应模式。输入非法时直接返回。 */
+    async runLoop(rawInput: string): Promise<void> {
+        const spec = parseLoopInput(rawInput);
+        if ("error" in spec) {
+            printInfo(spec.error);
+            return;
+        }
+        // 云排程决策点（间隔 ≥60min 或 daily 措辞）——教学版只提示不实现
+        const wantsCloud =
+            (spec.mode === "interval" && spec.intervalSeconds! >= OFFER_CLOUD_THRESHOLD_SECONDS) ||
+            isDailyWording(rawInput);
+        if (wantsCloud) {
+            printInfo("(Real Claude Code would offer to convert this to a persistent cloud schedule that keeps running after the session ends. This teaching build has no cloud backend — continuing in-session.)");
+        }
+
+        this.loopStop = false;
+        if (spec.mode === "interval") {
+            await this.runLoopInterval(spec);
+        } else {
+            await this.runLoopDynamic(spec);
+        }
+    }
+
+    /** interval 模式：每 N 秒重跑 prompt，直到中断或迭代上限。 */
+    private async runLoopInterval(spec: LoopSpec): Promise<void> {
+        printInfo(`⟳ /loop scheduled every ${spec.intervalLabel} (session-only, not persisted — dies when this process exits). Ctrl+C to stop.`);
+        let iterations = 0;
+        while (!this.loopStop) {
+            iterations++;
+            printInfo(`⟳ loop tick ${iterations}`);
+            await this.chat(spec.prompt);
+
+            const budget = this.checkBudget();
+            if (budget.exceeded) { printInfo(`Loop stopped: ${budget.reason}`); break; }
+            // --max-turns 同时约束 loop tick：checkBudget 的轮计数只在工具轮增长，
+            // 纯文本循环永远撞不到它——这里把 --max-turns 当 tick 上限用
+            if (this.maxTurns !== null && iterations >= this.maxTurns) {
+                printInfo(`Loop stopped: tick limit reached (${iterations} >= ${this.maxTurns}).`);
+                break;
+            }
+            if (iterations >= LOOP_MAX_ITERATIONS) {
+                printInfo(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
+                break;
+            }
+            if (await this.interruptibleSleep(spec.intervalSeconds! * 1000)) { printInfo("Loop stopped."); break; }
+        }
+    }
+
+    /** dynamic 模式：跑一轮 tick，然后主模型经 schedule_wakeup 自排。
+     *  排了唤醒→等（钳过的）延迟，用它回传的 prompt 再跑；没排→收敛。
+     *  schedule_wakeup 只在 loop 期间暴露，退出时摘掉。 */
+    private async runLoopDynamic(spec: LoopSpec): Promise<void> {
+        printInfo("⟳ /loop dynamic (self-paced) — the model schedules its own next run, or ends the loop. Ctrl+C to stop.");
+        const hadTool = this.tools.some(t => t.name === "schedule_wakeup");
+        if (!hadTool) this.tools = [...this.tools, SCHEDULE_WAKEUP_TOOL];
+        this.scheduleWakeupEnabled = true;
+        let prompt = spec.prompt;
+        let iterations = 0;
+        try {
+            while (!this.loopStop) {
+                iterations++;
+                this.pendingWakeup = null;
+                await this.chat(dynamicLoopDirective(prompt));
+
+                if (!this.pendingWakeup) {
+                    printInfo(`⟳ Loop converged after ${iterations} tick${iterations === 1 ? "" : "s"} (model scheduled no wakeup).`);
+                    break;
+                }
+                const budget = this.checkBudget();
+                if (budget.exceeded) { printInfo(`Loop stopped: ${budget.reason}`); break; }
+                if (this.maxTurns !== null && iterations >= this.maxTurns) {
+                    printInfo(`Loop stopped: tick limit reached (${iterations} >= ${this.maxTurns}).`);
+                    break;
+                }
+                if (iterations >= LOOP_MAX_ITERATIONS) {
+                    printInfo(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
+                    break;
+                }
+                const { delaySeconds, reason, prompt: nextPrompt } = this.pendingWakeup;
+                printInfo(`⟳ next run in ${delaySeconds}s — ${reason}`);
+                prompt = nextPrompt || prompt;
+                if (await this.interruptibleSleep(delaySeconds * 1000)) { printInfo("Loop stopped."); break; }
+            }
+        } finally {
+            // schedule_wakeup 摘掉，别在 loop 之外继续暴露
+            if (!hadTool) this.tools = this.tools.filter(t => t.name !== "schedule_wakeup");
+            this.scheduleWakeupEnabled = false;
+            this.pendingWakeup = null;
+        }
+    }
+
+    /** schedule_wakeup 执行器：把请求的唤醒记下来，loop 驱动在 turn 收敛后读取。
+     *  延迟钳到 [60, 3600]。 */
+    private executeScheduleWakeup(input: Record<string, any>): string {
+        const delaySeconds = clampWakeupDelay(Number(input.delaySeconds));
+        const reason = typeof input.reason === "string" ? input.reason : "";
+        const prompt = typeof input.prompt === "string" ? input.prompt : "";
+        this.pendingWakeup = { delaySeconds, reason, prompt };
+        return `Wakeup scheduled in ${delaySeconds}s. The loop will resume then; end your turn now.`;
+    }
+
+    /** 可中断睡眠：loopStop 置位时提前返回 true，避免中断后还干等长间隔。 */
+    private interruptibleSleep(ms: number): Promise<boolean> {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const tick = () => {
+                if (this.loopStop) return resolve(true);
+                if (Date.now() - start >= ms) return resolve(false);
+                setTimeout(tick, Math.min(200, ms));
+            };
+            tick();
+        });
+    }
+
+    /** 停止运行中的 /loop（REPL 中断处理调用）。 */
+    stopLoop(): void {
+        this.loopStop = true;
+    }
+
+    /** 停止运行中的 /goal（REPL 中断处理调用，下一个 turn 边界生效）。 */
+    stopGoal(): void {
+        this.goalStop = true;
     }
 
     async chat(userText: string): Promise<void> {
@@ -642,6 +897,12 @@ export class Agent {
     private async executeToolCall(name: string, input: Record<string, any>): Promise<string> {
         if (name === "agent") return this.executeAgentTool(input);
         if (name === "skill") return this.executeSkillTool(input);
+        if (name === "schedule_wakeup") {
+            // 只有 dynamic loop 驱动才路由到这里；loop 之外工具不广告，
+            // 这道守卫挡住模型裸调或同名外部工具
+            if (!this.scheduleWakeupEnabled) return "schedule_wakeup is only available during /loop dynamic mode.";
+            return this.executeScheduleWakeup(input);
+        }
         if (name.startsWith("mcp__")) {
             // server 掉线/名字拆错等——作为 tool_result 回给模型自行处置，不在主循环里炸
             try {
@@ -700,9 +961,11 @@ export class Agent {
         if (!result) return `Unknown skill: ${input.skill_name}`;
 
         if (result.context === "fork") {
-            const tools = result.allowedTools
+            // fork 不许继承 schedule_wakeup——它是本 agent dynamic loop 的驱动内部工具
+            const tools = (result.allowedTools
                 ? this.tools.filter(t => result.allowedTools!.includes(t.name))
-                : this.tools.filter(t => t.name !== "agent");
+                : this.tools.filter(t => t.name !== "agent"))
+                .filter(t => t.name !== "schedule_wakeup");
 
             printSubAgentStart("skill-fork", input.skill_name);
             const subAgent = new Agent({
