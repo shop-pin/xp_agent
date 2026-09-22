@@ -5,6 +5,7 @@ import * as os from "os";
 import { buildMemoryPromptSection } from "./memory.js";
 import { buildSkillDescriptions } from "./skills.js";
 import { buildAgentDescriptions } from "./subagent.js";
+import { getDeferredToolNames } from "./tools.js";
 
 const REGEXP = /^@(\S+)[ \t]*$/gm;
 const MAX_DEPTH = 5;
@@ -111,7 +112,13 @@ export function buildDynamicSystemContext(): string {
     const memorySection = buildMemoryPromptSection();
     const skillsSection = buildSkillDescriptions();
     const agentSection = buildAgentDescriptions();
-    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}${memorySection}${skillsSection}${agentSection}`;
+    // deferred 工具的"目录页"：schema 不广告，但名字要说，模型才知道去搜什么。
+    // 每次请求现算——tool_search 激活一个，它就从名单里消失
+    const deferredNames = getDeferredToolNames();
+    const deferredSection = deferredNames.length > 0
+        ? `\n\nThe following deferred tools are available via tool_search: ${deferredNames.join(", ")}. Use tool_search to fetch their full schemas when needed.`
+        : "";
+    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}${memorySection}${skillsSection}${agentSection}${deferredSection}`;
 }
 
 // 缓存的静态主体：所有用户、所有会话都完全一致，才能吃到前缀缓存

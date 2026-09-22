@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "readline";
-import { executeTool, toolDefinitions, truncateResult } from "./tools.js";
+import { executeTool, toolDefinitions, getActiveToolDefinitions, truncateResult, type ToolDef } from "./tools.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder } from "./prompt.js";
 import { checkPermission, type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
@@ -16,7 +16,7 @@ import {
 } from "./autonomy.js";
 import { saveSession } from "./session.js";
 import { randomUUID } from "crypto";
-import { mkdirSync, writeFileSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { printToolCall, printAssistantText, printInfo, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
@@ -49,7 +49,7 @@ export interface AgentOptions {
     // 子 agent 三件套：整个 system 视为静态块（跳过 dynamic 段与首条消息 reminder）、
     // 裁剪过的工具集、行为开关（不连 MCP、不 autoSave、不打 spinner/cost）
     customSystemPrompt?: string;
-    customTools?: Anthropic.Tool[];
+    customTools?: ToolDef[];
     isSubAgent?: boolean;
 }
 
@@ -57,7 +57,7 @@ export class Agent {
     private client: Anthropic;
     private messages: Anthropic.MessageParam[] = [];
     private mode: PermissionMode = "default";
-    private tools: Anthropic.Tool[];
+    private tools: ToolDef[];
     private staticSystemPrompt: string;
     private hasCustomPrompt: boolean;
     private isSubAgent: boolean;
@@ -67,6 +67,21 @@ export class Agent {
     private readFileState: Map<string, number> = new Map();
     private confirmedPaths: Set<string> = new Set();
     private confirmFn?: (message: string) => Promise<boolean>;
+
+    // ─── ch25 Plan Mode ─────────────────────────────────────────
+    // prePlanMode 记住进入前的模式——退出时精确恢复（acceptEdits 进 plan，
+    // 出来还是 acceptEdits，而不是掉回 default）
+    private prePlanMode: PermissionMode | null = null;
+    private planFilePath: string | null = null;
+    // 审批选项 1 的信号位：清历史后 exit 结果要作为重建上下文的首条 user 消息，
+    // 主循环读它改道。工具批次里更早的 tool_result 随旧历史一起作废
+    private contextCleared = false;
+    // 审批回调由 CLI/测试注入——Agent 类不依赖具体 UI（readline/对话框/测试桩）。
+    // 子 agent 没有回调，exit 走 fallback 直接恢复原模式
+    private planApprovalFn?: (planContent: string) => Promise<{
+        choice: "clear-and-execute" | "execute" | "manual-execute" | "keep-planning";
+        feedback?: string;
+    }>;
     private sessionId: string = randomUUID().slice(0, 8);
     private sessionStartTime: string = new Date().toISOString();
 
@@ -126,6 +141,11 @@ export class Agent {
             ...sdkRetries,
         });
         this.effectiveWindow = getContextWindow(MODEL) - 20000;
+        // --plan 启动即规划：plan 文件路径在此生成，提示注入走请求时的
+        // buildAnthropicSystem() planSuffix（本类没有常驻 systemPrompt 字段）
+        if (this.mode === "plan") {
+            this.planFilePath = this.generatePlanFilePath();
+        }
     }
 
     history(): Anthropic.MessageParam[] {
@@ -142,6 +162,61 @@ export class Agent {
 
     setMode(mode: PermissionMode): void {
         this.mode = mode;
+    }
+
+    setPlanApprovalFn(fn: (planContent: string) => Promise<{
+        choice: "clear-and-execute" | "execute" | "manual-execute" | "keep-planning";
+        feedback?: string;
+    }>): void {
+        this.planApprovalFn = fn;
+    }
+
+    // REPL /plan 入口：对称的进出切换。进入时生成 plan 文件；plan 提示不在这里
+    // 拼——请求时 buildAnthropicSystem() 按 mode 现算，省掉一份常驻 systemPrompt
+    togglePlanMode(): string {
+        if (this.mode === "plan") {
+            this.mode = this.prePlanMode || "default";
+            this.prePlanMode = null;
+            this.planFilePath = null;
+            printInfo(`Exited plan mode → ${this.mode} mode`);
+            return this.mode;
+        }
+        this.prePlanMode = this.mode;
+        this.mode = "plan";
+        this.planFilePath = this.generatePlanFilePath();
+        printInfo(`Entered plan mode. Plan file: ${this.planFilePath}`);
+        return "plan";
+    }
+
+    // plan 文件按会话 ID 落盘（clear-and-execute 清掉历史后，磁盘上还有底稿可读；
+    // 也方便用户跨会话翻看历史方案）。目录用 my_src 自己的 ~/.mini-claude 命名空间
+    // （src 用 ~/.claude/plans——教学版不碰真实 Claude Code 的目录）
+    private generatePlanFilePath(): string {
+        const dir = join(homedir(), ".mini-claude", "plans");
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        return join(dir, `plan-${this.sessionId}.md`);
+    }
+
+    private buildPlanModePrompt(): string {
+        return `
+
+# Plan Mode Active
+
+Plan mode is active. You MUST NOT make any edits (except the plan file below), run non-readonly tools, or make any changes to the system.
+
+## Plan File: ${this.planFilePath}
+Write your plan incrementally to this file using write_file or edit_file. This is the ONLY file you are allowed to edit.
+
+## Workflow
+1. **Explore**: Read code to understand the task. Use read_file, list_files, grep_search.
+2. **Design**: Design your implementation approach. Use the agent tool with type="plan" if the task is complex.
+3. **Write Plan**: Write a structured plan to the plan file including:
+   - **Context**: Why this change is needed
+   - **Steps**: Implementation steps with critical file paths
+   - **Verification**: How to test the changes
+4. **Exit**: Call exit_plan_mode when your plan is ready for user review.
+
+IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that.`;
     }
 
     setMaxCost(usd: number): void {
@@ -470,8 +545,11 @@ export class Agent {
     // 含工具 schema，命中服务端前缀缓存）；动态上下文（环境 + memory 索引）
     // 放断点之后——模型写一条记忆索引就变，进了静态块等于每次写记忆都作废缓存
     private buildAnthropicSystem(): Anthropic.TextBlockParam[] {
+        // plan 提示进动态尾巴：进出 plan 模式它就变，混进静态块等于每次进出
+        // plan 都作废一次前缀缓存
+        const planSuffix = this.mode === "plan" ? this.buildPlanModePrompt() : "";
         // 子 agent（customSystemPrompt）：整个 system 当静态块，dynamic 段是主对话的环境噪音
-        const dynamicText = this.hasCustomPrompt ? "" : buildDynamicSystemContext().trim();
+        const dynamicText = ((this.hasCustomPrompt ? "" : buildDynamicSystemContext()) + planSuffix).trim();
         const blocks: Anthropic.TextBlockParam[] = [
             { type: "text", text: this.staticSystemPrompt, cache_control: { type: "ephemeral" } },
         ];
@@ -797,7 +875,7 @@ export class Agent {
                         model: MODEL,
                         max_tokens: 4096,
                         system: this.buildAnthropicSystem(),
-                        tools: [...this.tools, ...mcpTools],
+                        tools: [...getActiveToolDefinitions(this.tools), ...mcpTools],
                         messages: this.withCacheBreakpoints(this.messages),
                     });
                     // src 同款协调：首个 text 事件先停 spinner 再打印，避免 \r 重画吃掉流式输出；
@@ -855,6 +933,7 @@ export class Agent {
             }
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
+            let contextBreak = false;
             for (const tu of toolUses) {
                 printToolCall(tu.name, tu.input as Record<string, any>);
                 if (this.mode === "auto" && ["write_file", "edit_file", "run_shell"].includes(tu.name)) {
@@ -868,7 +947,7 @@ export class Agent {
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
                     continue;
                 }
-                const perm = checkPermission(tu.name, tu.input as Record<string, any>, this.mode);
+                const perm = checkPermission(tu.name, tu.input as Record<string, any>, this.mode, this.planFilePath || undefined);
                 if (perm.action === "deny") {
                     printInfo(`Denied: ${perm.message}`);
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: `Denied: ${perm.message}` });
@@ -886,15 +965,32 @@ export class Agent {
                     }
                 }
                 const output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
+                if (this.contextCleared) {
+                    // 选项 1（clear-and-execute）：历史刚被清空，exit 结果作为重建
+                    // 上下文的首条 user 消息（带 CLAUDE.md reminder，与 chat() 首条
+                    // 同待遇）；本批更早的 tool_result 随旧历史一起作废——assistant
+                    // 的 tool_use 块也已清掉，不会留孤儿
+                    this.contextCleared = false;
+                    const content = this.messages.length === 0 && !this.hasCustomPrompt
+                        ? `${output}\n\n${buildUserContextReminder()}`
+                        : output;
+                    this.messages.push({ role: "user", content });
+                    contextBreak = true;
+                    break;
+                }
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
             }
-            this.messages.push({ role: "user", content: toolResult });
+            if (!contextBreak && !this.contextCleared && toolResult.length > 0) {
+                this.messages.push({ role: "user", content: toolResult });
+            }
+            this.contextCleared = false;
         }
     }
 
     // ─── 工具分发（ch23 重构）：普通工具落 executeTool；agent/skill/mcp 走各自通道 ───
 
     private async executeToolCall(name: string, input: Record<string, any>): Promise<string> {
+        if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
         if (name === "agent") return this.executeAgentTool(input);
         if (name === "skill") return this.executeSkillTool(input);
         if (name === "schedule_wakeup") {
@@ -912,6 +1008,80 @@ export class Agent {
             }
         }
         return executeTool(name, input, this.readFileState);
+    }
+
+    // ─── Plan Mode 工具执行（ch25）──────────────────────────────
+
+    private async executePlanModeTool(name: string): Promise<string> {
+        if (name === "enter_plan_mode") {
+            if (this.mode === "plan") return "Already in plan mode.";
+            this.prePlanMode = this.mode;
+            this.mode = "plan";
+            this.planFilePath = this.generatePlanFilePath();
+            printInfo("Entered plan mode (read-only). Plan file: " + this.planFilePath);
+            return `Entered plan mode. You are now in read-only mode.\n\nYour plan file: ${this.planFilePath}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode.`;
+        }
+
+        if (name === "exit_plan_mode") {
+            if (this.mode !== "plan") return "Not in plan mode.";
+            // plan 内容从磁盘读而非内存——clear-and-execute 之后历史没了，底稿还在
+            let planContent = "(No plan file found)";
+            if (this.planFilePath && existsSync(this.planFilePath)) {
+                planContent = readFileSync(this.planFilePath, "utf-8");
+            }
+
+            if (this.planApprovalFn) {
+                const result = await this.planApprovalFn(planContent);
+
+                if (result.choice === "keep-planning") {
+                    // 打回重做：不退出 plan 模式，反馈作为 tool_result 回灌——
+                    // 模型留在只读态改方案
+                    const feedback = result.feedback || "Please revise the plan.";
+                    return `User rejected the plan and wants to keep planning.\n\nUser feedback: ${feedback}\n\nPlease revise your plan based on this feedback. When done, call exit_plan_mode again.`;
+                }
+
+                // 批准：选项 1/2 → acceptEdits（自动接受编辑，执行效率最高）；
+                // 选项 3（manual-execute）→ 恢复进入前的模式
+                let targetMode: PermissionMode;
+                if (result.choice === "clear-and-execute") {
+                    targetMode = "acceptEdits";
+                } else if (result.choice === "execute") {
+                    targetMode = "acceptEdits";
+                } else {
+                    targetMode = this.prePlanMode || "default";
+                }
+
+                this.mode = targetMode;
+                this.prePlanMode = null;
+                const savedPlanPath = this.planFilePath;
+                this.planFilePath = null;
+
+                if (result.choice === "clear-and-execute") {
+                    this.clearHistoryKeepSystem();
+                    this.contextCleared = true;
+                    printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
+                    return `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\nPlan file: ${savedPlanPath}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
+                }
+
+                printInfo(`Plan approved. Executing in ${targetMode} mode.`);
+                return `User approved the plan. Permission mode: ${targetMode}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
+            }
+
+            // 无审批回调（one-shot/子 agent）：直接退出恢复原模式
+            this.mode = this.prePlanMode || "default";
+            this.prePlanMode = null;
+            this.planFilePath = null;
+            printInfo("Exited plan mode. Restored to " + this.mode + " mode.");
+            return `Exited plan mode. Permission mode restored to: ${this.mode}\n\n## Your Plan:\n${planContent}`;
+        }
+
+        return `Unknown plan mode tool: ${name}`;
+    }
+
+    /** 审批选项 1 的清历史：system 在请求时现算，无需保留；token 仪表归零。 */
+    private clearHistoryKeepSystem() {
+        this.messages = [];
+        this.lastInputTokenCount = 0;
     }
 
     // ─── Sub-agent fork（ch23）────────────────────────────────

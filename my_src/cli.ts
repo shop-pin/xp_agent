@@ -3,7 +3,8 @@ import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
 import { loadSession, getLatestSessionId } from "./session.js";
 import { discoverSkills, getSkillByName, resolveSkillPrompt } from "./skills.js";
-import { printWelcome, printError, printInfo } from "./ui.js";
+import type { PermissionMode } from "./permissions.js";
+import { printWelcome, printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
     let resume: boolean = false;
@@ -11,7 +12,40 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         resume = true;
         argv = argv.filter((t) => t !== "--resume");
     }
-    const agent = new Agent();
+    // 模式 flag 先解析完再构造 Agent——--plan 的 plan 文件路径在构造期生成
+    // （对齐 src：parseArgs → new Agent({ permissionMode })，构造函数处理 plan 态）
+    let permissionMode: PermissionMode = "default";
+    if (argv.includes("--plan")) {
+        permissionMode = "plan";
+        argv = argv.filter((t) => t !== "--plan");
+        console.log(`(plan mode: read-only)`);
+    }
+
+    if (argv.includes("--auto")) {
+        permissionMode = "auto";
+        argv = argv.filter((t) => t !== "--auto");
+        console.log(`(auto mode: a classifier gates dangerous actions)`);
+    }
+
+    if (argv.includes("--yolo") || argv.includes("-y")) {
+        permissionMode = "bypassPermissions";
+        argv = argv.filter((t) => t !== "--yolo" && t !== "-y");
+        console.log(`(bypassPermissions: confirmations skipped; deny rules still apply)`);
+    }
+
+    if (argv.includes("--accept-edits")) {
+        permissionMode = "acceptEdits";
+        argv = argv.filter((t) => t !== "--accept-edits");
+        console.log(`(acceptEdits: file edits auto-approved, dangerous shell still confirmed)`);
+    }
+
+    if (argv.includes("--dont-ask")) {
+        permissionMode = "dontAsk";
+        argv = argv.filter((t) => t !== "--dont-ask");
+        console.log(`(dontAsk: anything needing confirmation is auto-denied)`);
+    }
+
+    const agent = new Agent({ permissionMode });
     if (resume) {
         const sessionId = getLatestSessionId();
         if (sessionId) {
@@ -24,35 +58,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         } else {
             printInfo("No previous sessions found.");
         }
-    }
-    if (argv.includes("--plan")) {
-        agent.setMode("plan");
-        argv = argv.filter((t) => t !== "--plan");
-        console.log(`(plan mode: read-only)`);
-    }
-
-    if (argv.includes("--auto")) {
-        agent.setMode("auto");
-        argv = argv.filter((t) => t !== "--auto");
-        console.log(`(auto mode: a classifier gates dangerous actions)`);
-    }
-
-    if (argv.includes("--yolo") || argv.includes("-y")) {
-        agent.setMode("bypassPermissions");
-        argv = argv.filter((t) => t !== "--yolo" && t !== "-y");
-        console.log(`(bypassPermissions: confirmations skipped; deny rules still apply)`);
-    }
-
-    if (argv.includes("--accept-edits")) {
-        agent.setMode("acceptEdits");
-        argv = argv.filter((t) => t !== "--accept-edits");
-        console.log(`(acceptEdits: file edits auto-approved, dangerous shell still confirmed)`);
-    }
-
-    if (argv.includes("--dont-ask")) {
-        agent.setMode("dontAsk");
-        argv = argv.filter((t) => t !== "--dont-ask");
-        console.log(`(dontAsk: anything needing confirmation is auto-denied)`);
     }
 
     let goalCondition: string | undefined;
@@ -101,6 +106,35 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
             });
         });
     });
+    // 审批回调复用同一个 readline（同一个 stdin 开第二个 interface 的经典坑）。
+    // 选项 4 追问反馈；无效输入原界面重问
+    agent.setPlanApprovalFn((planContent: string) => {
+        return new Promise((resolve) => {
+            printPlanForApproval(planContent);
+            printPlanApprovalOptions();
+
+            const askChoice = () => {
+                rl.question("  Enter choice (1-4): ", (answer) => {
+                    const choice = answer.trim();
+                    if (choice === "1") {
+                        resolve({ choice: "clear-and-execute" });
+                    } else if (choice === "2") {
+                        resolve({ choice: "execute" });
+                    } else if (choice === "3") {
+                        resolve({ choice: "manual-execute" });
+                    } else if (choice === "4") {
+                        rl.question("  Feedback (what to change): ", (feedback) => {
+                            resolve({ choice: "keep-planning", feedback: feedback.trim() || undefined });
+                        });
+                    } else {
+                        console.log("  Invalid choice. Enter 1, 2, 3, or 4.");
+                        askChoice();
+                    }
+                });
+            };
+            askChoice();
+        });
+    });
     printWelcome();
     return await new Promise<void>((resolve) => {
         // stdin EOF (Ctrl+D on an empty line) closes the readline interface
@@ -120,6 +154,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                 if (input === "/clear") {
                     agent.clearHistory();
                     console.log(`(history cleared)`);
+                    ask();
+                    return;
+                }
+                if (input === "/plan") {
+                    agent.togglePlanMode();
                     ask();
                     return;
                 }

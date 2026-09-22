@@ -122,30 +122,41 @@ export function matchesRule(rule: ParsedRule, toolName: string, input: Record<st
 export type PermissionDecision = { action: "allow" | "deny" | "confirm"; message?: string };
 
 // 八阶段流水线：顺序即安全语义（显式禁令 > 模式契约 > 便捷快捷方式 > 默认行为）。
-// ① deny 规则（连 --yolo 也拦） ② plan 只读契约（plan 文件豁免留 ch25） ③ bypass 全放行
-// ④ allow 规则（核心价值=免确认） ⑤ READ_TOOLS ⑥ acceptEdits+EDIT_TOOLS
-// ⑦ confirm 候选（dontAsk 转 deny） ⑧ 兜底 allow
+// ① deny 规则（连 --yolo 也拦） ② plan 只读契约（唯一豁免 = plan 文件本身，
+//   路径全等才放行） ③ bypass 全放行 ④ allow 规则（核心价值=免确认）
+// ⑤ READ_TOOLS ⑥ plan 工具本身（进出是纯状态切换，agent 层处理） ⑦ acceptEdits+EDIT_TOOLS
+// ⑧ confirm 候选（dontAsk 转 deny） ⑨ 兜底 allow
 export function checkPermission(
     toolName: string,
     input: Record<string, any>,
-    mode: PermissionMode = "default"
+    mode: PermissionMode = "default",
+    planFilePath?: string
 ): PermissionDecision {
     // 只扫一次规则表，①④ 共用同一个结果——两次调用间规则不会变，且省一半扫描
     const ruleResult = checkPermissionRules(toolName, input);
     if (ruleResult === "deny") {
         return { action: "deny", message: `Denied by permission rule for ${toolName}` };
     }
+    // plan 只读契约压在 allow 规则和 bypass 之上：除 plan 文件外一切写/编辑都拦，
+    // shell 也拦——"只读"是代码强制，不是提示词恳求
     if (mode === "plan") {
         if (EDIT_TOOLS.has(toolName)) {
+            const filePath = input.file_path || input.path;
+            if (planFilePath && filePath === planFilePath) {
+                return { action: "allow" };
+            }
             return { action: "deny", message: `Blocked in plan mode: ${toolName}` };
         }
         if (toolName === "run_shell") {
-            return { action: "deny", message: "Blocked in plan mode: run_shell" };
+            return { action: "deny", message: "Shell commands blocked in plan mode" };
         }
     }
     if (mode === "bypassPermissions") return { action: "allow" };
     if (ruleResult === "allow") return { action: "allow" };
     if (READ_TOOLS.has(toolName)) return { action: "allow" };
+    if (toolName === "enter_plan_mode" || toolName === "exit_plan_mode") {
+        return { action: "allow" };
+    }
     if (mode === "acceptEdits" && EDIT_TOOLS.has(toolName)) return { action: "allow" };
 
     let confirmMessage = "";

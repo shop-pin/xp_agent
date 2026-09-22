@@ -5,7 +5,11 @@ import { glob } from "glob";
 import type Anthropic from "@anthropic-ai/sdk";
 import { getMemoryDir, updateMemoryIndex } from "./memory.js";
 
-export const toolDefinitions: Anthropic.Tool[] = [
+// deferred 标记的工具不随 schema 广告（getActiveToolDefinitions 过滤），
+// 模型经 tool_search 搜索到后才激活——大多数会话用不到的工具不占提示词空间
+export type ToolDef = Anthropic.Tool & { deferred?: boolean };
+
+export const toolDefinitions: ToolDef[] = [
     {
         name: "read_file",
         description: "Read the contents of a file. Returns the file content with line numbers.",
@@ -128,6 +132,27 @@ export const toolDefinitions: Anthropic.Tool[] = [
             required: ["url"],
         },
     },
+    // ─── Plan mode tools（deferred：用到才激活）──────────────────
+    {
+        name: "enter_plan_mode",
+        description:
+            "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file. Use this when you need to explore the codebase and design an implementation plan before making changes.",
+        input_schema: {
+            type: "object",
+            properties: {},
+        },
+        deferred: true,
+    },
+    {
+        name: "exit_plan_mode",
+        description:
+            "Exit plan mode after you have finished writing your plan to the plan file. The user will review and approve the plan before you proceed with implementation.",
+        input_schema: {
+            type: "object",
+            properties: {},
+        },
+        deferred: true,
+    },
     // ─── Skill tool ─────────────────────────────────────────────
     {
         name: "skill",
@@ -173,7 +198,46 @@ export const toolDefinitions: Anthropic.Tool[] = [
             required: ["description", "prompt"],
         },
     },
+    // ─── Tool search（deferred 工具的加载器，本身永远广告）─────────
+    {
+        name: "tool_search",
+        description:
+            "Search for available tools by name or keyword. Returns full schema definitions for matching deferred tools so you can use them.",
+        input_schema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Tool name or search keywords" },
+            },
+            required: ["query"],
+        },
+    },
 ];
+
+// ─── Deferred tool activation ───────────────────────────────
+// 激活态是模块级全局（对齐 src）：主对话 tool_search 一次，同名 deferred 工具
+// 对后续所有请求（含子 agent）永久可见——一次搜索，终身有效
+const activatedTools = new Set<string>();
+
+export function resetActivatedTools(): void {
+    activatedTools.clear();
+}
+
+// 发请求用的工具清单：非 deferred 的全量，deferred 的只给已激活的；
+// deferred 标记本身要剥掉（API 不认识这个字段）
+export function getActiveToolDefinitions(allTools?: ToolDef[]): Anthropic.Tool[] {
+    const tools = allTools || toolDefinitions;
+    return tools
+        .filter((t) => !t.deferred || activatedTools.has(t.name))
+        .map(({ deferred, ...rest }) => rest);
+}
+
+// 还没激活的 deferred 工具名单——拼进 system 提示，模型才知道去搜什么
+export function getDeferredToolNames(allTools?: ToolDef[]): string[] {
+    const tools = allTools || toolDefinitions;
+    return tools
+        .filter((t) => t.deferred && !activatedTools.has(t.name))
+        .map((t) => t.name);
+}
 
 export async function executeTool(
     name: string,
@@ -203,6 +267,22 @@ export async function executeTool(
         case "web_fetch":
             result = await webFetch(input as { url: string; max_length?: number });
             break;
+        case "tool_search": {
+            const query = ((input.query as string) || "").toLowerCase();
+            const deferred = toolDefinitions.filter((t) => t.deferred);
+            const matches = deferred.filter((t) =>
+                t.name.toLowerCase().includes(query) ||
+                ((t.description as string) || "").toLowerCase().includes(query)
+            );
+            if (matches.length === 0) return "No matching deferred tools found.";
+            for (const m of matches) activatedTools.add(m.name);
+            // 直接 return：命中即激活，返回完整 schema 让模型立刻会用
+            return JSON.stringify(matches.map((t) => ({
+                name: t.name,
+                description: t.description,
+                input_schema: t.input_schema,
+            })), null, 2);
+        }
         default:
             return `Unknown tool: ${name}`;
     }

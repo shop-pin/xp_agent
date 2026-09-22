@@ -241,28 +241,124 @@ const scenarios = {
     },
   },
   "10": {
-    // chapter 10: --plan starts the CLI in read-only mode. The model tries to
-    // write a file, the gate denies it naming plan mode, nothing lands on disk,
-    // and the model recovers with a text-only reply.
+    // chapter 10 → ch25 迁移：plan 拦截仍是开场戏（阶段②只读契约，非 plan 文件
+    // 一律拒），plan 模式里读文件照常放行（只读语义），之后模型经 tool_search
+    // 激活 deferred 的 exit_plan_mode 并调用——one-shot 无 REPL 审批回调，走
+    // fallback 直接退出恢复 default 模式，随后的 write 成功落盘。setup 预置
+    // report.txt：覆盖已存在文件没有 confirm 候选，one-shot 没有 confirmFn 也
+    // 不悬在 stdin；预置同时引来 ch18 read-before-write 门——所以恢复后先读再写。
     needsLog: true,
-    setup: () => {},
+    setup: (dir) => writeFileSync(join(dir, "report.txt"), "old content"),
     runs: [{ argv: ["--plan", "Create a file report.txt with the plan."] }],
     turns: [
       { tools: [{ name: "write_file", input: { file_path: "report.txt", content: "the plan" } }] },
-      { text: "That was blocked because we're in plan (read-only) mode." },
+      { tools: [{ name: "read_file", input: { file_path: "report.txt" } }] },
+      { tools: [{ name: "tool_search", input: { query: "plan" } }] },
+      { tools: [{ name: "exit_plan_mode", input: {} }] },
+      { tools: [{ name: "write_file", input: { file_path: "report.txt", content: "the plan" } }] },
+      { text: "Plan mode exited, report.txt updated." },
     ],
     verify: (dir, logPath) => {
       let ok = true;
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
-      check("nothing was written in plan mode", !existsSync(join(dir, "report.txt")));
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request");
-      check("two model calls (model saw the denial and recovered)", reqs.length === 2);
+      check("6 model calls (deny -> read -> search -> exit -> write -> finish)", reqs.length === 6);
       check("the actual task reached the model", reqs[0]?.firstUserText.includes("Create a file report.txt"));
       const denial = (reqs[1]?.toolResults || []).map((t) => t.content).join(" ");
       check("tool_result says Denied", denial.includes("Denied"));
       check("denial names the mode (plan)", denial.includes("plan"));
       check("denial is not the file content", !denial.includes("the plan"));
+      check("reads still allowed in plan mode",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("old content")));
+      check("deferred plan tools hidden before tool_search",
+        !reqs[2]?.tools.includes("exit_plan_mode") && !reqs[2]?.tools.includes("enter_plan_mode"));
+      check("activated by tool_search by the 4th request", reqs[3]?.tools.includes("exit_plan_mode"));
+      const exitRes = (reqs[4]?.toolResults || []).map((t) => t.content).join(" ");
+      check("fallback exit (no approval fn in one-shot) restored default mode",
+        exitRes.includes("Permission mode restored to: default"));
+      check("write success fed back after restore",
+        (reqs[5]?.toolResults || []).some((t) => t.content.includes("Successfully wrote")));
+      check("report.txt overwritten after mode restore",
+        existsSync(join(dir, "report.txt")) && readFileSync(join(dir, "report.txt"), "utf-8") === "the plan");
+      if (!ok) process.exitCode = 1;
+    },
+  },
+  "25": {
+    // ch25 新场景：deferred 激活 + Plan Mode 三种审批去向。三个 run 直调 agent 层
+    // （planApprovalFn 脚本化注入——runCli one-shot 不带 REPL 审批，fallback 路径
+    // 由 ch10 迁移覆盖）。激活态是模块级全局：run1 tool_search 之后 enter/exit
+    // 对后续 run 一直可见，run2/run3 无需再搜。
+    // run1 execute：搜索 → enter → exit（审批 choice=execute）→ 模式落 acceptEdits
+    //   → 新文件写免确认直接落盘。
+    // run2 keep-planning：exit 被打回（feedback 回灌），模式**留在 plan**——
+    //   后续 write 仍被拦是"留在 plan"的硬证据。
+    // run3 clear-and-execute：审批清空历史，exit 结果以独立 user 消息重建上下文
+    //   （首条消息带 CLAUDE.md reminder），断言 messageCount===1。
+    // plan 文件路径含随机 sessionId，脚本化 write 够不着——写 plan 文件豁免
+    // （checkPermission 全等放行分支）mock 测不到，靠 review + 真机冒烟兜底。
+    needsLog: true,
+    setup: () => {},
+    runs: [
+      { prompt: "Plan how to create report.txt, then do it.", planApproval: { choice: "execute" } },
+      { prompt: "Plan the refactor.", planApproval: { choice: "keep-planning", feedback: "Add a verification step." } },
+      { prompt: "Plan the migration.", planApproval: { choice: "clear-and-execute" } },
+    ],
+    tracks: {
+      main: {
+        turns: [
+          // run1（t0-t4）
+          { tools: [{ name: "tool_search", input: { query: "plan" } }] },
+          { tools: [{ name: "enter_plan_mode", input: {} }] },
+          { tools: [{ name: "exit_plan_mode", input: {} }] },
+          { tools: [{ name: "write_file", input: { file_path: "report.txt", content: "the plan, executed" } }] },
+          { text: "Plan approved and executed." },
+          // run2（t5-t8）
+          { tools: [{ name: "enter_plan_mode", input: {} }] },
+          { tools: [{ name: "exit_plan_mode", input: {} }] },
+          { tools: [{ name: "write_file", input: { file_path: "evil.txt", content: "should not land" } }] },
+          { text: "Still in plan mode after the rejection." },
+          // run3（t9-t12）
+          { tools: [{ name: "enter_plan_mode", input: {} }] },
+          { tools: [{ name: "exit_plan_mode", input: {} }] },
+          { tools: [{ name: "write_file", input: { file_path: "fresh.txt", content: "fresh start" } }] },
+          { text: "Fresh context, executing." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request").filter((e) => e.track === "main");
+      const tr = (i) => (reqs[i]?.toolResults || []).map((t) => t.content).join("\n");
+      check("13 main-track requests (5 + 4 + 4)", reqs.length === 13);
+      check("system lists the deferred tools before activation",
+        reqs[0]?.system.includes("deferred tools are available via tool_search: enter_plan_mode, exit_plan_mode"));
+      check("deferred plan tools hidden before tool_search (tool_search itself advertised)",
+        !reqs[0]?.tools.includes("enter_plan_mode") && !reqs[0]?.tools.includes("exit_plan_mode")
+        && reqs[0]?.tools.includes("tool_search"));
+      check("tool_search returned the deferred schemas",
+        tr(1).includes("enter_plan_mode") && tr(1).includes("input_schema"));
+      check("deferred section gone + tools activated after tool_search",
+        !reqs[1]?.system.includes("available via tool_search")
+        && reqs[1]?.tools.includes("enter_plan_mode") && reqs[1]?.tools.includes("exit_plan_mode"));
+      check("enter result announces read-only + plan file",
+        tr(2).includes("Entered plan mode") && tr(2).includes("Your plan file"));
+      check("execute approval switched to acceptEdits",
+        tr(3).includes("User approved the plan") && tr(3).includes("acceptEdits"));
+      check("report.txt written under acceptEdits (no confirm fn injected)",
+        existsSync(join(dir, "report.txt")) && tr(4).includes("Successfully wrote"));
+      check("keep-planning feedback looped back to the model",
+        tr(7).includes("User rejected the plan") && tr(7).includes("User feedback: Add a verification step."));
+      check("keep-planning left plan mode ON (evil.txt denied)",
+        !existsSync(join(dir, "evil.txt")) && tr(8).includes("Blocked in plan mode"));
+      check("clear-and-execute rebuilt context as a single user message",
+        reqs[11]?.messageCount === 1 && reqs[11]?.firstUserText.includes("User approved the plan"));
+      check("rebuilt first message carries the CLAUDE.md reminder",
+        reqs[11]?.firstUserText.includes("<system-reminder>"));
+      check("fresh.txt written after clear-and-execute (3-msg history by then)",
+        existsSync(join(dir, "fresh.txt")) && reqs[12]?.messageCount === 3);
       if (!ok) process.exitCode = 1;
     },
   },
@@ -998,7 +1094,8 @@ if (s.runs) {
   const mod = await import(pathToFileURL(join(HERE, "dist", "cli.js")).href);
   let crashed = false;
   for (const r of s.runs) {
-    console.log(`  you: ${r.argv ? r.argv.join(" ") : `(loop) ${r.loop}`}\n`);
+    const label = r.argv ? r.argv.join(" ") : r.loop !== undefined ? `(loop) ${r.loop}` : r.prompt;
+    console.log(`  you: ${label}\n`);
     try {
       if (r.loop !== undefined) {
         // ch24：/loop 是 REPL 命令（对齐 src 后 one-shot 不解析斜杠命令），
@@ -1009,6 +1106,15 @@ if (s.runs) {
         if (r.maxTurns) a.setMaxTurns(r.maxTurns);
         if (r.stopLoopAfterMs) setTimeout(() => a.stopLoop(), r.stopLoopAfterMs);
         await a.runLoop(r.loop);
+        if (a.close) await a.close();
+      } else if (r.planApproval !== undefined) {
+        // ch25：审批回调脚本化注入（one-shot 无 REPL）。confirmFn 注入"自动否"——
+        // 若模式切换逻辑坏了，走 confirm 路径会干净失败而不是悬在 stdin
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        a.setConfirmFn(async () => false);
+        a.setPlanApprovalFn(async () => r.planApproval);
+        await a.chat(r.prompt);
         if (a.close) await a.close();
       } else {
         await mod.runCli(r.argv);
