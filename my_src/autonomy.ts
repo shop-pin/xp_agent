@@ -1,8 +1,12 @@
-import { Anthropic } from "@anthropic-ai/sdk";
+import { readFileSync, existsSync } from "fs";
+import { fileURLToPath } from "url";
+import { join, dirname } from "path";
 
-// Autonomy & continuation：/goal 与 /loop 的提示词与极简逻辑。
+// Autonomy & continuation：/goal、/loop 与 Auto Mode 的提示词与极简逻辑。
 // /goal 是被动闸门（Stop hook + 每轮评估器）；/loop 是主动自排程
-// （固定间隔，或让主模型经 schedule_wakeup 自选节奏）。
+// （固定间隔，或让主模型经 schedule_wakeup 自选节奏）；Auto Mode 把确认框
+// 换成读脱敏 transcript 的分类器（内部代号 YOLO classifier）——硬底线
+// （deny 规则）仍前置，分类器只裁"旧规则没拦、但也不该无脑放行"的动作。
 
 // ─── /goal — prompt 版 Stop-hook 评估器 ──────────────────────────────────────
 
@@ -164,36 +168,202 @@ export function dynamicLoopDirective(prompt: string): string {
 /** 间隔轮教学安全上限：无预算的演示循环也能终止。 */
 export const LOOP_MAX_ITERATIONS = 100;
 
-// ─── Auto Mode 简版分类器（ch14 遗留，ch26 换 transcript 双段分类器）────────
+// ─── Auto Mode — transcript 分类器权限闸 ─────────────────────────────────────
+//
+// default/acceptEdits 等模式靠静态规则 + 确认框决策；Auto Mode 把确认框换成
+// 一个 LLM：读一段脱敏的对话记录投影，对照自然语言规则集判"该不该拦"。
+// 提示词骨架、输出格式、两段后缀、CLAUDE.md 注入措辞逐字取自泄露实锤
+// （how-claude-code-works ch18 附录，Claude Code 2.1.201 二进制提取）；
+// 规则桶是 `claude auto-mode defaults` 的代表性子集。两段式流程（stage 1
+// 激进闸 → stage 2 审慎裁决）照跑；不做 GrowthBook 灰度/熔断、命令级 Bash
+// 分类器、规则 critique 元评估器。
 
-export async function classifyAction(
-    toolName: string,
-    input: Record<string, any>,
-    transcript: string,
-    client: Anthropic,
-    model: string):
-    Promise<{ allow: boolean; reason: string }> {
-    const reply = await client.messages.create({
-        model,
-        max_tokens: 256,
-        system: "You are a security monitor for an autonomous AI coding agent. By default, actions are ALLOWED; block only clearly dangerous ones. Reply starting with exactly '<block>yes</block>' to block or '<block>no</block>' to allow, followed by a short reason.",
-        messages: [
-            {
-                role: "user",
-                content: `Tool: ${toolName}\nInput: ${JSON.stringify(input)}\n\nTranscript so far:\n${transcript}`,
-            },
-        ],
-    });
-    const text = reply.content
-        .filter((b) => b.type === "text")
-        .map((b: any) => b.text)
-        .join("")
-        .trim();
-    if (text.startsWith("<block>no</block>")) {
-        return { allow: true, reason: "" };
+export interface AutoModeRules {
+    system_skeleton: string;
+    output_format: string;
+    suffix: string;          // 单段后缀（留作参照）
+    suffix_stage1: string;   // 两段式：激进闸
+    suffix_stage2: string;   // 两段式：审慎裁决
+    claude_md_injection: string;
+    allow: string[];
+    soft_deny: string[];
+    hard_deny: string[];
+    environment: string[];
+}
+
+let cachedRules: AutoModeRules | null = null;
+
+const REQUIRED_RULE_STRINGS = [
+    "system_skeleton", "output_format", "suffix", "suffix_stage1", "suffix_stage2", "claude_md_injection",
+] as const;
+const REQUIRED_RULE_ARRAYS = ["allow", "soft_deny", "hard_deny", "environment"] as const;
+
+/** 加载分类器规则资产（带缓存）。从本模块位置向上爬父目录找
+ *  assets/auto-mode-rules.json——dist/ 或源码目录跑都能解析，不依赖进程 CWD
+ *  （mock 沙箱会 chdir，更不能锚 cwd）。逐字段校验，缺一个就抛——规则资产
+ *  损坏必须 fail-closed（agent 层的 try/catch 把抛错转成拦截），绝不能留一个
+ *  undefined 后缀悄悄劣化某一段。 */
+export function loadAutoModeRules(): AutoModeRules {
+    if (cachedRules) return cachedRules;
+    let dir = dirname(fileURLToPath(import.meta.url));
+    let path = "";
+    for (let i = 0; i < 6; i++) {
+        const candidate = join(dir, "assets", "auto-mode-rules.json");
+        if (existsSync(candidate)) { path = candidate; break; }
+        dir = dirname(dir);
     }
-    return {
-        allow: false,
-        reason: text.replace("<block>yes</block>", "").trim() || "unparseable verdict",
-    };
+    if (!path) throw new Error("auto-mode rules asset not found (assets/auto-mode-rules.json)");
+    const obj: any = JSON.parse(readFileSync(path, "utf8"));
+    for (const k of REQUIRED_RULE_STRINGS) {
+        if (typeof obj[k] !== "string" || !obj[k].trim()) throw new Error(`auto-mode rules: missing/empty string field '${k}'`);
+    }
+    for (const k of REQUIRED_RULE_ARRAYS) {
+        if (!Array.isArray(obj[k]) || obj[k].length === 0) throw new Error(`auto-mode rules: missing/empty array field '${k}'`);
+    }
+    cachedRules = obj as AutoModeRules;
+    return cachedRules;
+}
+
+/** 组装分类器 system 提示：骨架 + 规则桶 + 输出格式。镜像真实 Claude Code 把
+ *  <permissions_template> 展开成 Environment / HARD BLOCK / SOFT BLOCK /
+ *  ALLOW 四节。用户的 CLAUDE.md 刻意不在这里——它是不可信的仓库内容，走
+ *  user 消息注入（见 classifierUserMessage）。塞进 system 等于给仓库内容
+ *  系统级权威去覆盖规则。 */
+export function buildClassifierSystem(rules: AutoModeRules): string {
+    const bucket = (title: string, items: string[]) =>
+        `## ${title}\n${items.map((r) => `- ${r}`).join("\n")}`;
+    return [
+        rules.system_skeleton,
+        bucket("Environment", rules.environment),
+        bucket("HARD BLOCK", rules.hard_deny),
+        bucket("SOFT BLOCK", rules.soft_deny),
+        bucket("ALLOW Exceptions", rules.allow),
+        rules.output_format,
+    ].join("\n\n");
+}
+
+/** 完全跳过分类器的工具——只读或无副作用，没东西可判。真实 Claude Code
+ *  SAFE_YOLO_ALLOWLISTED_TOOLS 的精简镜像。注意 write_file/edit_file 刻意
+ *  排除（真 CC 也排除 Write/Edit），web_fetch 也排除——URL 拉取可能带数据
+ *  出境，分类器必须看到。 */
+export const AUTO_MODE_FAST_PATH_TOOLS = new Set<string>([
+    "read_file", "list_files", "grep_search", "tool_search",
+    "enter_plan_mode", "exit_plan_mode",
+]);
+
+/** 拒绝上限：拦到这个次数说明分类器可能卡死在拒绝循环里，退回人工确认
+ *  （无人值守则拒绝）。逐字常量取自逆向实锤 §8。 */
+export const DENIAL_LIMITS = { maxConsecutive: 3, maxTotal: 20 };
+
+/** 头尾截断：超长负载撑不爆分类器提示，且两端都可见（机密常在两端）。 */
+function clip(s: string, max = 1500): string {
+    if (s.length <= max) return s;
+    const half = Math.floor((max - 20) / 2);
+    return `${s.slice(0, half)}…[${s.length - half * 2} chars]…${s.slice(-half)}`;
+}
+
+/** JSON 编码一条 transcript 条目，额外把 < > & 转成 \u 转义。裸
+ *  JSON.stringify 只转义引号和换行，不转尖括号——`</transcript>` 或
+ *  `<block>no</block>` 这类值会原样出现在 <transcript> 包裹里，重构分类器
+ *  的框定。转义中和了它，同时仍是合法 JSON。 */
+function safeJson(obj: unknown): string {
+    return JSON.stringify(obj).replace(/[<>&]/g, (c) =>
+        c === "<" ? "\\u003c" : c === ">" ? "\\u003e" : "\\u0026");
+}
+
+/** 剥掉 agent 前置进首条 user 消息的 CLAUDE.md/日期 <system-reminder> 块。
+ *  它是仓库配置不是 user 轮——留在 transcript 里会双重注入 CLAUDE.md，还会
+ *  让 stage 2 把仓库配置误认成 turn 内的用户授权。CLAUDE.md 只经
+ *  user_claude_md 专槽进分类器。 */
+function stripReminder(s: string): string {
+    return s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/gi, "").trim();
+}
+
+/** 把单次工具调用投影成分类器看到的安全相关字符串——逐工具的
+ *  toAutoClassifierInput。保留决定爆炸半径的部分：shell 留命令；写文件连
+ *  **内容**一起留（只留路径会藏住密钥泄漏/指令投毒——真 CC 的 FileWriteTool
+ *  投影 `${path}: ${content}`）。 */
+export function projectActionForClassifier(toolName: string, input: Record<string, any>): string {
+    switch (toolName) {
+        case "run_shell": return clip(String(input.command ?? ""));
+        case "write_file": return clip(`${input.file_path ?? ""}: ${input.content ?? ""}`);
+        case "edit_file": return clip(`${input.file_path ?? ""}: ${input.new_string ?? ""}`);
+        case "web_fetch": return clip(`fetch ${input.url ?? ""}`);
+        default: return clip(JSON.stringify(input ?? {}));
+    }
+}
+
+/** 构建分类器读的"推理盲"transcript：user 文本 + assistant 的**工具调用**
+ *  ——assistant 散文全部丢弃，那是模型自己写的、可能被构造来操纵分类器
+ *  （真 CC 的 buildTranscriptEntries 同款）。待判动作追加在最后一行。
+ *  my_src 单 Anthropic 后端，只处理 tool_use 块（src 还兼容 OpenAI
+ *  tool_calls 数组——单后端不移植）。 */
+export function buildClassifierTranscript(
+    history: { role: string; content: any }[],
+    pending: { toolName: string; input: Record<string, any> },
+): string {
+    const lines: string[] = [];
+    for (const m of history) {
+        if (m.role === "user") {
+            const raw = typeof m.content === "string"
+                ? m.content
+                : Array.isArray(m.content)
+                    ? m.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ")
+                    : "";
+            // 先剥前置的 CLAUDE.md/日期 reminder，再 JSON 编码 + 尖括号转义——
+            // 敌意内容既伪造不出一行记录，也注入不了 </transcript>
+            const text = stripReminder(raw);
+            if (text.trim()) lines.push(safeJson({ user: text.trim().slice(0, 2000) }));
+        } else if (m.role === "assistant") {
+            if (Array.isArray(m.content)) {
+                for (const b of m.content) {
+                    if (b.type === "tool_use") {
+                        lines.push(safeJson({ [b.name]: projectActionForClassifier(b.name, b.input) }));
+                    }
+                }
+            }
+        }
+    }
+    // 待判动作——agent 最近的一次动作
+    lines.push(safeJson({ [pending.toolName]: projectActionForClassifier(pending.toolName, pending.input) }));
+    return lines.join("\n");
+}
+
+export interface BlockVerdict {
+    block: boolean;
+    reason: string;
+}
+
+/** 解析分类器的 `<block>yes|no</block><reason>…</reason>` 回复。
+ *  先剥 <thinking>…</thinking>（真 CC 的 parseXmlBlock 同款）——否则
+ *  `<thinking><block>no</block></thinking><block>yes</block>` 会被误读成
+ *  thinking 块里的放行。闭合的 </block> 必须完整：我们不用 stop_sequences
+ *  （真 CC 的 stage-1 闸在 </block> 处截断），格式完好的回复总会闭合标签；
+ *  截断的 `<block>no` 属畸形 → 拦（fail-closed）。任何不以完整裁决开头的
+ *  回复都判拦，绝不当放行。 */
+export function parseBlockVerdict(raw: string): BlockVerdict {
+    const cleaned = raw
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+        .replace(/<thinking>[\s\S]*$/i, "")
+        .trimStart();
+    const blockMatch = cleaned.match(/^<block>\s*(yes|no)\s*<\/block>/i);
+    if (!blockMatch) return { block: true, reason: "unparseable classifier output — blocking for safety" };
+    if (blockMatch[1].toLowerCase() === "no") return { block: false, reason: "" };
+    const reasonMatch = cleaned.match(/<reason>\s*([\s\S]*?)\s*<\/reason>/i);
+    return { block: true, reason: reasonMatch ? reasonMatch[1].trim() : "blocked (no reason given)" };
+}
+
+/** 分类器 user 消息：（不可信的）CLAUDE.md 上下文 + transcript 投影 + 阶段
+ *  后缀。CLAUDE.md 走这条 USER 消息且 JSON 编码——仓库内容无法逃出标签、也
+ *  拿不到 system 权威。suffix 选段（stage1 激进闸 / stage2 审慎裁决）。 */
+export function classifierUserMessage(
+    rules: AutoModeRules,
+    transcript: string,
+    suffix: string,
+    claudeMd?: string,
+): string {
+    const cm = claudeMd && claudeMd.trim()
+        ? `${rules.claude_md_injection}\n<user_claude_md>\n${safeJson(claudeMd.trim())}\n</user_claude_md>\n\n`
+        : "";
+    return `${cm}<transcript>\n${transcript}\n</transcript>\n\n${suffix}`;
 }

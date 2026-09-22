@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "readline";
 import { executeTool, toolDefinitions, getActiveToolDefinitions, truncateResult, type ToolDef } from "./tools.js";
-import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder } from "./prompt.js";
+import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { checkPermission, type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
@@ -12,7 +12,8 @@ import {
     parseGoalVerdict, GOAL_MAX_ITERATIONS, type GoalVerdict,
     parseLoopInput, isDailyWording, OFFER_CLOUD_THRESHOLD_SECONDS,
     SCHEDULE_WAKEUP_TOOL, clampWakeupDelay, dynamicLoopDirective, LOOP_MAX_ITERATIONS, type LoopSpec,
-    classifyAction,
+    loadAutoModeRules, buildClassifierSystem, buildClassifierTranscript, classifierUserMessage,
+    parseBlockVerdict, AUTO_MODE_FAST_PATH_TOOLS, DENIAL_LIMITS,
 } from "./autonomy.js";
 import { saveSession } from "./session.js";
 import { randomUUID } from "crypto";
@@ -98,6 +99,14 @@ export class Agent {
     private maxTurns: number | null = null;
     // ch21 压缩仪表：最近一次 API 调用时刻——T2/T3 用它判断缓存冷热
     private lastApiCallTime = 0;
+
+    // ─── ch26：Auto Mode 拒绝计数与中断基建 ──────────────────────
+    // transcript 分类器的 DENIAL_LIMITS 追踪：连拦 3 次或累计 20 次 → 分类器
+    // 可能卡死在拒绝循环，降级回人工确认（或无人值守拒绝）
+    private autoConsecutiveDenials = 0;
+    private autoTotalDenials = 0;
+    // 中断支持：SIGINT 处理器经 abort() 取消在途 API 请求（isProcessing 判忙）
+    private abortController: AbortController | null = null;
     // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
     private effectiveWindow: number;
     // ch22 语义召回：prefetch 句柄 + 防重复注入簿记（按记忆文件绝对路径）
@@ -234,6 +243,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             (this.totalCacheReadTokens / 1_000_000) * 0.3 +
             (this.totalCacheCreationTokens / 1_000_000) * 3.75 +
             (this.totalOutputTokens / 1_000_000) * 15
+        );
+    }
+
+    /** REPL /cost 入口：token 四计数 + 估算费用 + 预算余量 + 缓存命中率。 */
+    showCost(): void {
+        const total = this.getCurrentCostUsd();
+        const budgetInfo = this.maxCostUsd !== null ? ` / $${this.maxCostUsd} budget` : "";
+        const turnInfo = this.maxTurns !== null ? ` | Turns: ${this.currentTurns}/${this.maxTurns}` : "";
+        const cached = this.totalCacheReadTokens;
+        const billedInput = this.totalInputTokens + this.totalCacheCreationTokens + cached;
+        const hitRate = billedInput > 0 ? Math.round((cached / billedInput) * 100) : 0;
+        const cacheInfo = (cached || this.totalCacheCreationTokens)
+            ? `\n  Cache: ${cached} read / ${this.totalCacheCreationTokens} write (${hitRate}% of input from cache)`
+            : "";
+        printInfo(
+            `Tokens: ${this.totalInputTokens} in / ${this.totalOutputTokens} out${cacheInfo}\n  Estimated cost: $${total.toFixed(4)}${budgetInfo}${turnInfo}`
         );
     }
 
@@ -577,28 +602,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return out;
     }
 
-    private transcriptText(): string {
-        // 评估器/分类器需要看到工具证据；裸渲染会把 tool_use/tool_result 全变占位符，
-        // 导致 "done.txt exists" 这类目标永远判不通过（ch14 实测发现）
-        const blockText = (b: any): string => {
-            if (b.type === "tool_use") return `[tool_use ${b.name}: ${JSON.stringify(b.input)}]`;
-            if (b.type === "tool_result") {
-                const c = typeof b.content === "string"
-                    ? b.content
-                    : Array.isArray(b.content)
-                        ? b.content.map((x: any) => x?.text ?? "").join(" ")
-                        : "";
-                return `[tool_result: ${String(c).slice(0, 300)}]`;
-            }
-            return `[${b.type}]`;
-        };
-        return this.messages
-            .map((m) => `${m.role}: ${typeof m.content === "string"
-                ? m.content
-                : Array.isArray(m.content) ? m.content.map(blockText).join(" ") : "[content]"}`)
-            .join("\n");
-    }
-
     // ─── /goal — prompt 版 Stop-hook（ch24：三态 JSON 契约）───────
 
     /** 设定活跃 goal 并返回首轮指令（设定 goal 本身就开启一个 turn）。 */
@@ -846,6 +849,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.goalStop = true;
     }
 
+    // ─── 中断支持（ch26：SIGINT 两连退出的地基）──────────────────
+
+    /** 取消在途 API 请求（流式请求会立刻以 abort 错误失败，chat 向上抛）。 */
+    abort(): void {
+        this.abortController?.abort();
+    }
+
+    get isProcessing(): boolean {
+        return this.abortController !== null;
+    }
+
     async chat(userText: string): Promise<void> {
         const content = this.messages.length === 0 && !this.hasCustomPrompt
             ? `${userText}\n\n${buildUserContextReminder()}`
@@ -860,6 +874,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         await this.startMemoryPrefetchForTurn(userText, this.messages);
         if (!this.isSubAgent) await this.ensureMcp();
         const mcpTools: Anthropic.Tool[] = this.isSubAgent ? [] : this.mcpManager.getToolDefinitions();
+        // abort 生命周期覆盖整个 turn（请求 + 工具执行）：SIGINT 处理器读
+        // isProcessing 判忙、调 abort() 取消在途请求
+        this.abortController = new AbortController();
+        try {
+            await this.runAgentLoop(mcpTools);
+        } finally {
+            this.abortController = null;
+        }
+    }
+
+    /** 主 agent 循环：请求 → 工具 → 回灌，直到模型不再调用工具。 */
+    private async runAgentLoop(mcpTools: Anthropic.Tool[]): Promise<void> {
         while (true) {
             // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
             this.runCompressionPipeline();
@@ -877,7 +903,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         system: this.buildAnthropicSystem(),
                         tools: [...getActiveToolDefinitions(this.tools), ...mcpTools],
                         messages: this.withCacheBreakpoints(this.messages),
-                    });
+                    }, { signal: this.abortController?.signal });
                     // src 同款协调：首个 text 事件先停 spinner 再打印，避免 \r 重画吃掉流式输出；
                     // 纯工具调用响应没有 text 事件，靠 finally 兜底
                     stream.on("text", (t) => {
@@ -910,7 +936,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
                     this.autoSave();
                 }
-                return;
+                break;
             }
 
             // budget 检查点（位置 B）：响应已结算、工具未执行。超限时每个 tool_use
@@ -929,39 +955,34 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     })),
                 });
                 this.autoSave();
-                return;
+                break;
             }
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             let contextBreak = false;
             for (const tu of toolUses) {
                 printToolCall(tu.name, tu.input as Record<string, any>);
-                if (this.mode === "auto" && ["write_file", "edit_file", "run_shell"].includes(tu.name)) {
-                    // auto 的闸门只有分类器，静态流水线不再叠加（对齐 src）
-                    const verdict = await classifyAction(tu.name, tu.input as Record<string, any>, this.transcriptText(), this.client, MODEL);
-                    if (!verdict.allow) {
-                        toolResult.push({type: "tool_result", tool_use_id:tu.id, content: `Blocked by auto-mode monitor: ${verdict.reason}`});
-                        continue;
-                    }
-                    const output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
-                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
-                    continue;
-                }
-                const perm = checkPermission(tu.name, tu.input as Record<string, any>, this.mode, this.planFilePath || undefined);
+                // auto 走 transcript 分类器裁决（内含 deny 规则硬底线与 fast-path），
+                // 其余模式走静态八阶段流水线
+                const perm = this.mode === "auto"
+                    ? await this.classifyToolCall(tu.name, tu.input as Record<string, any>)
+                    : checkPermission(tu.name, tu.input as Record<string, any>, this.mode, this.planFilePath || undefined);
                 if (perm.action === "deny") {
                     printInfo(`Denied: ${perm.message}`);
                     toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: `Denied: ${perm.message}` });
                     continue;
                 }
                 if (perm.action === "confirm" && perm.message) {
-                    // 同一 message 确认一次后缓存；auto 的 confirm 是 reason 不是 path，绝不能缓存（ch26 的坑）
-                    if (!this.confirmedPaths.has(perm.message)) {
+                    // 同一 message 确认一次后缓存；但 auto 的 confirm 带的是动作摘要
+                    // 不是路径——一次批准等于给"同摘要"的所有后续动作开白名单，绝不能缓存
+                    const cacheable = this.mode !== "auto";
+                    if (!cacheable || !this.confirmedPaths.has(perm.message)) {
                         const confirmed = await this.confirmDangerous(perm.message);
                         if (!confirmed) {
                             toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: "User denied this action." });
                             continue;
                         }
-                        this.confirmedPaths.add(perm.message);
+                        if (cacheable) this.confirmedPaths.add(perm.message);
                     }
                 }
                 const output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
@@ -1082,6 +1103,94 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     private clearHistoryKeepSystem() {
         this.messages = [];
         this.lastInputTokenCount = 0;
+    }
+
+    // ─── Auto Mode — transcript 分类器权限闸（ch26）──────────────
+    // auto 模式下分类器取代人工确认框：deny 规则照旧硬拦，只读工具走
+    // fast-path，其余交给读"推理盲"transcript 投影的 LLM 裁决。
+
+    /** Auto Mode 下的工具裁决。返回 allow/deny（与 checkPermission 同形）或
+     *  confirm——拒绝上限触发时交还人工。
+     *
+     *  两段式（对齐真实 Claude Code 的 both 模式）：stage 1 是激进的廉价闸
+     *  （不看用户意图、不认 ALLOW 例外——任一规则**可能**命中就拦）；stage 1
+     *  放行即完成（一次调用）。stage 1 拦了才进 stage 2 的审慎裁决——这一段
+     *  权衡 transcript 里的用户意图、能解除拦截，它的结论是最终结论。 */
+    private async classifyToolCall(
+        toolName: string,
+        input: Record<string, any>,
+    ): Promise<{ action: "allow" | "deny" | "confirm"; message?: string }> {
+        // 硬底线前置：deny 规则在这里同样生效
+        const base = checkPermission(toolName, input, "default", this.planFilePath || undefined);
+        if (base.action === "deny") return base;
+        // fast-path：只读/无副作用工具跳过分类器
+        if (AUTO_MODE_FAST_PATH_TOOLS.has(toolName)) return { action: "allow" };
+
+        if (!this.client) {
+            // 没有可用评估器 → fail-closed。有人在（交互模式）交人工，否则直接拒
+            return this.autoFallback(`${toolName} (auto-mode classifier unavailable)`);
+        }
+        let verdict: { block: boolean; reason: string };
+        try {
+            const rules = loadAutoModeRules();
+            const transcript = buildClassifierTranscript(this.messages as any, { toolName, input });
+            const system = buildClassifierSystem(rules);
+            // CLAUDE.md 走 user 消息，不进 system——它是不可信的仓库内容
+            const claudeMd = loadClaudeMd();
+            // stage 1 — 激进廉价闸（token 预算很小：只够输出 <block>…）
+            const s1raw = await this.runClassifierQuery(system, classifierUserMessage(rules, transcript, rules.suffix_stage1, claudeMd), 256);
+            const s1 = parseBlockVerdict(s1raw);
+            if (!s1.block) {
+                verdict = s1;                 // stage 1 放行 → 一次调用搞定
+            } else {
+                // stage 2 — 审慎裁决（权衡用户意图、可解除拦截）。token 更多：
+                // stage 2 允许在裁决前输出 <thinking> 块
+                const s2raw = await this.runClassifierQuery(system, classifierUserMessage(rules, transcript, rules.suffix_stage2, claudeMd), 1024);
+                verdict = parseBlockVerdict(s2raw);
+            }
+        } catch (e: any) {
+            // 任何装配或分类器错误 → fail-closed（拦），与真 CC 的铁闸一致。
+            // 把资产加载也包进来：规则文件缺失/损坏不能炸掉整轮、孤儿化 tool_use
+            verdict = { block: true, reason: `classifier error: ${e?.message ?? e}` };
+        }
+
+        if (!verdict.block) {
+            this.autoConsecutiveDenials = 0;
+            return { action: "allow" };
+        }
+
+        this.autoConsecutiveDenials++;
+        this.autoTotalDenials++;
+        if (
+            this.autoConsecutiveDenials >= DENIAL_LIMITS.maxConsecutive ||
+            this.autoTotalDenials >= DENIAL_LIMITS.maxTotal
+        ) {
+            // 拒绝太多——分类器可能卡死了。交互模式交还人工；无人值守拒绝
+            // （真 CC 在这里直接中止 agent）
+            printInfo(`Auto Mode: denial limit reached — handing back to manual confirmation.`);
+            return this.autoFallback(`[Auto Mode blocked] ${verdict.reason}`);
+        }
+        return { action: "deny", message: `[Auto Mode] ${verdict.reason}` };
+    }
+
+    /** Auto Mode 兜底：有人就转人工确认，无人（headless）直接拒。绝不返回
+     *  "allow"——意义就在于不让未裁决的动作跑掉。auto 的 confirm 带的是
+     *  单次动作摘要而非路径，一次批准不能给后续同类动作开白名单。 */
+    private autoFallback(message: string): { action: "deny" | "confirm"; message: string } {
+        if (this.confirmFn) return { action: "confirm", message };
+        return { action: "deny", message: `${message} (headless — denied)` };
+    }
+
+    /** 单消息分类器查询，max_tokens 由调用方给定——两段各自定预算
+     *  （stage 1 小闸，stage 2 有思考空间）。temperature 0 保证裁决确定性。 */
+    private async runClassifierQuery(system: string, user: string, maxTokens: number): Promise<string> {
+        const resp = await this.client.messages.create({
+            model: MODEL, max_tokens: maxTokens, system, temperature: 0,
+            messages: [{ role: "user", content: user }],
+        }, { signal: this.abortController?.signal });
+        return resp.content
+            .filter((b): b is Anthropic.TextBlock => b.type === "text")
+            .map((b) => b.text).join("");
     }
 
     // ─── Sub-agent fork（ch23）────────────────────────────────

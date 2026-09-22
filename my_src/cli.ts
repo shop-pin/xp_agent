@@ -3,10 +3,45 @@ import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
 import { loadSession, getLatestSessionId } from "./session.js";
 import { discoverSkills, getSkillByName, resolveSkillPrompt } from "./skills.js";
+import { listMemories } from "./memory.js";
 import type { PermissionMode } from "./permissions.js";
 import { printWelcome, printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
 
+const USAGE = `
+Usage: mini-claude [options] [prompt]
+
+Options:
+  --plan              Plan mode: read-only, describe changes without executing
+  --auto              Auto Mode: an LLM classifier judges each action instead of asking
+  --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
+  --accept-edits      Auto-approve file edits, still confirm dangerous shell
+  --dont-ask          Auto-deny anything needing confirmation (for CI)
+  --resume            Resume the last session
+  --goal <condition>  Pursue a goal across turns until an evaluator judges it met
+  --max-cost USD      Stop when estimated cost exceeds this amount
+  --max-turns N       Stop after N agentic turns
+  --help, -h          Show this help
+  (model via env: ANTHROPIC_MODEL_ID, base URL via ANTHROPIC_BASE_URL)
+
+REPL commands:
+  /clear              Clear conversation history
+  /plan               Toggle plan mode (read-only <-> normal)
+  /cost               Show token usage and estimated cost
+  /compact            Manually compact the conversation
+  /goal <condition>   Pursue a goal until an evaluator judges it met
+  /goal               Show the active goal's status
+  /loop [interval] <prompt>  Re-run a prompt on an interval (5m/2h) or self-paced
+  /memory             List saved memories
+  /skills             List available skills
+  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
+  Ctrl+C twice        Exit (single Ctrl+C interrupts a running turn/loop)
+`;
+
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
+    if (argv.includes("--help") || argv.includes("-h")) {
+        console.log(USAGE);
+        return;
+    }
     let resume: boolean = false;
     if (argv.includes("--resume")) {
         resume = true;
@@ -142,10 +177,40 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         // the outer await finish.
         let closed = false;
         rl.on("close", () => { closed = true; resolve(); });
+        // SIGINT 两连退出：agent 处理中 → abort 在途请求、留在 REPL（经
+        // chat 抛出的 abort 错误回到 ask 循环）；空闲 → 第一次提示、第二次退出。
+        // stopLoop/stopGoal 先行——loop tick 间隙 agent 不在"处理中"，
+        // abort 路径够不着它们，只有停止标志能接住。rl 层挂一个（问题挂起时
+        // Ctrl+C 被原始模式下的 readline 拦截）、process 层挂一个（处理中无
+        // 问题挂起，终端信号直达进程）——两个路径互斥，不会双触发。
+        let sigintCount = 0;
+        const handleInterrupt = () => {
+            agent.stopLoop();
+            agent.stopGoal();
+            if (agent.isProcessing) {
+                agent.abort();
+                console.log("\n  (interrupted)");
+                sigintCount = 0;
+                return; // chat 抛出的 abort 错误会走 ask 的 catch，重新出提示符
+            }
+            sigintCount++;
+            if (sigintCount >= 2) {
+                console.log("\nBye!\n");
+                // 先断 MCP 子进程/定时器，否则它们会吊住进程（issue #8 教训）
+                agent.close().finally(() => process.exit(0));
+                return;
+            }
+            console.log("\n  Press Ctrl+C again to exit.");
+            ask(); // 挂着的 question 已死（Ctrl+C 被吞后不会回调），重新挂一个
+        };
+        rl.on("SIGINT", handleInterrupt);
+        process.on("SIGINT", handleInterrupt);
+        const isAbort = (e: any) => e?.name === "AbortError" || String(e?.message ?? "").includes("aborted");
         const ask = () => {
             if (closed) return;
             rl.question("you: ", async (line) => {
                 const input = line.trim();
+                sigintCount = 0;
                 if (input === "exit" || input === "quit") {
                     rl.close();
                     resolve();
@@ -162,6 +227,33 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     ask();
                     return;
                 }
+                if (input === "/cost") {
+                    agent.showCost();
+                    ask();
+                    return;
+                }
+                if (input === "/compact") {
+                    try {
+                        await agent.compactAnthropic();
+                    } catch (e: any) {
+                        printError(String(e.message ?? e));
+                    }
+                    ask();
+                    return;
+                }
+                if (input === "/memory") {
+                    const memories = listMemories();
+                    if (memories.length === 0) {
+                        printInfo("No memories saved yet.");
+                    } else {
+                        printInfo(`${memories.length} memories:`);
+                        for (const m of memories) {
+                            console.log(`    [${m.type}] ${m.name} — ${m.description}`);
+                        }
+                    }
+                    ask();
+                    return;
+                }
                 if (input === "/goal" || input.startsWith("/goal ")) {
                     const condition = input.slice("/goal".length).trim();
                     if (!condition) {
@@ -173,7 +265,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     try {
                         await agent.pursueGoal(directive);
                     } catch (e: any) {
-                        printError(String(e.message ?? e));
+                        if (!isAbort(e)) printError(String(e.message ?? e));
                     }
                     ask();
                     return;
@@ -183,7 +275,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     try {
                         await agent.runLoop(rest);
                     } catch (e: any) {
-                        printError(String(e.message ?? e));
+                        if (!isAbort(e)) printError(String(e.message ?? e));
                     }
                     ask();
                     return;
@@ -218,7 +310,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                                 await agent.chat(resolveSkillPrompt(skill, cmdArgs));
                             }
                         } catch (e: any) {
-                            printError(String(e.message ?? e));
+                            if (!isAbort(e)) printError(String(e.message ?? e));
                         }
                         ask();
                         return;
@@ -229,7 +321,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     try {
                         await agent.chat(input);
                     } catch (e: any) {
-                        printError(String(e.message ?? e));
+                        // 中断由 SIGINT 处理器报告过了，这里只报真错误
+                        if (!isAbort(e)) printError(String(e.message ?? e));
                     }
                 }
                 ask();

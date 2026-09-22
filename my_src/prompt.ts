@@ -37,7 +37,9 @@ function resolveIncludes(content: string, basePath: string, visited: Set<string>
     })
 }
 
-function loadClaudeMd(): string {
+// 导出给 Auto Mode 分类器：CLAUDE.md 以 user 消息注入分类器（untrusted 内容
+// 不进 system），与 buildUserContextReminder 读的是同一份
+export function loadClaudeMd(): string {
     const parts = [];
     let dir = process.cwd();
     while (true) {
