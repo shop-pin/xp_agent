@@ -132,7 +132,6 @@ export const toolDefinitions: ToolDef[] = [
             required: ["url"],
         },
     },
-    // ─── Plan mode tools（deferred：用到才激活）──────────────────
     {
         name: "enter_plan_mode",
         description:
@@ -153,7 +152,6 @@ export const toolDefinitions: ToolDef[] = [
         },
         deferred: true,
     },
-    // ─── Skill tool ─────────────────────────────────────────────
     {
         name: "skill",
         description:
@@ -173,7 +171,6 @@ export const toolDefinitions: ToolDef[] = [
             required: ["skill_name"],
         },
     },
-    // ─── Agent tool ─────────────────────────────────────────────
     {
         name: "agent",
         description:
@@ -198,7 +195,6 @@ export const toolDefinitions: ToolDef[] = [
             required: ["description", "prompt"],
         },
     },
-    // ─── Tool search（deferred 工具的加载器，本身永远广告）─────────
     {
         name: "tool_search",
         description:
@@ -213,7 +209,6 @@ export const toolDefinitions: ToolDef[] = [
     },
 ];
 
-// ─── Deferred tool activation ───────────────────────────────
 // 激活态是模块级全局（对齐 src）：主对话 tool_search 一次，同名 deferred 工具
 // 对后续所有请求（含子 agent）永久可见——一次搜索，终身有效
 const activatedTools = new Set<string>();
@@ -295,7 +290,7 @@ function readFile(input: { file_path: string }, readFileState?: Map<string, numb
         const out = lines.map((l, i) => `${String(i + 1).padStart(4)} | ${l}`).join("\n");
         // 记：簿记失败不能毁掉一次成功的读，stat 单独包 try/catch
         if (readFileState) {
-            try { readFileState.set(resolve(input.file_path), statSync(input.file_path).mtimeMs); } catch {}
+            try { readFileState.set(resolve(input.file_path), statSync(input.file_path).mtimeMs); } catch { }
         }
         return out;
     } catch (e: any) {
@@ -324,7 +319,7 @@ function writeFile(input: { file_path: string; content: string }, readFileState?
         autoUpdateMemoryIndex(absPath);
         // 更新（防自伤）：不回写的话下次写/编辑会把自己上次写入误判成"外部修改"
         if (readFileState) {
-            try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+            try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch { }
         }
         const n = input.content.split("\n").length;
         return `Successfully wrote to ${input.file_path} (${n} lines)`;
@@ -372,7 +367,7 @@ function editFile(
         writeFileSync(input.file_path, updated);
         // 更新（防自伤）：编辑失败（found N times 等）不会走到这里，map 里还是有效旧值
         if (readFileState) {
-            try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+            try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch { }
         }
         const viaNormalization = actual !== input.old_string;
         const diff = generateDiff(content, actual, input.new_string);
@@ -441,7 +436,7 @@ function grepJS(pattern: string, dir: string): string {
                 readFileSync(full, "utf-8").split("\n").forEach((line, i) => {
                     if (re.test(line) && matches.length < 100) matches.push(`${full}:${i + 1}:${line}`);
                 });
-            } catch {}
+            } catch { }
         }
     };
     walk(dir);

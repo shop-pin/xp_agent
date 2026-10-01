@@ -2,7 +2,7 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
-// 5+1 权限模式：auto 走分类器（ch15），不进本流水线
+// 5+1 权限模式：auto 走分类器，不进本流水线
 export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk" | "auto";
 
 export const READ_TOOLS = new Set(["read_file", "list_files", "grep_search", "web_fetch"]);
@@ -32,8 +32,6 @@ const DANGEROUS_PATTERNS = [
 export function isDangerous(command: string): boolean {
     return DANGEROUS_PATTERNS.some((p) => p.test(String(command || "")));
 }
-
-// ─── 规则文件（.claude/settings.json 的 permissions.allow/deny）───
 
 export interface ParsedRule {
     tool: string;
@@ -65,7 +63,6 @@ function loadSettings(filePath: string): any {
 }
 
 // 模块级缓存：settings 是只读配置，进程内不变，读一次即可。
-// 对比 ch17 的教训——session 路径是运行时状态必须惰性求值，这里是纯配置，缓存安全
 let cachedRules: PermissionRules | null = null;
 
 export function loadPermissionRules(): PermissionRules {
@@ -121,7 +118,7 @@ export function matchesRule(rule: ParsedRule, toolName: string, input: Record<st
 
 export type PermissionDecision = { action: "allow" | "deny" | "confirm"; message?: string };
 
-// 八阶段流水线：顺序即安全语义（显式禁令 > 模式契约 > 便捷快捷方式 > 默认行为）。
+// 九阶段流水线：顺序即安全语义（显式禁令 > 模式契约 > 便捷快捷方式 > 默认行为）。
 // ① deny 规则（连 --yolo 也拦） ② plan 只读契约（唯一豁免 = plan 文件本身，
 //   路径全等才放行） ③ bypass 全放行 ④ allow 规则（核心价值=免确认）
 // ⑤ READ_TOOLS ⑥ plan 工具本身（进出是纯状态切换，agent 层处理） ⑦ acceptEdits+EDIT_TOOLS

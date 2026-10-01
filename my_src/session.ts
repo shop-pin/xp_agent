@@ -1,4 +1,4 @@
-// ch17 多会话持久化 —— 类型契约按规格，函数体对齐 src/session.ts。
+// 多会话持久化 —— 类型契约按规格，函数体对齐 src/session.ts。
 // 收尾讲解（含你原稿的坑位分析）见 my_docs/17-multi-session.md 收尾记录
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";

@@ -28,6 +28,7 @@ function parseSkillFile(
         const userInvocable = meta["user-invocable"] !== "false";
         const context = meta.context === "fork" ? "fork" as const : "inline" as const;
 
+        // allowed-tools 两种写法都收：JSON 数组字符串（"[a, b]"）或裸逗号分隔（a, b）
         let allowedTools: string[] | undefined;
         if (meta["allowed-tools"]) {
             const rawTools = meta["allowed-tools"];
@@ -64,8 +65,6 @@ export function resolveSkillPrompt(skill: SkillDefinition, args: string): string
     prompt = prompt.replace(/\$\{CLAUDE_SKILL_DIR\}/g, skill.skillDir);
     return prompt;
 }
-
-// ─── Discovery ──────────────────────────────────────────────
 
 let cachedSkills: SkillDefinition[] | null = null;
 
@@ -107,8 +106,6 @@ function loadSkillsFromDir(
     }
 }
 
-// ─── Resolution ─────────────────────────────────────────────
-
 export function getSkillByName(name: string): SkillDefinition | null {
     return discoverSkills().find((s) => s.name === name) || null;
 }
@@ -125,8 +122,6 @@ export function executeSkill(
         context: skill.context,
     };
 }
-
-// ─── System prompt section ──────────────────────────────────
 
 export function buildSkillDescriptions(): string {
     const skills = discoverSkills();

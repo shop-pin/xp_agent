@@ -24,7 +24,6 @@ import { printToolCall, printAssistantText, printInfo, printConfirmation, printC
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
-// ─── ch21：四层压缩常量 ──────────────────────────────────────
 // T1 budget → T2 snip → T3 microcompact → T4 auto-compact。
 // T1–T3 零 API 成本（原地改 this.messages），T4 是唯一花一次摘要请求的层。
 const SNIPPABLE_TOOLS = new Set(["read_file", "grep_search", "list_files", "run_shell"]);
@@ -69,7 +68,6 @@ export class Agent {
     private confirmedPaths: Set<string> = new Set();
     private confirmFn?: (message: string) => Promise<boolean>;
 
-    // ─── ch25 Plan Mode ─────────────────────────────────────────
     // prePlanMode 记住进入前的模式——退出时精确恢复（acceptEdits 进 plan，
     // 出来还是 acceptEdits，而不是掉回 default）
     private prePlanMode: PermissionMode | null = null;
@@ -86,21 +84,20 @@ export class Agent {
     private sessionId: string = randomUUID().slice(0, 8);
     private sessionStartTime: string = new Date().toISOString();
 
-    // ch20 token 四计数：缓存读/写单列——input_tokens 只算未命中前缀，
+    // token 四计数：缓存读/写单列——input_tokens 只算未命中前缀，
     // cache_read 按 0.1x、cache_creation 按 1.25x 计费，混在一起费用就是错的
     private totalInputTokens = 0;
     private totalOutputTokens = 0;
     private totalCacheReadTokens = 0;
     private totalCacheCreationTokens = 0;
-    // 下一次请求的上下文体量预估（本次 prompt 全量 + 本次输出），ch21 压缩仪表的原料
+    // 下一次请求的上下文体量预估（本次 prompt 全量 + 本次输出），压缩仪表的原料
     private lastInputTokenCount = 0;
     private currentTurns = 0;
     private maxCostUsd: number | null = null;
     private maxTurns: number | null = null;
-    // ch21 压缩仪表：最近一次 API 调用时刻——T2/T3 用它判断缓存冷热
+    // 压缩仪表：最近一次 API 调用时刻——T2/T3 用它判断缓存冷热
     private lastApiCallTime = 0;
 
-    // ─── ch26：Auto Mode 拒绝计数与中断基建 ──────────────────────
     // transcript 分类器的 DENIAL_LIMITS 追踪：连拦 3 次或累计 20 次 → 分类器
     // 可能卡死在拒绝循环，降级回人工确认（或无人值守拒绝）
     private autoConsecutiveDenials = 0;
@@ -109,12 +106,11 @@ export class Agent {
     private abortController: AbortController | null = null;
     // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
     private effectiveWindow: number;
-    // ch22 语义召回：prefetch 句柄 + 防重复注入簿记（按记忆文件绝对路径）
+    // 语义召回：prefetch 句柄 + 防重复注入簿记（按记忆文件绝对路径）
     private memoryPrefetch: MemoryPrefetch | null = null;
     private alreadySurfacedMemories: Set<string> = new Set();
     private sessionMemoryBytes = 0;
 
-    // ─── ch24：/goal 三态与 /loop 两模式 ─────────────────────────
     // /goal——会话级 Stop hook 条件，跨 turn 追逐
     private activeGoal: {
         condition: string;
@@ -141,7 +137,7 @@ export class Agent {
         // mock 注入的 429 永远到不了用户代码
         const sdkRetries =
             process.env.MINI_CLAUDE_SDK_MAX_RETRIES != null && process.env.MINI_CLAUDE_SDK_MAX_RETRIES !== "" &&
-            !Number.isNaN(Number(process.env.MINI_CLAUDE_SDK_MAX_RETRIES))
+                !Number.isNaN(Number(process.env.MINI_CLAUDE_SDK_MAX_RETRIES))
                 ? { maxRetries: Number(process.env.MINI_CLAUDE_SDK_MAX_RETRIES) }
                 : {};
         this.client = new Anthropic({
@@ -199,7 +195,6 @@ export class Agent {
 
     // plan 文件按会话 ID 落盘（clear-and-execute 清掉历史后，磁盘上还有底稿可读；
     // 也方便用户跨会话翻看历史方案）。目录用 my_src 自己的 ~/.mini-claude 命名空间
-    // （src 用 ~/.claude/plans——教学版不碰真实 Claude Code 的目录）
     private generatePlanFilePath(): string {
         const dir = join(homedir(), ".mini-claude", "plans");
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -274,12 +269,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return { exceeded: false, reason: "" };
     }
 
-    // ═══ ch21：四层压缩（本章由你写）═════════════════════════════
     // 仪表：utilization = lastInputTokenCount / effectiveWindow
     // 调用点已接好：T1–T3 走 runCompressionPipeline()（每次发请求前），
     // T4 走 checkAndCompact()（turn 边界：用户消息刚 push、循环未开始）。
 
-    // 组装层：顺序即语义，各一行。
+    // 组装层：顺序即语义。
     runCompressionPipeline(): void {
         this.budgetToolResults();
         this.snipStaleResults();
@@ -290,15 +284,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     //    （它只处理大块头——那种结果留着必溢出，缩了顶多重建一次缓存）。
     private budgetToolResults(): void {
         const utilization = this.lastInputTokenCount / this.effectiveWindow;
-        if (utilization < 0.5) return;
-        const budget = utilization > 0.7 ? 15000 : 30000;
+        if (utilization < 0.5) return; // 上下文过半才开始管
+        const budget = utilization > 0.7 ? 15000 : 30000; // 越满预算越紧
 
         for (const msg of this.messages) {
             if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
             for (let i = 0; i < msg.content.length; i++) {
                 const block = msg.content[i] as any;
                 if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > budget) {
-                    const keepEach = Math.floor((budget - 80) / 2);
+                    const keepEach = Math.floor((budget - 80) / 2); // 减 80：给中间的截断提示文案留位
                     block.content = block.content.slice(0, keepEach) +
                         `\n\n[... budgeted: ${block.content.length - keepEach * 2} chars truncated ...]\n\n` +
                         block.content.slice(-keepEach);
@@ -391,28 +385,41 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async checkAndCompact(): Promise<void> {
         if (this.lastInputTokenCount > this.effectiveWindow * 0.85) {
             printInfo("Context window filling up, compacting conversation...");
-            await this.compactAnthropic();
-            printInfo("Conversation compacted.");
+            const compacted = await this.compactAnthropic();
+            if (compacted) printInfo("Conversation compacted.");
         }
     }
 
-    // 摘要重写（T4 主体）。硬不变式：调用时最后一条必须是纯 user 文本消息——
-    // 它会被 slice(0,-1) 摘出来最后塞回去；如果它是 tool_result，前面的 tool_use
-    // 就孤儿化了，摘要请求直接 400（与 ch20 refusal 配对同源：历史必须自洽）。
-    async compactAnthropic(): Promise<void> {
-        if (this.messages.length < 4) return;
-        const lastUserMsg = this.messages[this.messages.length - 1];
+    // user/assistant 交替 + tool_use/tool_result 配对，摘要请求的形状随末条消息的形态分三种边界：
+    // ① 纯文本 user（T4 turn 边界的正常形态）→ 摘出末条，摘要指令顶替它，重建时塞回；
+    // ② 无 tool_use 的 assistant（REPL /compact 的正常形态——turn 收敛时末条 assistant
+    //    必无 tool_use）→ 摘要指令直接追加，合法且配对完整；
+    // ③ 带 tool_result 的 user（budget 超限截停态）→ 非法边界：slice 会孤儿化前面的
+    //    tool_use（400），追加又造出连续 user（400）——跳过，宁少压一次再等下轮
+    async compactAnthropic(): Promise<boolean> {
+        if (this.messages.length < 4) return false; // 太短的对话不值得摘要
+        const tail = this.messages[this.messages.length - 1];
+        const tailHasToolUse = Array.isArray(tail.content) &&
+            (tail.content as any[]).some((b: any) => b.type === "tool_use");
+        const SUMMARIZE_INSTRUCTION = "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.";
+        let requestMessages: Anthropic.MessageParam[];
+        let carryTail: boolean;
+        if (tail.role === "user" && typeof tail.content === "string") {
+            requestMessages = [...this.messages.slice(0, -1), { role: "user", content: SUMMARIZE_INSTRUCTION }];
+            carryTail = true;
+        } else if (tail.role === "assistant" && !tailHasToolUse) {
+            requestMessages = [...this.messages, { role: "user", content: SUMMARIZE_INSTRUCTION }];
+            carryTail = false;
+        } else {
+            // ③ 或未知形态——fail-closed：不发注定非法的摘要请求
+            printInfo("Cannot compact here: history ends mid-tool-batch. Try again after the next exchange.");
+            return false;
+        }
         const summaryResp = await this.client.messages.create({
             model: MODEL,
             max_tokens: 2048,
             system: "You are a conversation summarizer. Be concise but preserve important details.",
-            messages: [
-                ...this.messages.slice(0, -1),
-                {
-                    role: "user",
-                    content: "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.",
-                },
-            ],
+            messages: requestMessages,
         });
         const summaryText =
             summaryResp.content[0]?.type === "text"
@@ -422,8 +429,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             { role: "user", content: `[Previous conversation summary]\n${summaryText}` },
             { role: "assistant", content: "Understood. I have the context from our previous conversation. How can I continue helping?" },
         ];
-        if (lastUserMsg.role === "user") this.messages.push(lastUserMsg);
+        if (carryTail) this.messages.push(tail);
         this.lastInputTokenCount = 0;
+        return true;
     }
 
     // ── 大结果持久化：>30KB 的工具结果落盘 ~/.mini-claude/tool-results/，
@@ -496,7 +504,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 },
                 anthropicMessages: this.messages,
             });
-        } catch {} // 写盘失败不打断对话——容错分层的取舍见 my_docs/17-multi-session.md
+        } catch { }
     }
 
     private async ensureMcp(): Promise<void> {
@@ -508,8 +516,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async close(): Promise<void> {
         await this.mcpManager.disconnectAll();
     }
-
-    // ─── Memory prefetch 生命周期（ch22）────────────────────────
 
     // 旁路查询：独立小请求（非流式、temperature 0、256 token 上限），
     // 给 memory selector 这类"让模型做决策"的辅助调用用，主对话历史不掺和
@@ -565,7 +571,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         );
     }
 
-    // ─── Prefix caching（Anthropic）────────────────────────────
     // system 拆成两个块：静态主体打 cache_control 断点（断点前的所有内容，
     // 含工具 schema，命中服务端前缀缓存）；动态上下文（环境 + memory 索引）
     // 放断点之后——模型写一条记忆索引就变，进了静态块等于每次写记忆都作废缓存
@@ -601,8 +606,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
         return out;
     }
-
-    // ─── /goal — prompt 版 Stop-hook（ch24：三态 JSON 契约）───────
 
     /** 设定活跃 goal 并返回首轮指令（设定 goal 本身就开启一个 turn）。 */
     setGoal(condition: string): string {
@@ -720,7 +723,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return "";
     }
 
-    // ─── /loop — 周期或自排程 prompt ─────────────────────────────
     // /goal 是被动闸门（每轮评估），/loop 相反：主动自排程。/goal 决定
     // *要不要*继续，/loop 决定*何时*开下一轮——固定间隔，或主模型经
     // schedule_wakeup 自选节奏。
@@ -849,8 +851,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.goalStop = true;
     }
 
-    // ─── 中断支持（ch26：SIGINT 两连退出的地基）──────────────────
-
     /** 取消在途 API 请求（流式请求会立刻以 abort 错误失败，chat 向上抛）。 */
     abort(): void {
         this.abortController?.abort();
@@ -861,13 +861,28 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     }
 
     async chat(userText: string): Promise<void> {
+        // 环境 reminder 只进主对话首条消息——子 agent 有自己的 system，不掺和
         const content = this.messages.length === 0 && !this.hasCustomPrompt
             ? `${userText}\n\n${buildUserContextReminder()}`
             : userText;
-        this.messages.push({ role: "user", content: content });
+        // budget 超限截停会把历史末尾停在 user（tool_result 拒绝批次）上——此刻再
+        // push 一条 user 就是连续同角色，真实 Anthropic API 直接 400（roles must
+        // alternate；真 CC 靠 normalizeMessagesForAPI 在客户端兜底）。把新文本并进
+        // 末条 user：字符串直接拼接；tool_result 批次则追加 text 块（tool_result
+        // 在前、text 在后的 user 消息是合法形状）
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === "user") {
+            if (typeof last.content === "string" || last.content == null) {
+                last.content = last.content ? `${last.content}\n\n${content}` : content;
+            } else {
+                (last.content as any[]).push({ type: "text", text: content });
+            }
+        } else {
+            this.messages.push({ role: "user", content });
+        }
         // T4 在 turn 边界检查：此刻最后一条消息是纯 user 文本，compactAnthropic 的
         // slice 不变式才成立。放进 while 顶的话，工具轮的末尾是 tool_result——
-        // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发（ch14 真机发现 5）
+        // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发
         await this.checkAndCompact();
         // 语义召回：turn 边界发起异步 prefetch，不挡主循环；每轮请求前轮询一次，
         // selector 一落定立刻注入，模型尽早看到记忆
@@ -917,7 +932,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
             this.emitText("\n");
             // 四计数：缓存读/写分开累计；lastInputTokenCount = 本次 prompt 全量 + 输出
-            // （输出会成为下一次请求的一部分），ch21 压缩仪表读它
+            // （输出会成为下一次请求的一部分），压缩仪表读它
             const u: any = response.usage;
             const cacheRead = u.cache_read_input_tokens || 0;
             const cacheCreation = u.cache_creation_input_tokens || 0;
@@ -928,7 +943,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.lastInputTokenCount = u.input_tokens + cacheRead + cacheCreation + u.output_tokens;
             this.lastApiCallTime = Date.now();
             this.messages.push({ role: "assistant", content: response.content });
-            
+
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 
             if (toolUses.length === 0) {
@@ -961,31 +976,39 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             let contextBreak = false;
             for (const tu of toolUses) {
-                printToolCall(tu.name, tu.input as Record<string, any>);
-                // auto 走 transcript 分类器裁决（内含 deny 规则硬底线与 fast-path），
-                // 其余模式走静态八阶段流水线
-                const perm = this.mode === "auto"
-                    ? await this.classifyToolCall(tu.name, tu.input as Record<string, any>)
-                    : checkPermission(tu.name, tu.input as Record<string, any>, this.mode, this.planFilePath || undefined);
-                if (perm.action === "deny") {
-                    printInfo(`Denied: ${perm.message}`);
-                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: `Denied: ${perm.message}` });
-                    continue;
-                }
-                if (perm.action === "confirm" && perm.message) {
-                    // 同一 message 确认一次后缓存；但 auto 的 confirm 带的是动作摘要
-                    // 不是路径——一次批准等于给"同摘要"的所有后续动作开白名单，绝不能缓存
-                    const cacheable = this.mode !== "auto";
-                    if (!cacheable || !this.confirmedPaths.has(perm.message)) {
-                        const confirmed = await this.confirmDangerous(perm.message);
-                        if (!confirmed) {
-                            toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: "User denied this action." });
-                            continue;
-                        }
-                        if (cacheable) this.confirmedPaths.add(perm.message);
+                // 单工具全包 try/catch：任何意外抛错（畸形 input 打崩 UI 渲染、落盘
+                // 失败等）都转成 error tool_result 回灌。否则异常逃出循环时历史里
+                // 挂着无回应的 tool_use，之后每个请求都 400（历史永久污染）
+                let output: string;
+                try {
+                    printToolCall(tu.name, tu.input as Record<string, any>);
+                    // auto 走 transcript 分类器裁决（内含 deny 规则硬底线与 fast-path），
+                    // 其余模式走静态八阶段流水线
+                    const perm = this.mode === "auto"
+                        ? await this.classifyToolCall(tu.name, tu.input as Record<string, any>)
+                        : checkPermission(tu.name, tu.input as Record<string, any>, this.mode, this.planFilePath || undefined);
+                    if (perm.action === "deny") {
+                        printInfo(`Denied: ${perm.message}`);
+                        toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: `Denied: ${perm.message}` });
+                        continue;
                     }
+                    if (perm.action === "confirm" && perm.message) {
+                        // 同一 message 确认一次后缓存；但 auto 的 confirm 带的是动作摘要
+                        // 不是路径——一次批准等于给"同摘要"的所有后续动作开白名单，绝不能缓存
+                        const cacheable = this.mode !== "auto";
+                        if (!cacheable || !this.confirmedPaths.has(perm.message)) {
+                            const confirmed = await this.confirmDangerous(perm.message);
+                            if (!confirmed) {
+                                toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: "User denied this action." });
+                                continue;
+                            }
+                            if (cacheable) this.confirmedPaths.add(perm.message);
+                        }
+                    }
+                    output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
+                } catch (e: any) {
+                    output = `Tool execution failed: ${e?.message ?? e}`;
                 }
-                const output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
                 if (this.contextCleared) {
                     // 选项 1（clear-and-execute）：历史刚被清空，exit 结果作为重建
                     // 上下文的首条 user 消息（带 CLAUDE.md reminder，与 chat() 首条
@@ -1008,8 +1031,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
     }
 
-    // ─── 工具分发（ch23 重构）：普通工具落 executeTool；agent/skill/mcp 走各自通道 ───
-
     private async executeToolCall(name: string, input: Record<string, any>): Promise<string> {
         if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
         if (name === "agent") return this.executeAgentTool(input);
@@ -1030,8 +1051,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
         return executeTool(name, input, this.readFileState);
     }
-
-    // ─── Plan Mode 工具执行（ch25）──────────────────────────────
 
     private async executePlanModeTool(name: string): Promise<string> {
         if (name === "enter_plan_mode") {
@@ -1105,7 +1124,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.lastInputTokenCount = 0;
     }
 
-    // ─── Auto Mode — transcript 分类器权限闸（ch26）──────────────
     // auto 模式下分类器取代人工确认框：deny 规则照旧硬拦，只读工具走
     // fast-path，其余交给读"推理盲"transcript 投影的 LLM 裁决。
 
@@ -1137,14 +1155,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             const system = buildClassifierSystem(rules);
             // CLAUDE.md 走 user 消息，不进 system——它是不可信的仓库内容
             const claudeMd = loadClaudeMd();
-            // stage 1 — 激进廉价闸（token 预算很小：只够输出 <block>…）
+            // stage 1 — 廉价闸：token 预算只够输出 <block>…
             const s1raw = await this.runClassifierQuery(system, classifierUserMessage(rules, transcript, rules.suffix_stage1, claudeMd), 256);
             const s1 = parseBlockVerdict(s1raw);
             if (!s1.block) {
-                verdict = s1;                 // stage 1 放行 → 一次调用搞定
+                verdict = s1;
             } else {
-                // stage 2 — 审慎裁决（权衡用户意图、可解除拦截）。token 更多：
-                // stage 2 允许在裁决前输出 <thinking> 块
+                // stage 2 — 审慎裁决：token 更宽裕，允许裁决前先输出 <thinking> 块
                 const s2raw = await this.runClassifierQuery(system, classifierUserMessage(rules, transcript, rules.suffix_stage2, claudeMd), 1024);
                 verdict = parseBlockVerdict(s2raw);
             }
@@ -1193,8 +1210,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             .map((b) => b.text).join("");
     }
 
-    // ─── Sub-agent fork（ch23）────────────────────────────────
-
     // 权限模式子 agent 继承规则：plan/auto 必须穿透——否则主对话里被拦的操作可以
     // 借 agent(prompt="rm -rf /") 让 bypassPermissions 的子 agent 绕过闸门（权限洗白）。
     // 其余模式落 bypassPermissions：子 agent 的危险动作由父层工具集与白名单约束
@@ -1240,9 +1255,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (!result) return `Unknown skill: ${input.skill_name}`;
 
         if (result.context === "fork") {
-            // fork 不许继承 schedule_wakeup——它是本 agent dynamic loop 的驱动内部工具
+            // fork 不许继承 schedule_wakeup——它是本 agent dynamic loop 的驱动内部工具；
+            // agent 同理，白名单里写了也不给（子 agent 不许再派生子 agent，递归失控）
             const tools = (result.allowedTools
-                ? this.tools.filter(t => result.allowedTools!.includes(t.name))
+                ? this.tools.filter(t => result.allowedTools!.includes(t.name) && t.name !== "agent")
                 : this.tools.filter(t => t.name !== "agent"))
                 .filter(t => t.name !== "schedule_wakeup");
 
@@ -1268,8 +1284,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
     }
-
-    // ─── 子 agent 入口：跑一次完整任务，回传最终文本 + token 增量（差值法）───
 
     async runOnce(prompt: string): Promise<{ text: string; tokens: { input: number; output: number } }> {
         this.outputBuffer = [];

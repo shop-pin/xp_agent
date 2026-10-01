@@ -8,8 +8,6 @@ import { join, dirname } from "path";
 // 换成读脱敏 transcript 的分类器（内部代号 YOLO classifier）——硬底线
 // （deny 规则）仍前置，分类器只裁"旧规则没拦、但也不该无脑放行"的动作。
 
-// ─── /goal — prompt 版 Stop-hook 评估器 ──────────────────────────────────────
-
 /** 设定 goal 时的首轮注入：设定 goal 本身就开启一个 turn。 */
 export function goalDirective(condition: string): string {
     return `/goal ${condition}\n\nA session-scoped Stop hook is now active with condition: "${condition}". Briefly acknowledge the goal, then immediately start working toward it — treat the condition itself as your directive.`;
@@ -72,8 +70,6 @@ export function parseGoalVerdict(raw: string): GoalVerdict {
 
 /** 无 --max-turns 时的硬顶：评估器漏判 impossible 的死循环也能终止。 */
 export const GOAL_MAX_ITERATIONS = 25;
-
-// ─── /loop — 周期或自排程 prompt ─────────────────────────────────────────────
 
 export interface LoopSpec {
     mode: "interval" | "dynamic";
@@ -168,12 +164,9 @@ export function dynamicLoopDirective(prompt: string): string {
 /** 间隔轮教学安全上限：无预算的演示循环也能终止。 */
 export const LOOP_MAX_ITERATIONS = 100;
 
-// ─── Auto Mode — transcript 分类器权限闸 ─────────────────────────────────────
-//
 // default/acceptEdits 等模式靠静态规则 + 确认框决策；Auto Mode 把确认框换成
 // 一个 LLM：读一段脱敏的对话记录投影，对照自然语言规则集判"该不该拦"。
 // 提示词骨架、输出格式、两段后缀、CLAUDE.md 注入措辞逐字取自泄露实锤
-// （how-claude-code-works ch18 附录，Claude Code 2.1.201 二进制提取）；
 // 规则桶是 `claude auto-mode defaults` 的代表性子集。两段式流程（stage 1
 // 激进闸 → stage 2 审慎裁决）照跑；不做 GrowthBook 灰度/熔断、命令级 Bash
 // 分类器、规则 critique 元评估器。

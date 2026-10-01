@@ -13,8 +13,6 @@ import { parseFrontmatter, formatFrontmatter } from "./frontmatter.js";
 /** A function that sends a prompt and returns the model's text response. */
 export type SideQueryFn = (system: string, userMessage: string, signal?: AbortSignal) => Promise<string>;
 
-// ─── Types ──────────────────────────────────────────────────
-
 export type MemoryType = "user" | "feedback" | "project" | "reference";
 
 export interface MemoryEntry {
@@ -28,8 +26,6 @@ export interface MemoryEntry {
 const VALID_TYPES = new Set<MemoryType>(["user", "feedback", "project", "reference"]);
 const MAX_INDEX_LINES = 200;
 const MAX_INDEX_BYTES = 25000;
-
-// ─── Paths ──────────────────────────────────────────────────
 
 // 每个项目隔离：目录名 = cwd 的 sha256 前 16 位。
 // 运行时惰性求值（HOME 沙箱 / mock 依赖这一点，不能提为模块常量）
@@ -47,8 +43,6 @@ function getIndexPath(): string {
     return join(getMemoryDir(), "MEMORY.md");
 }
 
-// ─── Slugify ────────────────────────────────────────────────
-
 function slugify(text: string): string {
     return text
         .toLowerCase()
@@ -56,8 +50,6 @@ function slugify(text: string): string {
         .replace(/^_|_$/g, "")
         .slice(0, 40);
 }
-
-// ─── CRUD ───────────────────────────────────────────────────
 
 export function listMemories(): MemoryEntry[] {
     const dir = getMemoryDir();
@@ -79,7 +71,6 @@ export function listMemories(): MemoryEntry[] {
             });
         } catch { /* skip corrupt files */ }
     }
-    // Sort by mtime desc
     entries.sort((a, b) => {
         try {
             const statA = statSync(join(dir, a.filename));
@@ -110,8 +101,6 @@ export function deleteMemory(filename: string): boolean {
     return true;
 }
 
-// ─── Index ──────────────────────────────────────────────────
-
 // 导出给 tools.ts 复用：write_file 落进记忆目录时自动重建索引（写时重建，
 // 模型永远不要手动维护 MEMORY.md）
 export function updateMemoryIndex(): void {
@@ -140,8 +129,6 @@ export function loadMemoryIndex(): string {
     return content;
 }
 
-// ─── Memory Header (lightweight scan) ──────────────────────
-
 export interface MemoryHeader {
     filename: string;
     filePath: string;
@@ -166,7 +153,6 @@ export function scanMemoryHeaders(): MemoryHeader[] {
             const filePath = join(dir, file);
             const stat = statSync(filePath);
             const raw = readFileSync(filePath, "utf-8");
-            // Only parse frontmatter (first 30 lines)
             const first30 = raw.split("\n").slice(0, 30).join("\n");
             const { meta } = parseFrontmatter(first30);
             headers.push({
@@ -178,7 +164,6 @@ export function scanMemoryHeaders(): MemoryHeader[] {
             });
         } catch { /* skip corrupt files */ }
     }
-    // Sort newest first, cap at 200
     headers.sort((a, b) => b.mtimeMs - a.mtimeMs);
     return headers.slice(0, MAX_MEMORY_FILES);
 }
@@ -196,8 +181,6 @@ export function formatMemoryManifest(headers: MemoryHeader[]): string {
         .join("\n");
 }
 
-// ─── Memory Age / Freshness ────────────────────────────────
-
 export function memoryAge(mtimeMs: number): string {
     const days = Math.max(0, Math.floor((Date.now() - mtimeMs) / 86_400_000));
     if (days === 0) return "today";
@@ -210,8 +193,6 @@ export function memoryFreshnessWarning(mtimeMs: number): string {
     if (days <= 1) return "";
     return `This memory is ${days} days old. Memories are point-in-time observations, not live state — claims about code behavior may be outdated. Verify against current code before asserting as fact.`;
 }
-
-// ─── Semantic Recall (sideQuery) ────────────────────────────
 
 const SELECT_MEMORIES_PROMPT = `You are selecting memories that will be useful to an AI coding assistant as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
 
@@ -239,7 +220,6 @@ export async function selectRelevantMemories(
     const headers = scanMemoryHeaders();
     if (headers.length === 0) return [];
 
-    // Filter out already-surfaced memories before sending to selector
     const candidates = headers.filter((h) => !alreadySurfaced.has(h.filePath));
     if (candidates.length === 0) return [];
 
@@ -259,13 +239,11 @@ export async function selectRelevantMemories(
         const parsed = JSON.parse(jsonMatch[0]);
         const selectedFilenames: string[] = parsed.selected_memories || [];
 
-        // Map filenames back to headers, read full content
         const filenameSet = new Set(selectedFilenames);
         const selected = candidates.filter((h) => filenameSet.has(h.filename));
 
         return selected.slice(0, 5).map((h) => {
             let content = readFileSync(h.filePath, "utf-8");
-            // Truncate to per-file limit
             if (Buffer.byteLength(content) > MAX_MEMORY_BYTES_PER_FILE) {
                 content = content.slice(0, MAX_MEMORY_BYTES_PER_FILE) +
                     "\n\n[... truncated, memory file too large ...]";
@@ -285,8 +263,6 @@ export async function selectRelevantMemories(
     }
 }
 
-// ─── Prefetch Handle ────────────────────────────────────────
-
 export interface MemoryPrefetch {
     promise: Promise<RelevantMemory[]>;
     settled: boolean;
@@ -304,7 +280,6 @@ function isQuerySubstantial(query: string): boolean {
     const cjkMatches = trimmed.match(cjkRegex);
     if (cjkMatches && cjkMatches.length >= 2) return true;
 
-    // Fallback: multi-word input (contains whitespace)
     if (/\s/.test(trimmed)) return true;
 
     return false;
@@ -319,13 +294,9 @@ export function startMemoryPrefetch(
     sessionMemoryBytes: number,
     signal?: AbortSignal,
 ): MemoryPrefetch | null {
-    // Gate: substantial input (CJK chars or multi-word)
     if (!isQuerySubstantial(query)) return null;
-
-    // Gate: session budget
     if (sessionMemoryBytes >= MAX_SESSION_MEMORY_BYTES) return null;
 
-    // Gate: memories must exist
     const dir = getMemoryDir();
     const hasMemories = readdirSync(dir).some(
         (f) => f.endsWith(".md") && f !== "MEMORY.md"
@@ -347,8 +318,6 @@ export function formatMemoriesForInjection(memories: RelevantMemory[]): string {
         .map((m) => `<system-reminder>\n${m.header}\n\n${m.content}\n</system-reminder>`)
         .join("\n\n");
 }
-
-// ─── System prompt section ──────────────────────────────────
 
 export function buildMemoryPromptSection(): string {
     const index = loadMemoryIndex();

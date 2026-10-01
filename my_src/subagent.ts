@@ -130,8 +130,9 @@ function discoverCustomAgents(): Map<string, CustomAgentDef> {
 export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
     const custom = discoverCustomAgents().get(type);
     if (custom) {
+        // 白名单/默认都滤掉 agent 工具——子 agent 不许再派生子 agent（递归失控）
         const tools = custom.allowedTools
-            ? toolDefinitions.filter((t) => custom.allowedTools!.includes(t.name))
+            ? toolDefinitions.filter((t) => custom.allowedTools!.includes(t.name) && t.name !== "agent")
             : toolDefinitions.filter((t) => t.name !== "agent");
         return { systemPrompt: custom.systemPrompt, tools };
     }
@@ -164,7 +165,7 @@ export function getAvailableAgentTypes(): { name: string; description: string }[
 
 export function buildAgentDescriptions(): string {
     const types = getAvailableAgentTypes();
-    if (types.length <= 3) return "";
+    if (types.length <= 3) return ""; // 前 3 项固定是内建类型，全是内建时无需广告
     const custom = types.slice(3);
     const lines = ["\n# Custom Agent Types", ""];
     for (const t of custom) {

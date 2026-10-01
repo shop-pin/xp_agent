@@ -39,17 +39,15 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
     }
 }
 
-// ─── 单条连接（每 server 一条）────────────────────────────────
-
 class McpConnection {
     private process: ChildProcess | null = null;
     private nextId = 1;
     // 每个 id 挂 {resolve, reject}：回应来了挑出 resolve；进程死了要能
-    // 逐个 reject（否则挂起的调用永远悬着）——这是对 ch12 版本的核心升级
+    // 逐个 reject（否则挂起的调用永远悬着）
     private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
     private rl: Interface | null = null;
 
-    constructor(private serverName: string, private config: McpServerConfig) {}
+    constructor(private serverName: string, private config: McpServerConfig) { }
 
     async connect(): Promise<void> {
         const env = { ...process.env, ...(this.config.env || {}) };
@@ -76,7 +74,7 @@ class McpConnection {
             }
         });
 
-        this.process.stderr?.on("data", () => {});
+        this.process.stderr?.on("data", () => { });
         this.process.on("error", (err) => {
             console.error(`[mcp:${this.serverName}] process error: ${err.message}`);
         });
@@ -143,8 +141,6 @@ class McpConnection {
     }
 }
 
-// ─── Manager（管理全部连接）──────────────────────────────────
-
 export class McpManager {
     private connections = new Map<string, McpConnection>();
     private tools: McpToolInfo[] = [];
@@ -209,7 +205,7 @@ export class McpManager {
     // ─── 配置加载 ────────────────────────────────────────────
 
     // 三处合并，后者覆盖：用户级 → 项目级 settings.json → .mcp.json。
-    // 与 ch19 权限规则同一个读取套路，但这里不缓存——MCP 配置虽然也只读，
+    // 与权限规则同一个读取套路，但这里不缓存——MCP 配置虽然也只读，
     // loadAndConnect 幂等已保证只读一次，无需再垫模块级缓存
     private loadConfigs(): Record<string, McpServerConfig> {
         const merged: Record<string, McpServerConfig> = {};

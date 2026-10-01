@@ -104,8 +104,6 @@ export function printInfo(msg: string) {
     console.log(chalk.cyan(`\n  ℹ ${msg}`));
 }
 
-// ─── Spinner for API calls ──────────────────────────────────
-
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 let spinnerTimer: ReturnType<typeof setInterval> | null = null;
@@ -131,8 +129,6 @@ export function stopSpinner() {
     process.stdout.write("\r\x1b[K");
 }
 
-// ─── Plan approval display (ch25 接线) ─────────────────────
-
 export function printPlanForApproval(planContent: string) {
     console.log(chalk.cyan("\n  ━━━ Plan for Approval ━━━"));
     const lines = planContent.split("\n");
@@ -155,8 +151,6 @@ export function printPlanApprovalOptions() {
     console.log(chalk.white("    4) No, keep planning") + chalk.gray(" — provide feedback to revise"));
 }
 
-// ─── Sub-agent display (ch23 接线) ─────────────────────────
-
 export function printSubAgentStart(type: string, description: string) {
     console.log(
         chalk.magenta(`\n  ┌─ Sub-agent [${type}]: ${description}`)
@@ -168,8 +162,6 @@ export function printSubAgentEnd(type: string, description: string) {
         chalk.magenta(`  └─ Sub-agent [${type}] completed`)
     );
 }
-
-// ─── Tool icons and summaries ───────────────────────────────
 
 function getToolIcon(name: string): string {
     const icons: Record<string, string> = {
@@ -197,10 +189,10 @@ function getToolSummary(name: string, input: Record<string, any>): string {
             return input.pattern;
         case "grep_search":
             return `"${input.pattern}" in ${input.path || "."}`;
-        case "run_shell":
-            return input.command.length > 60
-                ? input.command.slice(0, 60) + "..."
-                : input.command;
+        case "run_shell": {
+            const cmd = String(input.command ?? "");
+            return cmd.length > 60 ? cmd.slice(0, 60) + "..." : cmd;
+        }
         case "skill":
             return input.skill_name;
         case "agent":

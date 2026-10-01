@@ -21,8 +21,12 @@
    `"Summarize the conversation so far..."`——这个特征在 mock 里用来把辅助调用路由到
    独立轨道。
 4. **压缩结果 = `[摘要 user 消息, ...recent]`**——摘要以 user 身份开头（对话总是以
-   user 开头），recent 从 slice 边界接上。Anthropic 允许连续同角色消息（自动合并），
-   所以边界切在哪都是合法的。
+   user 开头），recent 从 slice 边界接上。注意：Anthropic API 要求 user/assistant
+   严格交替，连发同角色消息直接 400（"roles must alternate"；tool_use/tool_result
+   配对同理）——2026-10 收尾审查时实测确认（本机 GLM 兼容代理宽松放行，但官方契约
+   是 400，与 11 章笔记一致）。真 CC 靠 normalizeMessagesForAPI 在发送前合并分裂消息
+   （教材 ch06/ch07 均有记载），"边界切在哪都合法"的前提是过了这一层；教学版没有
+   这一层，靠构造时维持不变式替代。
 
 ### 切在哪、留多少
 

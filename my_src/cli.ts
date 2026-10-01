@@ -141,8 +141,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
             });
         });
     });
-    // 审批回调复用同一个 readline（同一个 stdin 开第二个 interface 的经典坑）。
-    // 选项 4 追问反馈；无效输入原界面重问
+    // 审批回调同理复用 readline（理由同上）。选项 4 追问反馈；无效输入原界面重问
     agent.setPlanApprovalFn((planContent: string) => {
         return new Promise((resolve) => {
             printPlanForApproval(planContent);

@@ -3,7 +3,7 @@
 //   npm run mock        → chapter 1
 //   npm run mock -- 2   → chapter 2
 //   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
-import { startMock } from "../steps/mock-anthropic.mjs";
+import { startMock } from "./mock-anthropic.mjs";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync } from "fs";
 import { createHash } from "crypto";
 import { tmpdir } from "os";
@@ -26,7 +26,7 @@ const scenarios = {
     prompt: "Create a file notes.txt containing the text remember-this.",
     // ch19 迁移：新文件写落到 confirm；注入自动 yes 的 confirmFn，场景专注"工具真写了盘"
     autoConfirm: true,
-    setup: () => {},
+    setup: () => { },
     turns: [
       {
         tools: [
@@ -198,7 +198,7 @@ const scenarios = {
         mainReqs[1]?.system.includes("My favorite editor")
         && mainReqs[1]?.system.includes("Deploy target"));
       let indexOnDisk = "";
-      try { indexOnDisk = readFileSync(join(memDir, "MEMORY.md"), "utf-8"); } catch {}
+      try { indexOnDisk = readFileSync(join(memDir, "MEMORY.md"), "utf-8"); } catch { }
       check("MEMORY.md on disk lists the new memory",
         indexOnDisk.includes("**[My favorite editor](user_editor.md)** (user)"));
       if (!ok) process.exitCode = 1;
@@ -298,7 +298,7 @@ const scenarios = {
     // plan 文件路径含随机 sessionId，脚本化 write 够不着——写 plan 文件豁免
     // （checkPermission 全等放行分支）mock 测不到，靠 review + 真机冒烟兜底。
     needsLog: true,
-    setup: () => {},
+    setup: () => { },
     runs: [
       { prompt: "Plan how to create report.txt, then do it.", planApproval: { choice: "execute" } },
       { prompt: "Plan the refactor.", planApproval: { choice: "keep-planning", feedback: "Add a verification step." } },
@@ -455,7 +455,7 @@ const scenarios = {
     // 藏住凭据泄漏。拒绝文案从 "Blocked by auto-mode monitor:" 变
     // "Denied: [Auto Mode] <reason>"。
     needsLog: true,
-    setup: () => {},
+    setup: () => { },
     runs: [
       { argv: ["--goal", "done.txt exists", "--accept-edits", "Create done.txt with ok."] },
       { argv: ["--auto", "Create secret.txt with credentials."] },
@@ -598,7 +598,7 @@ const scenarios = {
       { argv: ["--resume", "What is my favorite color?"] },
     ],
     needsLog: true,
-    setup: () => {},
+    setup: () => { },
     turns: [
       { text: "Got it — your favorite color is blue." },
       { text: "Your favorite color is blue." },
@@ -611,7 +611,7 @@ const scenarios = {
       check("old cwd .mini-session.json is gone", !existsSync(join(dir, ".mini-session.json")));
       const sessionsDir = join(dir, ".mini-claude", "sessions");
       let files = [];
-      try { files = readdirSync(sessionsDir).filter((f) => f.endsWith(".json")); } catch {}
+      try { files = readdirSync(sessionsDir).filter((f) => f.endsWith(".json")); } catch { }
       check("two session files under HOME sandbox (one per run)", files.length === 2);
       // run2 留下的那份：2 restored + 1 new user + 1 new assistant = 4 条。
       // resume 坏了的话 run2 只会存 2 条新消息，找不到 messageCount===4 的文件。
@@ -620,7 +620,7 @@ const scenarios = {
         try {
           const data = JSON.parse(readFileSync(join(sessionsDir, f), "utf-8"));
           if (data.metadata?.messageCount === 4) run2 = data;
-        } catch {}
+        } catch { }
       }
       check("run2 session carries full metadata", !!run2
         && typeof run2.metadata?.id === "string"
@@ -906,7 +906,7 @@ const scenarios = {
       let persisted = [];
       try {
         persisted = readdirSync(join(dir, ".mini-claude", "tool-results")).filter((f) => f.endsWith(".txt"));
-      } catch {}
+      } catch { }
       check("run2: full output landed in HOME-sandbox tool-results/", persisted.length >= 1);
       if (persisted.length >= 1) {
         const saved = readFileSync(join(dir, ".mini-claude", "tool-results", persisted[0]), "utf-8");
@@ -1021,7 +1021,7 @@ const scenarios = {
     // run3 dynamic 收敛：模型不调 schedule_wakeup → "converged after 1 tick"。
     // schedule_wakeup 广告门控：interval run 不广告；dynamic run（含 tick1）广告。
     needsLog: true,
-    setup: () => {},
+    setup: () => { },
     runs: [
       { loop: "1s report the clock", maxTurns: 2 },
       { loop: "check the deploy", stopLoopAfterMs: 400 },

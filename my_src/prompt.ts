@@ -10,11 +10,13 @@ import { getDeferredToolNames } from "./tools.js";
 const REGEXP = /^@(\S+)[ \t]*$/gm;
 const MAX_DEPTH = 5;
 
+// @<path> 指令：把引用文件的内容原地展开（CLAUDE.md 的 @import 语法，支持 ~/、
+// 绝对路径、相对当前文件）。visited 防环；找不到/成环都以 HTML 注释占位，不炸加载
 function resolveIncludes(content: string, basePath: string, visited: Set<string> = new Set(), depth: number = 0): string {
     if (depth > MAX_DEPTH) {
         return content;
     }
-    return content.replace(REGEXP, (whole, rawPath) => {  
+    return content.replace(REGEXP, (whole, rawPath) => {
         let path: string;
         if (rawPath.startsWith("~/")) {
             path = join(os.homedir(), rawPath.slice(2));
