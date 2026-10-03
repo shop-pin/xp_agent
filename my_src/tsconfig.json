@@ -11,6 +11,8 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": [
-    "*.ts"
+    "*.ts",
+    "cordis/**/*.ts",
+    "cordis-tests/**/*.ts"
   ]
 }

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "mock": "tsc && node run-mock.mjs",
-    "live": "tsc && node run-live.mjs"
+    "live": "tsc && node run-live.mjs",
+    "cordis": "tsc && node --test \"dist/cordis-tests/*.test.js\""
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
