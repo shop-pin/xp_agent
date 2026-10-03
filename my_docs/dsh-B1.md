@@ -70,6 +70,8 @@ function lookup(ctx, name) {
 
 子层同名 provide 就是**遮蔽**（shadow）：`child.counter` 和 `parent.counter` 可以是不同实例，互不影响。B5 的 per-agent 作用域（"每个 agent 一棵私有工具注册树"）就是把这套机制用在工具注册表上——dsh 的 `packages/core/scope` 本质上是它的加强版。
 
+> **【B2 修正】** 上面这段的"遮蔽"语义在 B2 被推翻：读真源码 `reflect.ts` 的 provide 后确认，真 cordis 是**全树共享一张服务表**（上下文树是"生命周期树"不是"服务表树"），子层同名提供是**冲突抛错**，不是遮蔽。父链查找保留（isolate 分槽时仍需要），但共享表下它只在 isolate 边界生效。详见 dsh-B2.md 第 1 节。
+
 ## 4. Service 基类与 declaration merging
 
 ```ts
@@ -123,9 +125,10 @@ return () => {
 | 能力 | 真 cordis | mini-cordis B1 | 补齐章 |
 |---|---|---|---|
 | get 陷阱服务查找 | ✅ reflect.ts | ✅ | — |
-| 父链继承/遮蔽 | ✅ extend | ✅ 构造传 parent | — |
+| 父链继承 | ✅ extend | ✅ 构造传 parent | — |
 | Service 基类 | ✅ + callable/tracker | ✅ 最小版 | 不补（诊断非核心） |
-| inject 未声明即抛错 | ✅ get 陷阱校验 | ❌ 不校验 | B2（Fiber 带 inject 表） |
+| 共享表 + provide 冲突抛错 | ✅ | ~~B1 各层独立表~~ → B2 已对齐 | 已在 B2 修正 |
+| inject 未声明即抛错 | ✅ get 陷阱校验 | ❌ 不校验 | 明确放弃（见 B2） |
 | effect/可撤销注册 | ✅ fiber.effect | ⚠️ provide 返回 disposer 但无人收集 | B3 |
 | isolate/intercept 多实例 | ✅ | ❌ | 只讲原理（B5） |
 

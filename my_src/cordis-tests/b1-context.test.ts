@@ -88,30 +88,33 @@ test('子上下文继承父服务（同一实例）', () => {
   assert.equal(parent.counter.next(), 2) // 状态共享：就是同一个实例
 })
 
-test('子上下文遮蔽：同名 provide 覆盖本层，父层不受影响', () => {
+test('B2 语义修正：共享服务表，子层同名 provide 是冲突抛错（隔离要等 isolate）', () => {
   const parent = new Context()
-  const parentCounter = new CounterService(parent)
+  new CounterService(parent)
   const child = new Context(parent)
-  const childCounter = new CounterService(child)
-  assert.equal(child.counter, childCounter)
-  assert.equal(parent.counter, parentCounter)
-  assert.notEqual(child.counter, parentCounter)
+  assert.equal(child.counter, parent.counter) // 同一张表：父子看到同一实例
+  assert.throws(
+    () => new CounterService(child),
+    /service "counter" has been registered already/,
+  )
 })
 
-test('provide 返回的 disposer：卸载即删除、幂等、不误删后来的提供者', () => {
+test('provide 同名冲突抛错；disposer 释放后可重新提供；disposer 幂等且不误删新值', () => {
   const ctx = new Context()
-  const disposeTemp = ctx.provide('temp', { v: 1 })
-  assert.equal(ctx.get<{ v: number }>('temp')?.v, 1)
-  disposeTemp()
-  assert.equal(ctx.get('temp'), undefined)
-  disposeTemp() // 二次调用安全
-
   const disposeFirst = ctx.provide('x', 'first')
-  const disposeSecond = ctx.provide('x', 'second')
-  disposeFirst() // 旧 disposer 不该动新提供者
+  assert.throws(() => ctx.provide('x', 'second'), /has been registered already/)
+  disposeFirst()
+  ctx.provide('x', 'second') // 槽位已释放
+  disposeFirst() // 二次调用安全，且不得删掉新提供者
   assert.equal(ctx.get('x'), 'second')
-  disposeSecond()
-  assert.equal(ctx.get('x'), undefined)
+})
+
+test('provide 落表触发通知：等待中的插件自动激活（B2 hooks 机制）', () => {
+  const ctx = new Context()
+  const fiber = ctx.plugin({ inject: ['counter'], apply: () => {} })
+  assert.equal(fiber.state, 'pending')
+  new CounterService(ctx)
+  assert.equal(fiber.state, 'active')
 })
 
 test('Context 自有方法优先于服务查找（同名服务换名，已知限制）', () => {

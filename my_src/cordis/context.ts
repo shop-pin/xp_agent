@@ -11,11 +11,16 @@
 //   3. `provide` 返回 disposer——B3 的 effect 模型会接管这些 disposer，
 //      实现"插件卸载 = 注册全部回滚"。
 //
-// 与真 cordis 的已知差异（B2/B3 起逐步补齐或明确放弃）：
-//   - get 陷阱不做 inject 声明校验（真版：'cannot get property without inject'），
-//     B2 引入 Fiber 后补上
+// 与真 cordis 的已知差异（后续章补齐或明确放弃）：
+//   - get 陷阱不做 inject 声明校验（真版：'cannot get property without inject'）——
+//     需要按 ctx 层追踪提供者归属，mini 版明确放弃，依赖纪律靠 inject 声明 + 评审
 //   - 无 effect/事件系统（B3/B4）
-//   - 同名服务覆盖时直接替换并返回恢复型 disposer（真版走 reflect.provide 的 check 流程）
+//   - 假设单树运行（全局 pending 队列），见 registry.ts
+
+import type { Plugin } from './fiber.js'
+import { Fiber } from './fiber.js'
+import { resolvePlugin, trackPending, refreshPendingFibers } from './registry.js'
+import { notifyProvided } from './hooks.js'
 
 type ServiceBag = {
   services: Map<string, unknown>
@@ -66,7 +71,11 @@ const contextProxyHandler: ProxyHandler<Context> = {
 
 export class Context {
   constructor(parent?: Context) {
-    const bag: ServiceBag = { services: new Map(), parent }
+    // B2 语义修正：整棵树共享一张服务表（真 cordis 的 store 按 isolate key 分槽，
+    // 默认全树同名同槽；上下文树是"生命周期树"不是"服务表树"）。
+    // parent 字段保留给查找兜底与 B5 的 isolate 讲解。
+    const parentBag = parent ? bags.get(parent) : undefined
+    const bag: ServiceBag = { services: parentBag?.services ?? new Map(), parent }
     bags.set(this, bag)
     const proxy = new Proxy(this, contextProxyHandler)
     bags.set(proxy, bag)
@@ -74,22 +83,38 @@ export class Context {
   }
 
   /**
-   * 注册服务到本层（同名覆盖旧值，父层不受影响）。
-   * 返回 disposer：只删除"仍然是自己的"注册，幂等，不误删后来的提供者，
-   * 也不恢复旧值（恢复会让已卸载的提供者复活；子层卸载后自然回落到父层同名服务，
-   * 因为查找是沿父链走的，不需要 restore）。
-   * B3 起 disposer 由 effect 统一收集，插件卸载时自动调用。
+   * 注册服务到本树（同名冲突直接抛错，与真 cordis 一致：
+   * `service "x" has been registered at <fiber>`；要隔离实例请用 isolate，B5 讲原理）。
+   * 返回 disposer：只删除"仍然是自己的"注册，幂等；B3 起由 effect 统一收集。
+   * 落表后触发 notifyProvided 唤醒依赖等待中的 fiber。
    */
   provide(name: string, service: unknown): () => void {
     const bag = bags.get(this)
     if (!bag) throw new Error('[mini-cordis] provide() 必须通过 ctx 实例调用（不要解构方法）')
+    if (bag.services.has(name)) {
+      throw new Error(`[mini-cordis] service "${name}" has been registered already`)
+    }
     bag.services.set(name, service)
+    notifyProvided(name)
     let disposed = false
     return () => {
       if (disposed) return
       disposed = true
       if (bag.services.get(name) === service) bag.services.delete(name)
     }
+  }
+
+  /**
+   * 挂载插件（B2）。创建 fiber 专属的 child Context（生命周期边界），
+   * 未就绪的依赖使 fiber 扣在 pending，由 provide 通知自动唤醒。
+   * 返回 Fiber 以便检查状态（真 cordis 的返回值语义更丰富，mini 版从简）。
+   */
+  plugin(pluginDef: Plugin, config?: unknown): Fiber {
+    const child = new Context(this)
+    const fiber = new Fiber(this, child, resolvePlugin(pluginDef), config)
+    trackPending(fiber)
+    refreshPendingFibers()
+    return fiber
   }
 
   /** 可空读取：沿父链查找，找不到返回 undefined，不抛错。 */

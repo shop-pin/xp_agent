@@ -203,10 +203,15 @@
 
 | 章 | 状态 | 完成记录 |
 |---|---|---|
-| A0 | 未开始 | — |
-| B1..B6 | 未开始 | — |
+| A0 | ✅ 完成（2026-10-03） | `dsh-A0.md`：三个核心思想实物证据 + turn flow 草图 + 自测题 |
+| B1 | ✅ 完成（2026-10-03） | `dsh-B1.md`；cordis/context.ts + service.ts；框架测试 10/10 |
+| B2 | ✅ 完成（2026-10-03） | `dsh-B2.md`；fiber/registry/hooks + ctx.plugin()；**语义修正：全树共享服务表、provide 冲突抛错**（B1 测试/文档同步修正）；框架测试 22/22 |
+| B3 | 未开始（下次从这继续） | effect 模型：ctx.effect / fiber.dispose / 级联卸载 |
+| B4..B6 | 未开始 | — |
 | C1..C8 | 未开始 | — |
 | D1..D6 | 未开始 | — |
 | E1..E3 | 未开始 | — |
 
-> 约定：每章完成时在本表打勾，并在 `my_docs/dsh-<n>.md` 末尾附"翻车记档 + 思考题"（沿用上一轮格式）。
+> 约定：每章完成时在本表打勾，并在 `my_docs/dsh-<n>.md` 末尾附"翻车记档 + 自测题"。
+> 模式（2026-10-03 起）：每章 = Claude 写讲解 md → 自动实现代码 → 验证（cordis 测试 + 22 mock 回归）→ 复查文档 → 给 commit comment（用户自己提交）→ 问是否开下一章。
+> 已交付 commit：A0 `add dsh migration plan, chapter roadmap, and phase-A immersion notes`；B1 `add mini-cordis service container with proxy context and declaration merging`；B2 `add mini-cordis plugin fibers with lifecycle states and provide notification`。
