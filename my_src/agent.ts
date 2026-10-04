@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { toolDefinitions, type ToolDef } from "./tools.js";
 import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
+import { SessionLog, type TokenUsage } from "./services/session-log.js";
 import { Context } from "./cordis/context.js";
 import { coreFsTools } from "./plugins/core-fs-tools.js";
 import { coreExecTools } from "./plugins/core-exec-tools.js";
@@ -68,6 +69,9 @@ export class Agent {
     // C1：每个 Agent 一棵 mini-cordis 树，工具注册表长在上面；
     // 后续 C 阶段服务（session-log/llm/approval）逐章挂进同一棵树
     private cordis: Context;
+    // C3：会话事件日志——追加镜像 + 纯投影。线上工作集 this.messages 仍是请求
+    // 体来源（压缩 T1–T4 原地改写它），日志与工作集的发散点即 D5 投影 replace 的缝
+    private sessionLog: SessionLog;
     private staticSystemPrompt: string;
     private hasCustomPrompt: boolean;
     private isSubAgent: boolean;
@@ -142,6 +146,7 @@ export class Agent {
         //（注册序 = 旧 toolDefinitions 数组序，请求体 tools 数组顺序的生命线）
         this.cordis = new Context();
         new ToolsService(this.cordis, "tools");
+        this.sessionLog = new SessionLog(this.cordis, "session-log");
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -179,14 +184,49 @@ export class Agent {
 
     loadHistory(messages: Anthropic.MessageParam[]): void {
         this.messages = messages;
+        this.sessionLog.load(messages); // 回放：消息数组 → 事件流
     }
 
     clearHistory(): void {
         this.messages = [];
+        this.sessionLog.clear();
+    }
+
+    // ---------- C3：消息操作统一入口（工作集 + 日志双写） ----------
+
+    /**
+     * user 消息入栈。连续 user 合并的双侧镜像：日志侧在 SessionLog.append 入口，
+     * 工作集侧在这里——两边用同一套合并语义（字符串拼接 / tool_result 批次追加
+     * text 块），与迁移前 chat() 的行为逐字节一致。
+     */
+    private pushUser(content: string | Anthropic.ToolResultBlockParam[]): void {
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === "user") {
+            if (typeof last.content === "string" || last.content == null) {
+                last.content = last.content ? `${last.content}\n\n${content}` : content;
+            } else {
+                (last.content as any[]).push({ type: "text", text: content });
+            }
+            this.sessionLog.append({ type: "user/message", content });
+        } else {
+            this.messages.push({ role: "user", content } as Anthropic.MessageParam);
+            this.sessionLog.append({ type: "user/message", content });
+        }
+    }
+
+    private pushAssistant(content: Anthropic.ContentBlockParam[], usage?: TokenUsage): void {
+        this.messages.push({ role: "assistant", content });
+        this.sessionLog.append({ type: "assistant/message", content, usage });
+    }
+
+    /** 日志投影（C5+ 与测试消费；D5 压缩投影 replace 接管请求组装的入口）。 */
+    deriveSession(): { system: Anthropic.TextBlockParam[]; messages: Anthropic.MessageParam[] } {
+        return this.sessionLog.derive();
     }
 
     setMode(mode: PermissionMode): void {
         this.mode = mode;
+        this.sessionLog.append({ type: "meta/note", key: "mode", value: mode });
     }
 
     setPlanApprovalFn(fn: (planContent: string) => Promise<{
@@ -501,7 +541,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     }
 
     restoreSession(data: { anthropicMessages?: any[] }): void {
-        if (data.anthropicMessages) this.messages = data.anthropicMessages;
+        if (data.anthropicMessages) this.loadHistory(data.anthropicMessages);
         printInfo(`Session restored (${this.messages.length} messages).`);
     }
 
@@ -879,20 +919,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             ? `${userText}\n\n${buildUserContextReminder()}`
             : userText;
         // budget 超限截停会把历史末尾停在 user（tool_result 拒绝批次）上——此刻再
-        // push 一条 user 就是连续同角色，真实 Anthropic API 直接 400（roles must
-        // alternate；真 CC 靠 normalizeMessagesForAPI 在客户端兜底）。把新文本并进
-        // 末条 user：字符串直接拼接；tool_result 批次则追加 text 块（tool_result
-        // 在前、text 在后的 user 消息是合法形状）
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === "user") {
-            if (typeof last.content === "string" || last.content == null) {
-                last.content = last.content ? `${last.content}\n\n${content}` : content;
-            } else {
-                (last.content as any[]).push({ type: "text", text: content });
-            }
-        } else {
-            this.messages.push({ role: "user", content });
-        }
+        // 进一条 user 就是连续同角色，真实 Anthropic API 直接 400（roles must
+        // alternate）。合并语义（字符串拼接 / tool_result 批次追加 text 块）
+        // 收进 pushUser，工作集与日志两侧镜像同一套规则
+        this.pushUser(content);
         // T4 在 turn 边界检查：此刻最后一条消息是纯 user 文本，compactAnthropic 的
         // slice 不变式才成立。放进 while 顶的话，工具轮的末尾是 tool_result——
         // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发
@@ -915,12 +945,20 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     /** 主 agent 循环：请求 → 工具 → 回灌，直到模型不再调用工具。 */
     private async runAgentLoop(mcpTools: Anthropic.Tool[]): Promise<void> {
         while (true) {
+            this.sessionLog.append({ type: "turn/start" });
             // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
             this.runCompressionPipeline();
             await this.consumeMemoryPrefetchIfReady(this.messages);
             if (!this.isSubAgent) startSpinner();
             let firstText = true;
             let response: Anthropic.Message;
+            // C3：system 进日志（对比去重——动态段未变不重复 append）。
+            // 日志里可能有历史 system 事件，derive 只取最新
+            const systemBlocks = this.buildAnthropicSystem();
+            const encodedSystem = JSON.stringify(systemBlocks);
+            if (this.sessionLog.peekLastSystem() !== encodedSystem) {
+                this.sessionLog.append({ type: "system/message", content: encodedSystem });
+            }
             try {
                 // withRetry 包住"建流 + 等完整消息"：重试时旧流已死，必须重建整个流，
                 // 所以 fn 每次调用都 new 一个 stream，不能只包 finalMessage()
@@ -928,7 +966,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     const stream = this.client.messages.stream({
                         model: MODEL,
                         max_tokens: 4096,
-                        system: this.buildAnthropicSystem(),
+                        system: systemBlocks,
                         tools: [...getActiveToolDefinitions(this.tools), ...mcpTools],
                         messages: this.withCacheBreakpoints(this.messages),
                     }, { signal: this.abortController?.signal });
@@ -955,11 +993,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.totalOutputTokens += u.output_tokens;
             this.lastInputTokenCount = u.input_tokens + cacheRead + cacheCreation + u.output_tokens;
             this.lastApiCallTime = Date.now();
-            this.messages.push({ role: "assistant", content: response.content });
+            const usage: TokenUsage = {
+                input: u.input_tokens,
+                output: u.output_tokens,
+                cacheRead,
+                cacheCreation,
+            };
+            this.pushAssistant(response.content, usage);
 
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 
             if (toolUses.length === 0) {
+                this.sessionLog.append({ type: "turn/end", reason: "end-turn" });
                 if (!this.isSubAgent) {
                     printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
                     this.autoSave();
@@ -974,17 +1019,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             const budget = this.checkBudget();
             if (budget.exceeded) {
                 printInfo(`Budget exceeded: ${budget.reason}`);
-                this.messages.push({
-                    role: "user",
-                    content: toolUses.map((tu) => ({
+                this.sessionLog.append({ type: "turn/end", reason: "budget" });
+                this.pushUser(toolUses.map((tu) => {
+                    this.sessionLog.append({ type: "tool/result", callId: tu.id, content: `Tool call not executed: ${budget.reason}`, isError: true });
+                    return {
                         type: "tool_result" as const,
                         tool_use_id: tu.id,
                         content: `Tool call not executed: ${budget.reason}`,
-                    })),
-                });
+                    };
+                }));
                 this.autoSave();
                 break;
             }
+            this.sessionLog.append({ type: "turn/end", reason: "tool-use" });
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             let contextBreak = false;
@@ -995,6 +1042,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 let output: string;
                 try {
                     printToolCall(tu.name, tu.input as Record<string, any>);
+                    this.sessionLog.append({ type: "tool/call", id: tu.id, name: tu.name, input: tu.input as Record<string, any> });
                     // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
                     // → 审批 → dispatch → post-execute）。auto 的分类器机制仍在
                     // 本类，经 autoAdjudicate 句柄被 auto 监听器调用
@@ -1009,11 +1057,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     if (outcome.kind === "denied") {
                         if (outcome.announce) printInfo(`Denied: ${outcome.announce}`);
                         toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: outcome.content });
+                        this.sessionLog.append({ type: "tool/result", callId: tu.id, content: outcome.content, isError: true });
                         continue;
                     }
                     output = this.persistLargeResult(tu.name, outcome.output);
                 } catch (e: any) {
                     output = `Tool execution failed: ${e?.message ?? e}`;
+                    this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output, isError: true });
                 }
                 if (this.contextCleared) {
                     // 选项 1（clear-and-execute）：历史刚被清空，exit 结果作为重建
@@ -1024,14 +1074,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     const content = this.messages.length === 0 && !this.hasCustomPrompt
                         ? `${output}\n\n${buildUserContextReminder()}`
                         : output;
-                    this.messages.push({ role: "user", content });
+                    this.pushUser(content);
                     contextBreak = true;
                     break;
                 }
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
+                this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output });
             }
             if (!contextBreak && !this.contextCleared && toolResult.length > 0) {
-                this.messages.push({ role: "user", content: toolResult });
+                this.pushUser(toolResult);
             }
             this.contextCleared = false;
         }
@@ -1131,6 +1182,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     /** 审批选项 1 的清历史：system 在请求时现算，无需保留；token 仪表归零。 */
     private clearHistoryKeepSystem() {
         this.messages = [];
+        this.sessionLog.clear();
         this.lastInputTokenCount = 0;
     }
 
