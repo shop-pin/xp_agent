@@ -1,13 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
-import * as readline from "readline";
 import { toolDefinitions, type ToolDef } from "./tools.js";
 import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition } from "./services/tools.js";
+import type { ApprovalService } from "./services/approval.js";
 import { Context } from "./cordis/context.js";
 import { coreFsTools } from "./plugins/core-fs-tools.js";
 import { coreExecTools } from "./plugins/core-exec-tools.js";
 import { coreMetaTools } from "./plugins/core-meta-tools.js";
+import { approvalPlugin } from "./plugins/approval.js";
+import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
-import { checkPermission, type PermissionMode } from "./permissions.js";
+import { type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
 import { McpManager } from "./mcp.js";
@@ -73,7 +75,6 @@ export class Agent {
     private outputBuffer: string[] | null = null;
     private mcpManager = new McpManager();
     private readFileState: Map<string, number> = new Map();
-    private confirmedPaths: Set<string> = new Set();
     private confirmFn?: (message: string) => Promise<boolean>;
 
     // prePlanMode 记住进入前的模式——退出时精确恢复（acceptEdits 进 plan，
@@ -144,6 +145,10 @@ export class Agent {
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
+        // C2：权限策略插件化。注册序 = waterfall 优先级：approval 在外层
+        // （deny 规则硬底线 + 九段静态流水线），auto 在内层（veto 链表达"auto 优先"）
+        this.cordis.plugin(approvalPlugin);
+        this.cordis.plugin(autoApprovalPlugin);
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
         this.staticSystemPrompt = options.customSystemPrompt || buildStaticSystemPrompt();
@@ -483,22 +488,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return null;
     }
 
-    // REPL 注入复用已有 readline 的确认回调；未注入时（one-shot）confirmDangerous 临时开一个
+    // REPL 注入复用已有 readline 的确认回调。双写：confirmFn 留在本类供
+    // autoFallback 的 headless 判定；同时包装成审批服务的 interactive provider
+    //（展示职责在 provider 里——问什么先打出来，回调只收 y/n）
     setConfirmFn(fn: (message: string) => Promise<boolean>): void {
         this.confirmFn = fn;
-    }
-
-    private async confirmDangerous(message: string): Promise<boolean> {
-        // 问什么先打出来（src 同款）：回调只收 y/n，展示是 agent 层的职责——
-        // 这样 REPL 注入的回调和 one-shot 的 fallback 都不漏"在批准什么"
-        printConfirmation(message);
-        if (this.confirmFn) return this.confirmFn(message);
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        return new Promise((resolve) => {
-            rl.question("  Allow? (y/n): ", (answer) => {
-                rl.close();
-                resolve(answer.toLowerCase().startsWith("y"));
-            });
+        const approval = this.cordis.get<ApprovalService>("approval");
+        approval?.setInteractiveProvider(async (_call, message) => {
+            printConfirmation(message);
+            return (await fn(message)) ? "allow-once" : "deny";
         });
     }
 
@@ -997,30 +995,23 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 let output: string;
                 try {
                     printToolCall(tu.name, tu.input as Record<string, any>);
-                    // auto 走 transcript 分类器裁决（内含 deny 规则硬底线与 fast-path），
-                    // 其余模式走静态八阶段流水线
-                    const perm = this.mode === "auto"
-                        ? await this.classifyToolCall(tu.name, tu.input as Record<string, any>)
-                        : checkPermission(tu.name, tu.input as Record<string, any>, this.mode, this.planFilePath || undefined);
-                    if (perm.action === "deny") {
-                        printInfo(`Denied: ${perm.message}`);
-                        toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: `Denied: ${perm.message}` });
+                    // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
+                    // → 审批 → dispatch → post-execute）。auto 的分类器机制仍在
+                    // 本类，经 autoAdjudicate 句柄被 auto 监听器调用
+                    const outcome = await this.cordis.require<ToolsService>("tools").executeCall(
+                        { name: tu.name, input: tu.input as Record<string, any>, mode: this.mode, planFilePath: this.planFilePath || undefined },
+                        {
+                            readFileState: this.readFileState,
+                            dispatch: (n, i) => this.executeToolCall(n, i),
+                            autoAdjudicate: (n, i) => this.classifyToolCall(n, i),
+                        },
+                    );
+                    if (outcome.kind === "denied") {
+                        if (outcome.announce) printInfo(`Denied: ${outcome.announce}`);
+                        toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: outcome.content });
                         continue;
                     }
-                    if (perm.action === "confirm" && perm.message) {
-                        // 同一 message 确认一次后缓存；但 auto 的 confirm 带的是动作摘要
-                        // 不是路径——一次批准等于给"同摘要"的所有后续动作开白名单，绝不能缓存
-                        const cacheable = this.mode !== "auto";
-                        if (!cacheable || !this.confirmedPaths.has(perm.message)) {
-                            const confirmed = await this.confirmDangerous(perm.message);
-                            if (!confirmed) {
-                                toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: "User denied this action." });
-                                continue;
-                            }
-                            if (cacheable) this.confirmedPaths.add(perm.message);
-                        }
-                    }
-                    output = this.persistLargeResult(tu.name, await this.executeToolCall(tu.name, tu.input as Record<string, any>));
+                    output = this.persistLargeResult(tu.name, outcome.output);
                 } catch (e: any) {
                     output = `Tool execution failed: ${e?.message ?? e}`;
                 }
@@ -1157,10 +1148,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         toolName: string,
         input: Record<string, any>,
     ): Promise<{ action: "allow" | "deny" | "confirm"; message?: string }> {
-        // 硬底线前置：deny 规则在这里同样生效
-        const base = checkPermission(toolName, input, "default", this.planFilePath || undefined);
-        if (base.action === "deny") return base;
-        // fast-path：只读/无副作用工具跳过分类器
+        // 硬底线（deny 规则）已由 approval 监听器在外层先行（C2）：走到这里的
+        // 调用都过了 deny 规则，本函数专注 fast-path 与分类器两段裁决
         if (AUTO_MODE_FAST_PATH_TOOLS.has(toolName)) return { action: "allow" };
 
         if (!this.client) {
