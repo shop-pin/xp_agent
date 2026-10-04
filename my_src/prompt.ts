@@ -5,7 +5,7 @@ import * as os from "os";
 import { buildMemoryPromptSection } from "./memory.js";
 import { buildSkillDescriptions } from "./skills.js";
 import { buildAgentDescriptions } from "./subagent.js";
-import { getDeferredToolNames } from "./tools.js";
+import { getDeferredToolNames } from "./services/tools.js";
 
 const REGEXP = /^@(\S+)[ \t]*$/gm;
 const MAX_DEPTH = 5;

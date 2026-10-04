@@ -13,6 +13,8 @@
   "include": [
     "*.ts",
     "cordis/**/*.ts",
-    "cordis-tests/**/*.ts"
+    "cordis-tests/**/*.ts",
+    "services/**/*.ts",
+    "plugins/**/*.ts"
   ]
 }

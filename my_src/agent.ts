@@ -1,6 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "readline";
-import { executeTool, toolDefinitions, getActiveToolDefinitions, truncateResult, type ToolDef } from "./tools.js";
+import { toolDefinitions, type ToolDef } from "./tools.js";
+import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition } from "./services/tools.js";
+import { Context } from "./cordis/context.js";
+import { coreFsTools } from "./plugins/core-fs-tools.js";
+import { coreExecTools } from "./plugins/core-exec-tools.js";
+import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { checkPermission, type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
@@ -58,6 +63,9 @@ export class Agent {
     private messages: Anthropic.MessageParam[] = [];
     private mode: PermissionMode = "default";
     private tools: ToolDef[];
+    // C1：每个 Agent 一棵 mini-cordis 树，工具注册表长在上面；
+    // 后续 C 阶段服务（session-log/llm/approval）逐章挂进同一棵树
+    private cordis: Context;
     private staticSystemPrompt: string;
     private hasCustomPrompt: boolean;
     private isSubAgent: boolean;
@@ -129,6 +137,13 @@ export class Agent {
     constructor(options: AgentOptions = {}) {
         this.mode = options.permissionMode || "default";
         this.isSubAgent = options.isSubAgent || false;
+        // C1：起容器树 → ToolsService 先行（三插件依赖它）→ 按序加载工具插件
+        //（注册序 = 旧 toolDefinitions 数组序，请求体 tools 数组顺序的生命线）
+        this.cordis = new Context();
+        new ToolsService(this.cordis, "tools");
+        this.cordis.plugin(coreFsTools);
+        this.cordis.plugin(coreExecTools);
+        this.cordis.plugin(coreMetaTools);
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
         this.staticSystemPrompt = options.customSystemPrompt || buildStaticSystemPrompt();
@@ -1049,7 +1064,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 return `Error: ${e.message ?? e}`;
             }
         }
-        return executeTool(name, input, this.readFileState);
+        // C1：switch 改查注册表。魔法名链（plan/agent/skill/schedule_wakeup/mcp__）
+        // 在上方已拦截；走到这里的都是注册表工具，未知名与旧 switch 的 default 同话术
+        const def: ToolDefinition | undefined = this.cordis.require<ToolsService>("tools").get(name);
+        if (!def) return `Unknown tool: ${name}`;
+        return await def.execute(input, { readFileState: this.readFileState });
     }
 
     private async executePlanModeTool(name: string): Promise<string> {
