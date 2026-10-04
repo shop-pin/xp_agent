@@ -183,6 +183,11 @@ export class Context {
     return lookup(this, name) !== MISSING
   }
 
+  /** 本上下文的父上下文（root 为 undefined）。B5 起供 scope 标签继承等机制沿链读取。 */
+  get parent(): Context | undefined {
+    return bags.get(this)?.parent
+  }
+
   // ---------- 事件系统（B4）：五种派发 + on，语义照抄 vendor/cordis events.ts ----------
 
   /** 取（必要时建立）事件名对应的监听器列表；顺带做解构调用守卫。 */
