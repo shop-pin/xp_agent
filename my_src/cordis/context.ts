@@ -8,16 +8,16 @@
 //   2. 内部状态存 WeakMap（key 同时挂 raw 实例与 proxy 两个身份），
 //      而不是私有字段：Proxy 会改变 this 的身份，#private 品牌检查会在
 //      proxy 身份上直接 TypeError（见 dsh-B1.md 的 this 绑定一节）。
-//   3. `provide` 返回 disposer——B3 的 effect 模型会接管这些 disposer，
-//      实现"插件卸载 = 注册全部回滚"。
+//   3. `provide` 返回 disposer；B3 起，插件内发起的 provide 其 disposer
+//      自动收集进当前 fiber（"注册即可撤销"），effect/级联卸载见 fiber.ts
 //
 // 与真 cordis 的已知差异（后续章补齐或明确放弃）：
 //   - get 陷阱不做 inject 声明校验（真版：'cannot get property without inject'）——
 //     需要按 ctx 层追踪提供者归属，mini 版明确放弃，依赖纪律靠 inject 声明 + 评审
-//   - 无 effect/事件系统（B3/B4）
+//   - 无事件系统（B4）；effect/级联卸载已在 B3 落地（见 fiber.ts）
 //   - 假设单树运行（全局 pending 队列），见 registry.ts
 
-import type { Plugin } from './fiber.js'
+import type { EffectExecute, Plugin } from './fiber.js'
 import { Fiber } from './fiber.js'
 import { resolvePlugin, trackPending, refreshPendingFibers } from './registry.js'
 import { notifyProvided } from './hooks.js'
@@ -70,6 +70,13 @@ const contextProxyHandler: ProxyHandler<Context> = {
 }
 
 export class Context {
+  /**
+   * 本上下文归属的 fiber（生命周期所有者）。root context 没有 fiber；
+   * 插件的 child context 在 plugin() 里指认。effect 必须有 fiber 才有归属。
+   * 与 get/provide 等自有成员一样，服务不许占用 "fiber" 这个名字（已知限制）。
+   */
+  fiber?: Fiber
+
   constructor(parent?: Context) {
     // B2 语义修正：整棵树共享一张服务表（真 cordis 的 store 按 isolate key 分槽，
     // 默认全树同名同槽；上下文树是"生命周期树"不是"服务表树"）。
@@ -97,21 +104,50 @@ export class Context {
     bag.services.set(name, service)
     notifyProvided(name)
     let disposed = false
-    return () => {
+    const disposer = () => {
       if (disposed) return
       disposed = true
       if (bag.services.get(name) === service) bag.services.delete(name)
     }
+    // B3：发生在插件 fiber 内的 provide，disposer 自动收集进该 fiber
+    // （真 cordis 里 provide 本身就是一条 effect）。fiber 外的手动场景维持 B1 语义。
+    const fiber = this.fiber
+    if (fiber && (fiber.state === 'loading' || fiber.state === 'active')) {
+      fiber.collect(disposer, `provide("${name}")`)
+    }
+    return disposer
+  }
+
+  /**
+   * 注册一条随本 fiber 卸载自动执行的 effect（B3）：execute 立即执行，
+   * 返回的 disposer 由 fiber 收集，dispose 时逆序执行。
+   * 必须在插件 apply 内调用——root context 没有 fiber，注册无主，直接 fail-loud。
+   */
+  effect(execute: EffectExecute, label?: string): void {
+    const fiber = this.fiber
+    if (!fiber) {
+      throw new Error('[mini-cordis] ctx.effect() requires a plugin fiber（请在插件 apply 内调用）')
+    }
+    fiber.effect(execute, label)
   }
 
   /**
    * 挂载插件（B2）。创建 fiber 专属的 child Context（生命周期边界），
    * 未就绪的依赖使 fiber 扣在 pending，由 provide 通知自动唤醒。
-   * 返回 Fiber 以便检查状态（真 cordis 的返回值语义更丰富，mini 版从简）。
+   * B3：子 fiber 的 dispose 注册为父 fiber 的一条 effect（级联卸载）——
+   * 父卸载连带子卸载，孙随子，深度不限；root 上挂载的插件没有父 fiber，
+   * 不参与级联（root 在 mini 版里不可卸载）。
+   * 返回 Fiber 以便检查状态与显式 dispose。
    */
   plugin(pluginDef: Plugin, config?: unknown): Fiber {
     const child = new Context(this)
     const fiber = new Fiber(this, child, resolvePlugin(pluginDef), config)
+    child.fiber = fiber
+    const parentFiber = this.fiber
+    if (parentFiber) {
+      // disposer 本身可异步：父 fiber 卸载时会等待子 fiber 清理结算
+      parentFiber.effect(() => () => fiber.dispose(), `child <${fiber.name}>`)
+    }
     trackPending(fiber)
     refreshPendingFibers()
     return fiber

@@ -39,6 +39,11 @@ export function trackPending(fiber: Fiber): void {
   pendingFibers.add(fiber)
 }
 
+/** 出队：fiber 卸载（含 pending 期间被级联卸载）时立即离开等待队列。 */
+export function untrackPending(fiber: Fiber): void {
+  pendingFibers.delete(fiber)
+}
+
 /** 重查等待队列：依赖已齐的 fiber 逐个 refresh，状态离开 pending 即出队。 */
 export function refreshPendingFibers(): void {
   for (const fiber of [...pendingFibers]) {
