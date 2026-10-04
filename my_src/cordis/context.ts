@@ -21,9 +21,15 @@ import type { EffectExecute, Plugin } from './fiber.js'
 import { Fiber } from './fiber.js'
 import { resolvePlugin, trackPending, refreshPendingFibers } from './registry.js'
 import { notifyProvided } from './hooks.js'
+import {
+  getHooks, onEvent, emitEvent, parallelEvent, serialEvent, bailEvent, waterfallEvent,
+} from './events.js'
+import type { Events, Parameters, ReturnType, Hook, HookMap } from './events.js'
 
 type ServiceBag = {
   services: Map<string, unknown>
+  /** 事件域整树共享（B4）——与 services 同一传递方式：根部创建，子层拿引用。 */
+  events: HookMap
   parent?: Context
 }
 
@@ -82,7 +88,11 @@ export class Context {
     // 默认全树同名同槽；上下文树是"生命周期树"不是"服务表树"）。
     // parent 字段保留给查找兜底与 B5 的 isolate 讲解。
     const parentBag = parent ? bags.get(parent) : undefined
-    const bag: ServiceBag = { services: parentBag?.services ?? new Map(), parent }
+    const bag: ServiceBag = {
+      services: parentBag?.services ?? new Map(),
+      events: parentBag?.events ?? new Map(),
+      parent,
+    }
     bags.set(this, bag)
     const proxy = new Proxy(this, contextProxyHandler)
     bags.set(proxy, bag)
@@ -171,5 +181,53 @@ export class Context {
   /** 是否可解析到该服务（含父链）。 */
   has(name: string): boolean {
     return lookup(this, name) !== MISSING
+  }
+
+  // ---------- 事件系统（B4）：五种派发 + on，语义照抄 vendor/cordis events.ts ----------
+
+  /** 取（必要时建立）事件名对应的监听器列表；顺带做解构调用守卫。 */
+  private eventHooks(name: string): Hook[] {
+    const bag = bags.get(this)
+    if (!bag) throw new Error('[mini-cordis] 事件方法必须通过 ctx 实例调用（不要解构方法）')
+    return getHooks(bag.events, name)
+  }
+
+  /**
+   * 注册监听器。插件内调用 → disposer 走 B3 effect（卸载自动摘除，
+   * 级联卸载顺带清干净子树）；root 上调用 → 返回 disposer 手动管理。
+   * 事件类型来自用户 declaration merging 的 Events 接口（同服务类型的手法）。
+   */
+  on<K extends keyof Events>(name: K, listener: Events[K]): () => boolean {
+    return onEvent(this.eventHooks(name as string), this.fiber, name as string, listener as (...args: any[]) => any)
+  }
+
+  /** 同步广播：不等待、忽略返回值；listener 同步抛错照常上抛。 */
+  emit<K extends keyof Events>(name: K, ...args: Parameters<Events[K]>): void {
+    emitEvent(this.eventHooks(name as string), args)
+  }
+
+  /** 全并发 await；任一 reject 时以 AggregateError 汇总上抛。 */
+  parallel<K extends keyof Events>(name: K, ...args: Parameters<Events[K]>): Promise<void> {
+    return parallelEvent(this.eventHooks(name as string), args)
+  }
+
+  /** 顺序 await；listener 返回非 null/false/undefined 即停（bail），返回该值。 */
+  serial<K extends keyof Events>(name: K, ...args: Parameters<Events[K]>): Promise<Awaited<ReturnType<Events[K]> | undefined>> {
+    return serialEvent(this.eventHooks(name as string), args) as Promise<Awaited<ReturnType<Events[K]> | undefined>>
+  }
+
+  /** serial 的同步版：不 await，遇 bail 值即停并返回它。 */
+  bail<K extends keyof Events>(name: K, ...args: Parameters<Events[K]>): ReturnType<Events[K]> {
+    return bailEvent(this.eventHooks(name as string), args) as ReturnType<Events[K]>
+  }
+
+  /**
+   * around 中间件链：listener 收 (...eventArgs, next)，调 next() 委托后继
+   * （可改写返回值），不调 = 否决（后继与兜底都不执行）。
+   * 调用方在最后一个参数位置传入兜底行为 inner——类型上恰好占据事件签名里
+   * next 的位置。
+   */
+  waterfall<K extends keyof Events>(name: K, ...args: Parameters<Events[K]>): ReturnType<Events[K]> {
+    return waterfallEvent(this.eventHooks(name as string), args) as ReturnType<Events[K]>
   }
 }
