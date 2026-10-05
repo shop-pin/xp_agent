@@ -86,6 +86,10 @@ export interface AgentHandle {
     cancel(cause?: unknown): void;
     /** 收敛到静默后 resolve（含排空循环里的后续 turn）。 */
     whenIdle(): Promise<void>;
+    /** 释放资源（MCP 子进程等）。 */
+    close(): Promise<void>;
+    /** 子 agent 的一次性结算（D3：subagent 插件消费）。 */
+    runOnce(prompt: string): Promise<{ text: string; tokens: { input: number; output: number } }>;
 }
 
 export class AgentRegistry extends Service {
@@ -104,6 +108,12 @@ export class AgentRegistry extends Service {
 
     list(): AgentHandle[] {
         return [...this.agents.values()];
+    }
+
+    /** 关闭全部子 agent（父 close 时收口——MCP 子进程等资源不悬挂）。 */
+    async disposeAll(): Promise<void> {
+        await Promise.all(this.list().map((a) => a.close()));
+        this.agents.clear();
     }
 }
 

@@ -1,8 +1,9 @@
 // plugins/core-meta-tools.ts——C1：元工具（tool_search）+ 魔法名的 schema 占位。
 // tool_search 的 execute 自 tools.ts 原样迁出（激活态经 services/tools 的模块
-// 级共享集合，行为不变）。enter/exit_plan_mode、skill、agent 四个工具的执行
-// 被 agent 循环的魔法名链在更早处拦截（C1 不动），注册它们只为保住广告顺序：
+// 级共享集合，行为不变）。enter/exit_plan_mode、skill 三个工具的执行
+// 被 agent 循环的魔法名链在更早处拦截，注册它们只为保住广告顺序：
 // 注册序 = 旧 toolDefinitions 数组序 = 请求体 tools 数组序的生命线。
+// （agent 工具自 D3 起由 plugins/subagent.ts 注册真身，不再是占位。）
 
 import type { Context } from "../cordis/context.js";
 import { activateTools, type ToolsService, type ToolDefinition, type JSONSchema } from "../services/tools.js";
@@ -45,12 +46,6 @@ export const coreMetaTools = {
             ...schemaOf("skill"),
             permissionHint: "meta",
             execute: magicFallback("skill"),
-        });
-        tools.register({
-            name: "agent",
-            ...schemaOf("agent"),
-            permissionHint: "meta",
-            execute: magicFallback("agent"),
         });
         tools.register({
             name: "tool_search",

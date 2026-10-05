@@ -220,8 +220,9 @@
 | C8 | ✅ 完成（2026-10-05，C 阶段收官） | `dsh-C8.md`；session-jsonl 插件（每事件落盘 + 半行丢弃 + 未闭合 turn 补合成 end）+ Agent.resume（derive 恢复消息 + 派生恢复 mode/cost/轮数/激活工具/goal）+ 惰性挂载防自复制；session.ts/autoSave/restoreSession 消亡；场景 4 断言变更（快照→事件流）+ 场景 32；cordis 112/112、mock 28 场景全绿；建议 commit：`add jsonl session persistence with replay resume and crash repair` |
 | D1 | ✅ 完成（2026-10-05） | `dsh-D1.md`；SkillRegistry（provider rank 竞争，user=10/project=20，回退可测）+ 目录注入迁 user message（pre-step 监听器，`<system-reminder>` 包裹，historyEmpty 只注一次；**否决传播礼仪**——inner 拒绝不翻案）；system skills 节消亡；场景 9 断言变更（正反双锚）；cordis 117/117、mock 28 场景全绿；建议 commit：`migrate skills to provider registry with user-message catalog` |
 | D2 | ✅ 完成（2026-10-05） | `dsh-D2.md`；mcp-bridge 插件（publicToolName 64 字符契约 + SHA 短哈希、syncTools 两阶段换代 + squat 冲突回滚恢复、连接层迁入、惰性时机保持）；mcp.ts 删除；mcp__ 魔法名分支消亡（注册表公民）；cordis 123/123、mock 28 场景全绿（18/19 零断言变更 = 广告字节等价）；建议 commit：`migrate mcp to bridge plugin with normalized names and generation swap` |
-| D3 | 未开始（下次从这继续） | subagent 插件化：ctx.agents.create + per-agent scope（B5 红利） |
-| — | 未开始 | D4..D6、E1..E3 | — |
+| D3 | ✅ 完成（2026-10-05） | `dsh-D3.md`；subagent 插件（agent 工具真身 + AgentPreset 排除表数据化 + childModeOf 防洗白）+ AgentRegistry 进树（disposeAll 生命周期）；executeAgentTool/魔法拦截消亡；**B5 完整 scope 被 B2 语义挡住——双层隔离（插件不加载+排除表）记档**；C1 断言变更（注册序神话破产——广告一直走 this.tools 数组）；cordis 128/128、mock 28 场景全绿；建议 commit：`migrate subagents to registry presets with data-driven excludes` |
+| D4 | 未开始（下次从这继续） | memory 与上下文注入：agent.inject() + prefetch 变 turn 边界监听器 |
+| — | 未开始 | D5..D6、E1..E3 | — |
 | D1..D6 | 未开始 | — |
 | E1..E3 | 未开始 | — |
 

@@ -2,6 +2,8 @@
 // 覆盖：注册序 = 旧 toolDefinitions 数组序（请求体字节等价的生命线）、
 // 请求数组逐字节等价、echo 插件注册可见/dispose 消失、同名冲突 fail-loud、
 // tool_search 激活语义不变、ToolExec 簿记线程、魔法名兜底。
+// D3 断言变更：agent 工具迁 plugins/subagent.ts（注册表序不再镜像广告序——
+// 广告走 this.tools 数组，字节等价由 mock 场景锚定；这里改比集合 + 按名映射）。
 // 运行：npm run cordis（tsc && node --test "dist/cordis-tests/*.test.js"）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -17,37 +19,47 @@ import { toolDefinitions } from '../tools.js'
 import { coreFsTools } from '../plugins/core-fs-tools.js'
 import { coreExecTools } from '../plugins/core-exec-tools.js'
 import { coreMetaTools } from '../plugins/core-meta-tools.js'
+import { subagentPlugin } from '../plugins/subagent.js'
+import { AgentRegistry } from '../services/agents.js'
 
 function buildTree(): { ctx: Context; tools: ToolsService } {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new AgentRegistry(ctx, 'agents')
   ctx.plugin(coreFsTools)
   ctx.plugin(coreExecTools)
   ctx.plugin(coreMetaTools)
+  // D3：agent 工具的真身在 subagent 插件（加载序在末尾——注册表按名查，
+  // 广告序不依赖它）
+  ctx.plugin(subagentPlugin, {
+    bridge: { parentMode: () => 'default', addTokens: () => {} },
+  })
   return { ctx, tools }
 }
 
-test('注册序 = 旧 toolDefinitions 数组序（12 个工具一个不差）', () => {
+test('注册表覆盖旧 toolDefinitions 全集（12 个工具一个不差；D3 起比集合不比序）', () => {
   resetActivatedTools()
   const { tools } = buildTree()
   assert.deepEqual(
-    tools.list().map((d) => d.name),
-    toolDefinitions.map((t) => t.name),
+    [...tools.list().map((d) => d.name)].sort(),
+    [...toolDefinitions.map((t) => t.name)].sort(),
   )
 })
 
-test('注册表重组出的请求 tools 数组与旧路径逐字节一致（激活前后两种状态）', () => {
+test('注册表重组出的请求 tools 条目与旧路径逐项一致（激活前后两种状态；按名映射比）', () => {
   resetActivatedTools()
   const { tools } = buildTree()
-  const activeView = () => tools
+  const asMap = (rows: Array<{ name: string; description?: string; input_schema?: unknown }>) =>
+    Object.fromEntries(rows.map((r) => [r.name, { name: r.name, description: r.description ?? '', input_schema: r.input_schema }]))
+  const activeView = () => asMap(tools
     .list()
     .filter((d) => !d.deferred || isActivated(d.name))
-    .map((d) => ({ name: d.name, description: d.description, input_schema: d.parameters }))
+    .map((d) => ({ name: d.name, description: d.description, input_schema: d.parameters })))
   // 未激活：两条路径都只有非 deferred 的 10 个
-  assert.equal(JSON.stringify(activeView()), JSON.stringify(getActiveToolDefinitions()))
+  assert.deepEqual(activeView(), asMap(getActiveToolDefinitions()))
   // 激活一个 deferred 后：两条路径同步多出它
   activateTools(['enter_plan_mode'])
-  assert.equal(JSON.stringify(activeView()), JSON.stringify(getActiveToolDefinitions()))
+  assert.deepEqual(activeView(), asMap(getActiveToolDefinitions()))
   resetActivatedTools()
 })
 
@@ -105,11 +117,15 @@ test('read_file 经注册表执行，ToolExec.readFileState 簿记照常线程',
   }
 })
 
-test('魔法名工具的注册表兜底：执行被 agent 循环拦截，真跑到这里会自报路由异常', async () => {
+test('魔法名工具的注册表兜底：执行被 agent 循环拦截，真跑到这里会自报路由异常（D3：agent 除外——它有真身）', async () => {
   resetActivatedTools()
   const { tools } = buildTree()
-  const def = tools.get('agent')!
-  assert.equal(def.deferred, undefined) // agent 不该是 deferred（旧数据里没有）
-  const out = await def.execute({}, {})
-  assert.match(out, /routed by the agent loop/)
+  for (const name of ['enter_plan_mode', 'exit_plan_mode', 'skill']) {
+    const out = await tools.get(name)!.execute({}, {})
+    assert.match(out, /routed by the agent loop/)
+  }
+  // agent 自 D3 起由 subagent 插件注册真 execute（不再是兜底占位）
+  const agentDef = tools.get('agent')!
+  assert.equal(agentDef.deferred, undefined)
+  assert.doesNotMatch(String(agentDef.execute).slice(0, 200), /routed by the agent loop/)
 })

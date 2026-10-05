@@ -130,10 +130,11 @@ function discoverCustomAgents(): Map<string, CustomAgentDef> {
 export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
     const custom = discoverCustomAgents().get(type);
     if (custom) {
-        // 白名单/默认都滤掉 agent 工具——子 agent 不许再派生子 agent（递归失控）
+        // D3：只解析白名单——agent/schedule_wakeup 的排除迁 plugins/subagent.ts
+        // 的 preset 排除表（数据化，不再散落过滤条件）
         const tools = custom.allowedTools
-            ? toolDefinitions.filter((t) => custom.allowedTools!.includes(t.name) && t.name !== "agent")
-            : toolDefinitions.filter((t) => t.name !== "agent");
+            ? toolDefinitions.filter((t) => custom.allowedTools!.includes(t.name))
+            : toolDefinitions;
         return { systemPrompt: custom.systemPrompt, tools };
     }
 
@@ -145,7 +146,7 @@ export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
         default:
             return {
                 systemPrompt: GENERAL_PROMPT,
-                tools: toolDefinitions.filter((t) => t.name !== "agent"),
+                tools: toolDefinitions,
             };
     }
 }

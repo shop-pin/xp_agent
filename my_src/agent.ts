@@ -16,6 +16,8 @@ import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
 import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
 import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
 import { skillsPlugin, SkillRegistry } from "./plugins/skills-registry.js";
+import { subagentPlugin, buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
+import { AgentRegistry } from "./services/agents.js";
 import { resolveSkillPrompt } from "./skills.js";
 import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { SystemPromptService } from "./services/system-prompt.js";
@@ -174,6 +176,19 @@ export class Agent implements AgentHandle {
         this.cordis.plugin(skillsPlugin, { catalogInjection: !this.isSubAgent });
         // D2：MCP 桥接（子 agent 不连接；ensure 保持 turn 开场的惰性时机）
         this.cordis.plugin(mcpBridgePlugin, { enabled: !this.isSubAgent });
+        // D3：子 agent 走 registry + preset（agent 工具的 execute 在插件里；
+        // 子 agent 不加载本插件——工具隔离的第一层，第二层是 preset 排除表）
+        new AgentRegistry(this.cordis, "agents");
+        this.cordis.plugin(subagentPlugin, {
+            bridge: {
+                parentMode: () => this.mode,
+                addTokens: (input: number, output: number) => {
+                    this.totalInputTokens += input;
+                    this.totalOutputTokens += output;
+                },
+            },
+            enabled: !this.isSubAgent,
+        });
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -630,8 +645,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.cordis.plugin(sessionJsonlPlugin, { sessionId: this.sessionId });
     }
 
-    // MCP 子进程 stdio 会挂住事件循环，one-shot/测试结束必须显式关闭
+    // MCP 子进程 stdio 会挂住事件循环，one-shot/测试结束必须显式关闭。
+    // D3：经 registry 创建的子 agent 先收口（它们的 close 是 no-op 级，但
+    // 生命周期所有权在 registry——不显式收就是悬挂句柄）
     async close(): Promise<void> {
+        await this.cordis.get<AgentRegistry>("agents")?.disposeAll();
         await this.cordis.get<McpBridge>("mcp")?.disconnectAll();
     }
 
@@ -1201,7 +1219,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     private async executeToolCall(name: string, input: Record<string, any>): Promise<string | TurnConclusion> {
         if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
-        if (name === "agent") return this.executeAgentTool(input);
         if (name === "skill") return this.executeSkillTool(input);
         if (name === "schedule_wakeup") {
             // 只有 dynamic loop 活跃期才路由到这里；loop 之外工具不广告，
@@ -1386,41 +1403,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return text;
     }
 
-    // 权限模式子 agent 继承规则：plan/auto 必须穿透——否则主对话里被拦的操作可以
-    // 借 agent(prompt="rm -rf /") 让 bypassPermissions 的子 agent 绕过闸门（权限洗白）。
-    // 其余模式落 bypassPermissions：子 agent 的危险动作由父层工具集与白名单约束
+    // 权限模式子 agent 继承规则（防洗白）：裁决在 plugins/subagent.ts 的
+    // childModeOf——agent 工具的 preset 构造与 skill fork 共用同一份
     private childPermissionMode(): PermissionMode {
-        if (this.mode === "plan") return "plan";
-        if (this.mode === "auto") return "auto";
-        return "bypassPermissions";
-    }
-
-    private async executeAgentTool(input: Record<string, any>): Promise<string> {
-        const type = (input.type || "general") as SubAgentType;
-        const description = input.description || "sub-agent task";
-        const prompt = input.prompt || "";
-
-        printSubAgentStart(type, description);
-
-        const config = getSubAgentConfig(type);
-        const subAgent = new Agent({
-            customSystemPrompt: config.systemPrompt,
-            customTools: config.tools,
-            isSubAgent: true,
-            permissionMode: this.childPermissionMode(),
-        });
-
-        try {
-            const result = await subAgent.runOnce(prompt);
-            // 子对话的消耗也是真实成本：token 增量记回父级，费用统计才完整
-            this.totalInputTokens += result.tokens.input;
-            this.totalOutputTokens += result.tokens.output;
-            printSubAgentEnd(type, description);
-            return result.text || "(Sub-agent produced no output)";
-        } catch (e: any) {
-            printSubAgentEnd(type, description);
-            return `Sub-agent error: ${e.message}`;
-        }
+        return childModeOf(this.mode);
     }
 
     // skill 的双入口分流：fork 派给隔离子 agent（system=解析后模板，tools=白名单过滤
@@ -1432,19 +1418,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         const prompt = resolveSkillPrompt(skill, input.args || "");
 
         if (skill.context === "fork") {
-            // fork 不许继承 schedule_wakeup——它是本 agent dynamic loop 的驱动内部工具；
-            // agent 同理，白名单里写了也不给（子 agent 不许再派生子 agent，递归失控）
-            const tools = (skill.allowedTools
-                ? this.tools.filter(t => skill.allowedTools!.includes(t.name) && t.name !== "agent")
-                : this.tools.filter(t => t.name !== "agent"))
-                .filter(t => t.name !== "schedule_wakeup");
+            // D3：排除表迁 preset（DEFAULT_EXCLUDES：agent 防递归失控 +
+            // schedule_wakeup 防驱动内部工具外流），创建走 ctx.agents
+            const preset = buildPresetFromSkill(skill, this.mode, this.tools);
 
             printSubAgentStart("skill-fork", input.skill_name);
-            const subAgent = new Agent({
+            const subAgent = this.cordis.require<AgentRegistry>("agents").create({
                 customSystemPrompt: prompt,
-                customTools: tools,
+                customTools: preset.tools,
                 isSubAgent: true,
-                permissionMode: this.childPermissionMode(),
+                permissionMode: preset.permissionMode,
             });
 
             try {
