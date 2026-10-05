@@ -1322,6 +1322,29 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "31": {
+    // C6：换后端 = 换路由配置行。MINI_CLAUDE_LLM_ROUTE=echo——agent 循环零改动
+    // 跑在二十行假后端上（echo 无 sideCall 覆写，走流聚合兜底）；anthropic mock
+    // 不应收到任何请求。usage 四计数经 Settlement 流转（echo 报 1 in / 1 out）。
+    needsLog: true,
+    env: { MINI_CLAUDE_LLM_ROUTE: "echo" },
+    setup: () => { },
+    runs: [{ echoBackend: true }],
+    tracks: { main: { turns: [] } },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      check("no request reached the anthropic mock", reqs.length === 0);
+      check("assistant settlement came from the echo backend",
+        typeof samples["echo-text"] === "string" && samples["echo-text"].includes("[echo] hello echo backend"));
+      check("usage rode the Settlement (echo reports 1 in + 1 out)", samples["echo-usage"] === "2");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1351,6 +1374,8 @@ process.env.USERPROFILE = workdir;
 // ch20：封 SDK 自带重试层（默认 2），否则它先吞掉注入的 429，withRetry 永远等不到失败。
 // 必须在动态 import dist 之前设置（Agent 构造时读取）
 if (s.envSdkRetries !== undefined) process.env.MINI_CLAUDE_SDK_MAX_RETRIES = String(s.envSdkRetries);
+// C6：场景级环境变量（在动态 import dist 之前生效——如 echo 后端路由）
+if (s.env) for (const [k, v] of Object.entries(s.env)) process.env[k] = String(v);
 process.chdir(workdir);
 
 console.log(`▶ mock model at ${mock.url}   sandbox: ${workdir}   chapter: ${chapter}`);
@@ -1515,6 +1540,16 @@ if (s.runs) {
         sample("recovery-error-escaped", escaped);
         await a.chat("continue");
         sample("recovery-status", a.status);
+        if (a.close) await a.close();
+      } else if (r.echoBackend !== undefined) {
+        // C6：换后端 = 换路由配置行。整个 agent 循环跑在 echo 假后端上
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        await a.chat("hello echo backend");
+        const last = a.sessionLog.events.filter((e) => e.type === "assistant/message").pop();
+        sample("echo-text", (last?.content || []).map((b) => b.text ?? "").join(""));
+        sample("echo-usage", String((last?.usage?.input ?? 0) + (last?.usage?.output ?? 0)));
         if (a.close) await a.close();
       } else {
         await mod.runCli(r.argv);

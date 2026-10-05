@@ -3,6 +3,7 @@ import { toolDefinitions, type ToolDef } from "./tools.js";
 import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
 import { SessionLog, type TokenUsage } from "./services/session-log.js";
+import { LlmRuntime, assembleStream, type Settlement } from "./services/llm.js";
 import { Inbox, type AgentHandle, type AgentStatus, type PreStepDecision } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
 import { coreFsTools } from "./plugins/core-fs-tools.js";
@@ -11,6 +12,8 @@ import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin, GoalService, LoopService } from "./plugins/autonomy.js";
+import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
+import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
@@ -69,7 +72,8 @@ export interface AgentOptions {
 }
 
 export class Agent implements AgentHandle {
-    private client: Anthropic;
+    // C6：LLM 路由——换后端 = 换环境变量（MINI_CLAUDE_LLM_ROUTE=echo 跑假后端）
+    private readonly llmRoute: string = process.env.MINI_CLAUDE_LLM_ROUTE || "anthropic";
     private messages: Anthropic.MessageParam[] = [];
     private mode: PermissionMode = "default";
     private tools: ToolDef[];
@@ -144,6 +148,10 @@ export class Agent implements AgentHandle {
         this.cordis = new Context();
         new ToolsService(this.cordis, "tools");
         this.sessionLog = new SessionLog(this.cordis, "session-log");
+        // C6：LLM seam 先立服务，适配器插件经 inject 等它（首个业务级 inject 依赖）
+        new LlmRuntime(this.cordis, "llm");
+        this.cordis.plugin(llmAnthropicPlugin);
+        this.cordis.plugin(adapterEchoPlugin);
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -165,19 +173,6 @@ export class Agent implements AgentHandle {
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
         this.staticSystemPrompt = options.customSystemPrompt || buildStaticSystemPrompt();
-        // 可选：封 SDK 自带的重试层（默认 2）。MINI_CLAUDE_SDK_MAX_RETRIES=0
-        // 用于在测试里隔离我们自己的 withRetry——否则 SDK 先吞掉失败，
-        // mock 注入的 429 永远到不了用户代码
-        const sdkRetries =
-            process.env.MINI_CLAUDE_SDK_MAX_RETRIES != null && process.env.MINI_CLAUDE_SDK_MAX_RETRIES !== "" &&
-                !Number.isNaN(Number(process.env.MINI_CLAUDE_SDK_MAX_RETRIES))
-                ? { maxRetries: Number(process.env.MINI_CLAUDE_SDK_MAX_RETRIES) }
-                : {};
-        this.client = new Anthropic({
-            apiKey: process.env.ANTHROPIC_API_KEY,
-            baseURL: process.env.ANTHROPIC_BASE_URL,
-            ...sdkRetries,
-        });
         this.effectiveWindow = getContextWindow(MODEL) - 20000;
         // --plan 启动即规划：plan 文件路径在此生成，提示注入走请求时的
         // buildAnthropicSystem() planSuffix（本类没有常驻 systemPrompt 字段）
@@ -483,16 +478,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             printInfo("Cannot compact here: history ends mid-tool-batch. Try again after the next exchange.");
             return false;
         }
-        const summaryResp = await this.client.messages.create({
+        // C6：旁路调用走 llm seam（非流式线格式保留——mock 断言锚 stream:false）
+        const { text: rawSummary } = await this.cordis.require<LlmRuntime>("llm").sideCall({
+            route: this.llmRoute,
             model: MODEL,
-            max_tokens: 2048,
+            maxTokens: 2048,
             system: "You are a conversation summarizer. Be concise but preserve important details.",
             messages: requestMessages,
         });
-        const summaryText =
-            summaryResp.content[0]?.type === "text"
-                ? summaryResp.content[0].text
-                : "No summary available.";
+        const summaryText = rawSummary || "No summary available.";
         this.messages = [
             { role: "user", content: `[Previous conversation summary]\n${summaryText}` },
             { role: "assistant", content: "Understood. I have the context from our previous conversation. How can I continue helping?" },
@@ -581,16 +575,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     // 旁路查询：独立小请求（非流式、temperature 0、256 token 上限），
     // 给 memory selector 这类"让模型做决策"的辅助调用用，主对话历史不掺和
     private buildSideQuery(): SideQueryFn {
-        const client = this.client;
-        const model = MODEL;
         return async (system, userMessage) => {
-            const resp = await client.messages.create({
-                model, max_tokens: 256, system, temperature: 0,
+            const { text } = await this.cordis.require<LlmRuntime>("llm").sideCall({
+                route: this.llmRoute,
+                model: MODEL,
+                maxTokens: 256,
+                system,
+                temperature: 0,
                 messages: [{ role: "user", content: userMessage }],
             });
-            return resp.content
-                .filter((b): b is Anthropic.TextBlock => b.type === "text")
-                .map((b) => b.text).join("");
+            return text;
         };
     }
 
@@ -730,12 +724,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         system: string,
         messages: { role: "user" | "assistant"; content: string }[],
     ): Promise<string> {
-        const resp = await this.client.messages.create({
-            model: MODEL, max_tokens: 512, system, temperature: 0, messages,
+        const { text } = await this.cordis.require<LlmRuntime>("llm").sideCall({
+            route: this.llmRoute,
+            model: MODEL,
+            maxTokens: 512,
+            system,
+            temperature: 0,
+            messages,
         });
-        return resp.content
-            .filter((b): b is Anthropic.TextBlock => b.type === "text")
-            .map((b) => b.text).join("");
+        return text;
     }
 
     /** 最近一条 assistant turn 的文本，供评审。 */
@@ -984,7 +981,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             await this.consumeMemoryPrefetchIfReady(this.messages);
             if (!this.isSubAgent) startSpinner();
             let firstText = true;
-            let response: Anthropic.Message;
+            let settlement: Settlement;
             // C3：system 进日志（对比去重——动态段未变不重复 append）。
             // 日志里可能有历史 system 事件，derive 只取最新
             const systemBlocks = this.buildAnthropicSystem();
@@ -993,48 +990,40 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 this.sessionLog.append({ type: "system/message", content: encodedSystem });
             }
             try {
-                // withRetry 包住"建流 + 等完整消息"：重试时旧流已死，必须重建整个流，
-                // 所以 fn 每次调用都 new 一个 stream，不能只包 finalMessage()
-                response = await withRetry(async () => {
-                    const stream = this.client.messages.stream({
+                // C6：中立 chunk 流 + 聚合结算。withRetry 包住"建流 + 聚合"：重试时
+                // 旧流已死，必须重建整个流（已打印的半截文本不缝合、重打——旧语义）
+                settlement = await withRetry(async () => assembleStream(
+                    this.cordis.require<LlmRuntime>("llm").stream({
+                        route: this.llmRoute,
                         model: MODEL,
-                        max_tokens: 4096,
+                        maxTokens: 4096,
                         system: systemBlocks,
                         tools: [...getActiveToolDefinitions(this.tools), ...mcpTools],
                         messages: this.withCacheBreakpoints(this.messages),
-                    }, { signal: this.abortController?.signal });
-                    // src 同款协调：首个 text 事件先停 spinner 再打印，避免 \r 重画吃掉流式输出；
-                    // 纯工具调用响应没有 text 事件，靠 finally 兜底
-                    stream.on("text", (t) => {
+                    }, this.abortController?.signal),
+                    (t) => {
+                        // src 同款协调：首个 text 先停 spinner 再打印，避免 \r 重画
+                        // 吃掉流式输出；纯工具调用响应没有 text，靠 finally 兜底
                         if (!this.isSubAgent && firstText) { stopSpinner(); firstText = false; }
                         this.emitText(t);
-                    });
-                    return await stream.finalMessage();
-                });
+                    },
+                ));
             } finally {
                 if (!this.isSubAgent) stopSpinner();
             }
             this.emitText("\n");
             // 四计数：缓存读/写分开累计；lastInputTokenCount = 本次 prompt 全量 + 输出
             // （输出会成为下一次请求的一部分），压缩仪表读它
-            const u: any = response.usage;
-            const cacheRead = u.cache_read_input_tokens || 0;
-            const cacheCreation = u.cache_creation_input_tokens || 0;
-            this.totalInputTokens += u.input_tokens;
-            this.totalCacheReadTokens += cacheRead;
-            this.totalCacheCreationTokens += cacheCreation;
-            this.totalOutputTokens += u.output_tokens;
-            this.lastInputTokenCount = u.input_tokens + cacheRead + cacheCreation + u.output_tokens;
+            const usage = settlement.usage;
+            this.totalInputTokens += usage.input;
+            this.totalCacheReadTokens += usage.cacheRead;
+            this.totalCacheCreationTokens += usage.cacheCreation;
+            this.totalOutputTokens += usage.output;
+            this.lastInputTokenCount = usage.input + usage.cacheRead + usage.cacheCreation + usage.output;
             this.lastApiCallTime = Date.now();
-            const usage: TokenUsage = {
-                input: u.input_tokens,
-                output: u.output_tokens,
-                cacheRead,
-                cacheCreation,
-            };
-            this.pushAssistant(response.content, usage);
+            this.pushAssistant(settlement.content, usage);
 
-            const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
+            const toolUses: Anthropic.ToolUseBlock[] = settlement.content.filter((b) => b.type === "tool_use") as Anthropic.ToolUseBlock[];
 
             if (toolUses.length === 0) {
                 // turn-stopping：收敛前最后一个口——监听器可 steer 挽留（文本排
@@ -1275,7 +1264,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // 调用都过了 deny 规则，本函数专注 fast-path 与分类器两段裁决
         if (AUTO_MODE_FAST_PATH_TOOLS.has(toolName)) return { action: "allow" };
 
-        if (!this.client) {
+        if (!this.cordis.get<LlmRuntime>("llm")?.hasRoute(this.llmRoute)) {
             // 没有可用评估器 → fail-closed。有人在（交互模式）交人工，否则直接拒
             return this.autoFallback(`${toolName} (auto-mode classifier unavailable)`);
         }
@@ -1332,13 +1321,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     /** 单消息分类器查询，max_tokens 由调用方给定——两段各自定预算
      *  （stage 1 小闸，stage 2 有思考空间）。temperature 0 保证裁决确定性。 */
     private async runClassifierQuery(system: string, user: string, maxTokens: number): Promise<string> {
-        const resp = await this.client.messages.create({
-            model: MODEL, max_tokens: maxTokens, system, temperature: 0,
+        const { text } = await this.cordis.require<LlmRuntime>("llm").sideCall({
+            route: this.llmRoute,
+            model: MODEL,
+            maxTokens: maxTokens,
+            system,
+            temperature: 0,
             messages: [{ role: "user", content: user }],
-        }, { signal: this.abortController?.signal });
-        return resp.content
-            .filter((b): b is Anthropic.TextBlock => b.type === "text")
-            .map((b) => b.text).join("");
+        }, this.abortController?.signal);
+        return text;
     }
 
     // 权限模式子 agent 继承规则：plan/auto 必须穿透——否则主对话里被拦的操作可以
