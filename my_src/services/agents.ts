@@ -19,6 +19,14 @@ export type AgentStatus = "idle" | "running" | "maintenance";
 
 export type InboxTarget = "next-turn" | "next-step";
 
+/** C5 pre-step 监听器的裁决：reject = 本 turn 不消耗模型调用直接收敛（输入
+ *  已 claim，不回队列不进消息——对齐 dsh "认领即所有权"）；input = 改写后
+ *  进入消息的文本。 */
+export interface PreStepDecision {
+    reject?: string;
+    input?: string[];
+}
+
 /** 内存版双队列 inbox。dsh 的 ReactLoopInbox 把队列变更持久化为 session 投影
  *  （agent/inbox/spliced 事件，重启不丢），mini 的持久化在 C8 一并考虑。 */
 export class Inbox {
@@ -94,5 +102,22 @@ export class AgentRegistry extends Service {
 declare module "../cordis/context.js" {
     interface Context {
         agents?: AgentRegistry;
+    }
+}
+
+// C5：循环扩展点进全局 Events 表（与 tools/* 管线事件同一手法）。
+// payload 是 dsh 的子集（无 turn/step/signal——mini 的循环没有独立 phase 对象）。
+declare module "../cordis/events.js" {
+    interface Events {
+        /** 组装前：可改写/拒绝本 step 的输入（waterfall，不调 next = 否决）。 */
+        "agent/pre-step"(
+            payload: { input: string[] },
+            next: () => PreStepDecision | Promise<PreStepDecision>,
+        ): PreStepDecision | Promise<PreStepDecision>;
+        /** 收敛前：监听器可 steer 文本挽留（serial 无 next；返回非空值会 bail 后继）。 */
+        "agent/turn-stopping"(state: { steer: (text: string) => void }): void | Promise<void>;
+        /** turn 真实收敛（end-turn/budget/aborted/blocked/concluded；tool-use 是
+         *  step 级注记不发事件）。 */
+        "agent/turn-end"(payload: { reason: string }): void;
     }
 }

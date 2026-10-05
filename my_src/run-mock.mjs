@@ -1212,6 +1212,42 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "28": {
+    // C5：循环事件探针（events runner，三阶段全串行，无需 delayMs）：
+    //   1 pre-step 改写（REWRITTEN 前缀进请求）
+    //   2 pre-step 拒绝 → 无模型调用，turn 以 blocked 收敛，驱动回 idle
+    //   3 turn-stopping 挽留 → steer 文本经排空循环开新 turn 消费
+    //   附：agent/turn-end 事件序列采样（end-turn,blocked,end-turn,end-turn）
+    needsLog: true,
+    setup: () => { },
+    runs: [{ events: true }],
+    tracks: {
+      main: {
+        turns: [
+          { text: "ok one" },
+          { text: "ok two" },
+          { text: "ok three" },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      check("3 main requests (rewrite 1 + reject 0 + steer 2)", reqs.length === 3);
+      check("phase1: pre-step rewrite reached the request",
+        typeof reqs[0]?.firstUserText === "string" && reqs[0].firstUserText.includes("REWRITTEN: hello there"));
+      check("phase2: rejected input consumed no model call", samples["reject-no-request"] === "true");
+      check("phase2: driver back to idle after blocked turn", samples["reject-idle"] === "idle");
+      check("phase3: turn-stopping steer opened a new turn",
+        typeof reqs[2]?.lastUserText === "string" && reqs[2].lastUserText.includes("KEEP-GOING"));
+      check("turn-end event sequence", samples["turn-end-reasons"] === "end-turn,blocked,end-turn,end-turn");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1327,6 +1363,44 @@ if (s.runs) {
         await p3;
         sample("phase3-after", a.status);
         await a.whenIdle();
+        if (a.close) await a.close();
+      } else if (r.events !== undefined) {
+        // C5：循环事件探针。三个 toy 监听器挂在 agent 的 cordis 树上（runtime
+        // 直取私有字段——探针专属，教学代码不背这个口子）
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        const actx = a.cordis;
+        const readEvents = () => {
+          let raw2 = "";
+          try { raw2 = readFileSync(logPath, "utf-8"); } catch { return []; }
+          const out = [];
+          for (const l of raw2.split("\n").filter(Boolean)) { try { out.push(JSON.parse(l)); } catch { /* 半行 */ } }
+          return out;
+        };
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        let phase = "rewrite";
+        const turnEnds = [];
+        actx.on("agent/turn-end", (e) => turnEnds.push(e.reason));
+        actx.on("agent/pre-step", (payload, next) => {
+          if (phase === "rewrite") { next(); return { input: payload.input.map((t) => `REWRITTEN: ${t}`) }; }
+          if (phase === "reject") return { reject: "not allowed in this phase" };
+          return next();
+        });
+        let steered = false;
+        actx.on("agent/turn-stopping", (state) => {
+          if (phase === "steer" && !steered) { steered = true; state.steer("KEEP-GOING: do phase two now."); }
+        });
+        const countReq = () => readEvents().filter((e) => e.type === "request" && e.track === "main").length;
+        await a.chat("hello there");            // 阶段 1：pre-step 改写进请求
+        const afterRewrite = countReq();
+        phase = "reject";
+        await a.chat("should never run");       // 阶段 2：pre-step 拒绝 → blocked 收敛
+        sample("reject-no-request", countReq() === afterRewrite);
+        sample("reject-idle", a.status);
+        phase = "steer";
+        await a.chat("first turn");             // 阶段 3：turn-stopping 挽留
+        await a.whenIdle();
+        sample("turn-end-reasons", turnEnds.join(","));
         if (a.close) await a.close();
       } else {
         await mod.runCli(r.argv);

@@ -1,9 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { toolDefinitions, type ToolDef } from "./tools.js";
-import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition } from "./services/tools.js";
+import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
 import { SessionLog, type TokenUsage } from "./services/session-log.js";
-import { Inbox, type AgentHandle, type AgentStatus } from "./services/agents.js";
+import { Inbox, type AgentHandle, type AgentStatus, type PreStepDecision } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
 import { coreFsTools } from "./plugins/core-fs-tools.js";
 import { coreExecTools } from "./plugins/core-exec-tools.js";
@@ -96,9 +96,6 @@ export class Agent implements AgentHandle {
     // 出来还是 acceptEdits，而不是掉回 default）
     private prePlanMode: PermissionMode | null = null;
     private planFilePath: string | null = null;
-    // 审批选项 1 的信号位：清历史后 exit 结果要作为重建上下文的首条 user 消息，
-    // 主循环读它改道。工具批次里更早的 tool_result 随旧历史一起作废
-    private contextCleared = false;
     // 审批回调由 CLI/测试注入——Agent 类不依赖具体 UI（readline/对话框/测试桩）。
     // 子 agent 没有回调，exit 走 fallback 直接恢复原模式
     private planApprovalFn?: (planContent: string) => Promise<{
@@ -981,6 +978,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
     }
 
+    /** turn 真实收敛的统一出口：注记 + cordis 事件（tool-use 是 step 级标记，
+     *  只进注记不走这里）。 */
+    private endTurn(reason: string): void {
+        this.sessionLog.append({ type: "turn/end", reason });
+        this.cordis.emit("agent/turn-end", { reason });
+    }
+
     private ensureDriver(): Promise<void> {
         if (!this.driverPromise) {
             this.setStatus("running");
@@ -1003,7 +1007,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
             this.setStatus("idle");
         } catch (e) {
-            if (isAbortLike(e)) this.sessionLog.append({ type: "turn/end", reason: "aborted" });
+            if (isAbortLike(e)) this.endTurn("aborted");
             this.setStatus("idle");
             throw e;
         }
@@ -1011,7 +1015,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     /** 一个 turn：旧 chat() 的开场（maintenance 相位）+ step 循环（running 相位）。 */
     private async runOneTurn(batch: string[]): Promise<void> {
-        for (const text of batch) {
+        // pre-step（turn 首步形态）：组装前可改写/拒绝。拒绝 → 本 turn 不消耗
+        // 模型调用直接收敛（dsh：blocked；输入已 claim，不回队列不进消息）
+        const decision = await this.cordis.waterfall(
+            "agent/pre-step",
+            { input: batch },
+            (): PreStepDecision => ({ input: batch }),
+        );
+        if (decision.reject !== undefined) {
+            this.endTurn("blocked");
+            return;
+        }
+        for (const text of decision.input ?? batch) {
             // 环境 reminder 只进主对话首条消息——子 agent 有自己的 system，不掺和。
             // 连续 user 的合并在 pushUser（工作集）与 SessionLog.append（日志）双侧镜像
             const content = this.messages.length === 0 && !this.hasCustomPrompt
@@ -1046,7 +1061,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         let firstStep = true;
         while (true) {
             if (!firstStep) {
-                for (const steerText of this.inbox.claimStep()) this.pushUser(steerText);
+                const steers = this.inbox.claimStep();
+                if (steers.length > 0) {
+                    // pre-step（step 边界形态）：拒绝只丢插话、step 照常（与 turn
+                    // 首步的"整 turn 收敛"不同——mini 简化，偏差记 dsh-C5.md §2）
+                    const steerDecision = await this.cordis.waterfall(
+                        "agent/pre-step",
+                        { input: steers },
+                        (): PreStepDecision => ({ input: steers }),
+                    );
+                    if (steerDecision.reject === undefined) {
+                        for (const steerText of steerDecision.input ?? steers) this.pushUser(steerText);
+                    }
+                }
             }
             firstStep = false;
             this.sessionLog.append({ type: "turn/start" });
@@ -1108,7 +1135,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             const toolUses: Anthropic.ToolUseBlock[] = response.content.filter((b) => b.type === "tool_use");
 
             if (toolUses.length === 0) {
-                this.sessionLog.append({ type: "turn/end", reason: "end-turn" });
+                // turn-stopping：收敛前最后一个口——监听器可 steer 挽留（文本排
+                // next-step，排空循环开新 turn 消费；请求体同形见 dsh-C4.md §3）
+                await this.cordis.serial("agent/turn-stopping", { steer: (text: string) => this.steer(text) });
+                this.endTurn("end-turn");
                 if (!this.isSubAgent) {
                     printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
                     this.autoSave();
@@ -1123,7 +1153,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             const budget = this.checkBudget();
             if (budget.exceeded) {
                 printInfo(`Budget exceeded: ${budget.reason}`);
-                this.sessionLog.append({ type: "turn/end", reason: "budget" });
+                this.endTurn("budget");
                 this.pushUser(toolUses.map((tu) => {
                     this.sessionLog.append({ type: "tool/result", callId: tu.id, content: `Tool call not executed: ${budget.reason}`, isError: true });
                     return {
@@ -1135,10 +1165,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 this.autoSave();
                 break;
             }
+            // step 级标记（turn 继续）：只进注记，不发 agent/turn-end 事件
             this.sessionLog.append({ type: "turn/end", reason: "tool-use" });
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
-            let contextBreak = false;
+            let conclusion: TurnConclusion | null = null;
             for (const tu of toolUses) {
                 // 单工具全包 try/catch：任何意外抛错（畸形 input 打崩 UI 渲染、落盘
                 // 失败等）都转成 error tool_result 回灌。否则异常逃出循环时历史里
@@ -1164,35 +1195,39 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         this.sessionLog.append({ type: "tool/result", callId: tu.id, content: outcome.content, isError: true });
                         continue;
                     }
+                    // C5：工具自结 turn（plan 的 clear-and-execute 是第一个签发者）。
+                    // 工具输出不进 tool_result 批次（dropBatch：历史已清，批次会
+                    // 孤儿化 → 400），注入文本排 next-turn，drain 循环开新 turn——
+                    // 首条消息的 reminder 待遇由 runOneTurn 统一给
+                    if (outcome.conclusion) {
+                        conclusion = outcome.conclusion;
+                        break;
+                    }
                     output = this.persistLargeResult(tu.name, outcome.output);
                 } catch (e: any) {
                     output = `Tool execution failed: ${e?.message ?? e}`;
                     this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output, isError: true });
                 }
-                if (this.contextCleared) {
-                    // 选项 1（clear-and-execute）：历史刚被清空，exit 结果作为重建
-                    // 上下文的首条 user 消息（带 CLAUDE.md reminder，与 chat() 首条
-                    // 同待遇）；本批更早的 tool_result 随旧历史一起作废——assistant
-                    // 的 tool_use 块也已清掉，不会留孤儿
-                    this.contextCleared = false;
-                    const content = this.messages.length === 0 && !this.hasCustomPrompt
-                        ? `${output}\n\n${buildUserContextReminder()}`
-                        : output;
-                    this.pushUser(content);
-                    contextBreak = true;
-                    break;
-                }
                 toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
                 this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output });
             }
-            if (!contextBreak && !this.contextCleared && toolResult.length > 0) {
+            if (conclusion) {
+                if (!conclusion.dropBatch && toolResult.length > 0) {
+                    this.pushUser(toolResult);
+                }
+                if (conclusion.nextTurnInput !== undefined) {
+                    this.inbox.append("next-turn", conclusion.nextTurnInput);
+                }
+                this.endTurn("concluded");
+                break;
+            }
+            if (toolResult.length > 0) {
                 this.pushUser(toolResult);
             }
-            this.contextCleared = false;
         }
     }
 
-    private async executeToolCall(name: string, input: Record<string, any>): Promise<string> {
+    private async executeToolCall(name: string, input: Record<string, any>): Promise<string | TurnConclusion> {
         if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
         if (name === "agent") return this.executeAgentTool(input);
         if (name === "skill") return this.executeSkillTool(input);
@@ -1217,7 +1252,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return await def.execute(input, { readFileState: this.readFileState });
     }
 
-    private async executePlanModeTool(name: string): Promise<string> {
+    private async executePlanModeTool(name: string): Promise<string | TurnConclusion> {
         if (name === "enter_plan_mode") {
             if (this.mode === "plan") return "Already in plan mode.";
             this.prePlanMode = this.mode;
@@ -1263,9 +1298,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 if (result.choice === "clear-and-execute") {
                     this.clearHistoryKeepSystem();
-                    this.contextCleared = true;
                     printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
-                    return `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\nPlan file: ${savedPlanPath}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
+                    // C5：签发 TurnConclusion 而非私有信号位——循环按结论收束本
+                    // turn，注入文本经 inbox 开新 turn（旧 contextCleared 改道消亡）
+                    return {
+                        concludeTurn: true,
+                        dropBatch: true,
+                        nextTurnInput: `User approved the plan. Context was cleared. Permission mode: ${targetMode}\n\nPlan file: ${savedPlanPath}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`,
+                    };
                 }
 
                 printInfo(`Plan approved. Executing in ${targetMode} mode.`);

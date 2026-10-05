@@ -33,8 +33,9 @@ export type PermissionHint = "read" | "edit" | "exec" | "meta";
 export interface ToolExec {
     /** read-before-edit 簿记：路径 → 上次读取的 mtime。 */
     readFileState?: Map<string, number>;
-    /** agent 的完整分发链（魔法名 → 注册表）——管线管权限，分发归 agent。 */
-    dispatch?: (name: string, input: Record<string, any>) => Promise<string>;
+    /** agent 的完整分发链（魔法名 → 注册表）——管线管权限，分发归 agent。
+     *  返回 string 即工具输出；返回 TurnConclusion 即工具自结 turn（C5）。 */
+    dispatch?: (name: string, input: Record<string, any>) => Promise<string | TurnConclusion>;
     /** auto 模式的分类器裁决（C2 起由监听器调用；机制留在 Agent）。 */
     autoAdjudicate?: (name: string, input: Record<string, any>) => Promise<AutoVerdict>;
 }
@@ -67,8 +68,25 @@ export interface PreExecCall {
 
 /** executeCall 的结果：正常输出，或被拒（announce = 需要打印的拒绝原因）。 */
 export type ExecOutcome =
-    | { kind: "result"; output: string }
+    | { kind: "result"; output: string; conclusion?: TurnConclusion }
     | { kind: "denied"; content: string; announce?: string };
+
+/** C5：工具自结 turn 的结论。第一个签发者是 plan 的 clear-and-execute——
+ *  循环只认识这个对象，不认识任何工具的私有状态位。 */
+export interface TurnConclusion {
+    /** 本 step 结束后 turn 收敛，不再继续工具循环。 */
+    concludeTurn: true;
+    /** 跳过本批 tool_result 回灌——clear-and-execute 清历史后，批次里的结果
+     *  没有对应的 tool_use（孤儿化 → 400），必须一并丢弃。 */
+    dropBatch?: boolean;
+    /** 注入文本排 inbox 的 next-turn，drain 循环开新 turn 消费（首条消息的
+     *  reminder 待遇由 runOneTurn 的 pushUser 统一给）。 */
+    nextTurnInput?: string;
+}
+
+function isTurnConclusion(v: unknown): v is TurnConclusion {
+    return typeof v === "object" && v !== null && (v as TurnConclusion).concludeTurn === true;
+}
 
 const DECISION_RANK: Record<PreExecDecision["type"], number> = { allow: 0, ask: 1, deny: 2 };
 
@@ -223,7 +241,13 @@ export class ToolsService extends Service {
 
         let output: string;
         if (exec.dispatch) {
-            output = await exec.dispatch(call.name, call.input);
+            const dispatched = await exec.dispatch(call.name, call.input);
+            if (isTurnConclusion(dispatched)) {
+                // 工具经 dispatch 自结 turn：结论原样上浮，输出即注入文本
+                // （不进 tool_result 批次，truncateResult 也不适用）
+                return { kind: "result", output: dispatched.nextTurnInput ?? "", conclusion: dispatched };
+            }
+            output = dispatched;
         } else if (preCall.def) {
             output = await preCall.def.execute(call.input, exec);
         } else {
