@@ -10,6 +10,7 @@ import { coreExecTools } from "./plugins/core-exec-tools.js";
 import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
+import { goalPlugin, GoalService } from "./plugins/autonomy.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
@@ -18,7 +19,7 @@ import { McpManager } from "./mcp.js";
 import { withRetry } from "./retry.js";
 import {
     goalDirective, GOAL_EVALUATOR_SYSTEM, GOAL_TRANSCRIPT_FRAMING, goalJudgeUserMessage,
-    parseGoalVerdict, GOAL_MAX_ITERATIONS, type GoalVerdict,
+    parseGoalVerdict, type GoalVerdict,
     parseLoopInput, isDailyWording, OFFER_CLOUD_THRESHOLD_SECONDS,
     SCHEDULE_WAKEUP_TOOL, clampWakeupDelay, dynamicLoopDirective, LOOP_MAX_ITERATIONS, type LoopSpec,
     loadAutoModeRules, buildClassifierSystem, buildClassifierTranscript, classifierUserMessage,
@@ -132,14 +133,6 @@ export class Agent implements AgentHandle {
     private alreadySurfacedMemories: Set<string> = new Set();
     private sessionMemoryBytes = 0;
 
-    // /goal——会话级 Stop hook 条件，跨 turn 追逐
-    private activeGoal: {
-        condition: string;
-        iterations: number;
-        startedAt: number;
-        lastReason?: string;
-    } | null = null;
-    private goalStop = false; // 中断时置位，跳出 goal 追逐
     // /loop dynamic——模型调 schedule_wakeup 时写入，loop 驱动在 turn 收敛后读取并清空
     private pendingWakeup: { delaySeconds: number; reason: string; prompt: string } | null = null;
     private loopStop = false; // 中断时置位，跳出运行中的 loop
@@ -162,6 +155,12 @@ export class Agent implements AgentHandle {
         // （deny 规则硬底线 + 九段静态流水线），auto 在内层（veto 链表达"auto 优先"）
         this.cordis.plugin(approvalPlugin);
         this.cordis.plugin(autoApprovalPlugin);
+        // C5 第二段：goal 追逐迁 turn-stopping 监听器（plugins/autonomy.ts）。
+        // 桥 = 评估器与预算检查（C6 llm 服务落地后收窄）
+        this.cordis.plugin(goalPlugin, {
+            evaluate: (condition: string) => this.evaluateGoal(condition),
+            getBudget: () => this.checkBudget(),
+        });
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
         this.staticSystemPrompt = options.customSystemPrompt || buildStaticSystemPrompt();
@@ -668,70 +667,40 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return out;
     }
 
-    /** 设定活跃 goal 并返回首轮指令（设定 goal 本身就开启一个 turn）。 */
+    /** 设定活跃 goal 并返回首轮指令（设定 goal 本身就开启一个 turn）。
+     *  状态在 ctx.goal 服务；追逐决策在 goal 插件的 turn-stopping 监听器。 */
     setGoal(condition: string): string {
-        this.activeGoal = { condition, iterations: 0, startedAt: Date.now() };
+        this.cordis.require<GoalService>("goal").set(condition);
         printInfo(`◎ /goal active — Stop hook condition: "${condition}"`);
         return goalDirective(condition);
     }
 
     /** /goal 无参数：打印当前 goal 状态。 */
     showGoal(): void {
-        if (!this.activeGoal) {
+        const goal = this.cordis.get<GoalService>("goal")?.active;
+        if (!goal) {
             printInfo("No active goal. Set one with /goal <condition>.");
             return;
         }
-        const secs = ((Date.now() - this.activeGoal.startedAt) / 1000).toFixed(1);
-        const last = this.activeGoal.lastReason ? `\n  last reason: ${this.activeGoal.lastReason}` : "";
+        const secs = ((Date.now() - goal.startedAt) / 1000).toFixed(1);
+        const last = goal.lastReason ? `\n  last reason: ${goal.lastReason}` : "";
         printInfo(
-            `◎ /goal active\n  condition: ${this.activeGoal.condition}\n  iterations: ${this.activeGoal.iterations}\n  elapsed: ${secs}s${last}`
+            `◎ /goal active\n  condition: ${goal.condition}\n  iterations: ${goal.iterations}\n  elapsed: ${secs}s${last}`
         );
     }
 
-    /** 追逐活跃 goal：跑指令轮，然后循环 评估→(未达)回灌 reason→下一轮，
-     *  直到 met / impossible / 预算或迭代上限 / goalStop。 */
+    /** goal 入口：首 turn + 收尾（C5 第二段起）。追逐逻辑在 goal 插件的
+     *  turn-stopping 监听器——未达 steer 回灌续命、met/impossible/预算/迭代
+     *  上限停机。abort（SIGINT）绕过 turn-stopping，finally 统一清状态——
+     *  stale goal 不能留着（旧版同一纪律）。 */
     async pursueGoal(directive: string): Promise<void> {
-        if (!this.activeGoal) return;
-        this.goalStop = false;
+        const goal = this.cordis.require<GoalService>("goal");
+        if (!goal.active) return;
         try {
             await this.chat(directive);
-            // 刚结束的 turn 在任何上限/续轮决策**之前**先评审——最终轮的输出不能漏判
-            while (this.activeGoal && !this.goalStop) {
-                const verdict = await this.evaluateGoal(this.activeGoal.condition);
-                if (verdict.ok) {
-                    const turns = this.activeGoal.iterations + 1;
-                    const secs = ((Date.now() - this.activeGoal.startedAt) / 1000).toFixed(1);
-                    printInfo(`✓ Goal achieved (${turns} turn${turns === 1 ? "" : "s"}, ${secs}s): ${verdict.reason}`);
-                    break;
-                }
-                if (verdict.impossible) {
-                    printInfo(`Hooks: Prompt hook condition judged impossible: ${verdict.reason}`);
-                    break;
-                }
-
-                // 未达：记录并决定是否还允许下一轮
-                this.activeGoal.iterations++;
-                this.activeGoal.lastReason = verdict.reason;
-                printInfo(`Hooks: Prompt hook condition was not met: ${verdict.reason}`);
-
-                const budget = this.checkBudget();
-                if (budget.exceeded) { printInfo(`Goal stopped: ${budget.reason}`); break; }
-                // 与 --max-turns 无关的硬顶：--max-turns 只数工具轮（checkBudget），
-                // 无工具的 goal 循环需要自己的无条件保险丝
-                if (this.activeGoal.iterations >= GOAL_MAX_ITERATIONS) {
-                    printInfo(`Goal stopped: reached ${GOAL_MAX_ITERATIONS} iterations without meeting the condition.`);
-                    break;
-                }
-                if (this.goalStop) break;
-
-                await this.chat(
-                    `Hooks: Prompt hook condition was not met: ${verdict.reason}\n\nKeep working toward the goal.`
-                );
-            }
-            if (this.goalStop) printInfo("Goal pursuit interrupted.");
+            if (goal.stopped) printInfo("Goal pursuit interrupted.");
         } finally {
-            // 任何出口（met / impossible / 上限 / 中断）都清掉——stale goal 不能留着
-            this.activeGoal = null;
+            goal.clear();
         }
     }
 
@@ -907,9 +876,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.loopStop = true;
     }
 
-    /** 停止运行中的 /goal（REPL 中断处理调用，下一个 turn 边界生效）。 */
+    /** 停止运行中的 /goal（REPL 中断处理经 cancel 调用；监听器见到标志不再续命）。 */
     stopGoal(): void {
-        this.goalStop = true;
+        this.cordis.get<GoalService>("goal")?.stop();
     }
 
     // ---------- C4：handle 面与 inbox 驱动 ----------
@@ -1136,9 +1105,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             if (toolUses.length === 0) {
                 // turn-stopping：收敛前最后一个口——监听器可 steer 挽留（文本排
-                // next-step，排空循环开新 turn 消费；请求体同形见 dsh-C4.md §3）
-                await this.cordis.serial("agent/turn-stopping", { steer: (text: string) => this.steer(text) });
-                this.endTurn("end-turn");
+                // next-step，排空循环开新 turn 消费；请求体同形见 dsh-C4.md §3），
+                // 或 block 把收敛注记改为 blocked（goal 判 impossible 时）
+                let stopReason = "end-turn";
+                await this.cordis.serial("agent/turn-stopping", {
+                    steer: (text: string) => this.steer(text),
+                    block: () => { stopReason = "blocked"; },
+                });
+                this.endTurn(stopReason);
                 if (!this.isSubAgent) {
                     printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
                     this.autoSave();

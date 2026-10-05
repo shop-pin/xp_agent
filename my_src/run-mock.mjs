@@ -1248,6 +1248,38 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "29": {
+    // C5 第二段：goal 判 impossible → turn 以 blocked 收敛（turn-stopping 的
+    // block 动作）。15 场景已锚 impossible 的停机行为（1 main + 1 eval），
+    // 本场景专锚注记词汇表与驱动收敛。
+    needsLog: true,
+    setup: () => { },
+    runs: [{ goalImpossible: true }],
+    tracks: {
+      main: {
+        turns: [{ text: "It cannot be done." }],
+      },
+      goal: {
+        match: "evaluating a hook condition",
+        turns: [{ text: '{"ok": false, "impossible": true, "reason": "mathematically impossible."}' }],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const goalReqs = reqs.filter((e) => e.track === "goal");
+      check("1 main call + 1 evaluator call, no continuation", mainReqs.length === 1 && goalReqs.length === 1);
+      check("impossible verdict ends the turn as blocked (annotation)",
+        samples["goal-end-reasons"] === "blocked");
+      check("driver idle after blocked turn", samples["goal-idle"] === "idle");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1401,6 +1433,17 @@ if (s.runs) {
         await a.chat("first turn");             // 阶段 3：turn-stopping 挽留
         await a.whenIdle();
         sample("turn-end-reasons", turnEnds.join(","));
+        if (a.close) await a.close();
+      } else if (r.goalImpossible !== undefined) {
+        // C5 第二段：goal impossible → turn 以 blocked 收敛（注记断言）
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        const directive = a.setGoal("make 2+2 equal 5");
+        await a.pursueGoal(directive);
+        const ends = a.sessionLog.events.filter((e) => e.type === "turn/end").map((e) => e.reason);
+        sample("goal-end-reasons", ends.join(","));
+        sample("goal-idle", a.status);
         if (a.close) await a.close();
       } else {
         await mod.runCli(r.argv);

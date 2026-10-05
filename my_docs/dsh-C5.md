@@ -102,7 +102,7 @@ runDriver: while (inbox.hasPending)
               → [dropBatch? 跳过回灌] → nextTurnInput 排 next-turn → endTurn("concluded") → break
 ```
 
-## 5. 实现与验证记录
+## 5. 实现与验证记录（第一段）
 
 **文件**：
 - `services/agents.ts`（agent 域 Events merging + PreStepDecision）
@@ -134,6 +134,34 @@ runDriver: while (inbox.hasPending)
 > 3. 是同一条（next-step/插话队列）。turn-stopping 的 steer 在收敛点入队 → 排空循环开新 turn 消费；用户 send 在 step 中途入队 → step 边界认领并入批次。请求字节相同（都是 [.., assistant, user(插话)]），差异在 turn 注记粒度与消费时机——这就是 C4 §3 论证的"mini 注记 per-request，消息流才是请求体"。
 > 4. 变简单：循环不用解析 tool_result 内容，签发点是类型化的 outcome，TS 能查。变不可能（暂时）：结论不进会话日志——C8 重放时无法从日志还原"当时 turn 是被工具结论结束的"（注记 turn/end(concluded) 有记录但结论对象本身没落盘）；D5 若要投影 replace 工具结论也够不着。dsh 挂 tool result 正因为 tool/result 是持久事件。mini 的债记在 C8 章清单。
 
-## 7. 下一段预告（C5 第二段：goal 迁移）
+## 7. 第二段：goal 迁移（turn-stopping 挽留）
 
-`pursueGoal` 的外层 while 拆掉：/goal 设条件 → `plugins/autonomy.ts` 注册 turn-stopping 监听器（评估 → 未达 steer 回灌 reason 续命 → impossible/budget → endTurn blocked）→ REPL await 自然等到排空。新断言：goal 评估 reject → turn/end 注记带 blocked。危险点：SIGINT 与挽留的交互（cancel 后 turn-stopping 不得再续命）。
+旧 `pursueGoal` 是 Agent 里的一层 while：chat → 评估 → 未达则再 chat。第二段把它拆成**所有权三分**：
+
+| 角色 | 落点 | 职责 |
+|---|---|---|
+| **状态** | `ctx.goal`（GoalService，plugins/autonomy.ts） | condition/iterations/startedAt/lastReason + stopped 标志 |
+| **决策** | goal 插件的 turn-stopping 监听器 | 评估 → met 清状态 / impossible 清状态 + `block()` / 未达 steer 回灌 reason 续命（预算、迭代上限停机） |
+| **生命周期** | `pursueGoal`（Agent） | 首 turn（chat directive）+ 收尾：stopped 打印 + **finally 清状态** |
+
+finally 为什么必须在 pursueGoal：abort（SIGINT）从 runStepLoop 直接抛出、**绕过 turn-stopping**——监听器永远没机会清状态。发起方兜底是唯一覆盖所有出口的清法（旧版同一纪律，位置从"循环后的 finally"变成"入口的 finally"）。
+
+**续命的机制路径**：监听器 `steer("Hooks: ... not met: ...\n\nKeep working toward the goal.")` → 文本排 next-step → 排空循环 claimTurn 开新 turn → 新 turn 收敛点再评估——while 循环没有消失，它化进了 C4 的 drain 循环 + C5 的 turn-stopping 这对组合。评估时序变化：旧在 turn **之间**（agent idle），新在收敛点**之内**（serial 期间）——请求序列逐条同序（场景 15 的 8 main + 3 goal 调用锚原样通过）。
+
+**block 是 mini 扩展**：dsh 的 turn end reason 由机器独占（listener 只能 steer 或沉默）；mini 让 turn-stopping 监听器可把收敛注记从 end-turn 改成 blocked——impossible 是它的第一个也是（目前）唯一用户。评估器错误仍按未达处理（fail-closed，绝不误清 goal）——评估器的 try/catch 在 `evaluateGoal` 里，桥之外不变。
+
+**C6 缝（记档）**：`GoalBridge { evaluate, getBudget }` 是 Agent 借给插件的桥——评估器还是 SDK 直调 + 读 messages。C6 的 `llm.sideCall` 落地后，evaluate 变成服务调用，桥只剩 getBudget（D6 一并收口）。
+
+### 第二段实现与验证记录
+
+**文件**：`plugins/autonomy.ts`（新增：GoalService + goalPlugin + Context.goal merging）；`services/agents.ts`（TurnStoppingState：steer + block）；`agent.ts`（activeGoal/goalStop 字段消亡、setGoal/showGoal/stopGoal 走服务、pursueGoal 收缩为首 turn + finally、turn-stopping 发 block）；`cordis-tests/c5-goal.test.ts`（新增 5 条）；`run-mock.mjs`（场景 29 + goalImpossible runner）。
+
+**验证**：cordis **97/97**（第二段 +5：未达 steer、met 清态、impossible block、预算停机、stop 标志 + 无 goal no-op）；mock **25 场景全绿**——场景 15（三态 + auto 混跑）的 8 main + 3 goal 调用锚与场景 7（goal+压缩）原样通过 = 追逐请求序列逐字节等价；新场景 29 锚 impossible → turn/end 注记恰为 `blocked` + 驱动回 idle。
+
+**翻车记档**（第二段）：
+1. **runner 分支各管各的助手**：goalImpossible 分支用了 `sample` 但没定义——midturn/events 分支各自定义了自己的 sample，复制分支时只带了调用没带定义。三个分支三份本地助手已是坏味道，D6 加 schedule 探针时该提到 runner 顶层共享。
+2. **plugin config 的类型推导断在 ctx.plugin 边界**：`evaluate: (condition) => ...` 报 implicit any——`ctx.plugin(P, config)` 的 config 形参是 unknown（B2 的宽签名），GoalBridge 的类型进不去箭头函数参数。显式标注 `(condition: string)` 即可。教训：跨插件边界的回调参数永远显式标类型，别指望结构化推导。
+
+## 8. 下一段预告（C5 第三段：loop 迁移 + 失败补全）
+
+runLoopInterval/runLoopDynamic → autonomy 插件监听器（interval 用 setTimeout 雏形，dynamic 的 schedule_wakeup 字段协议保留、D6 换 ctx.schedule）；step 抛错时为每个无果 tool/call 补 isError 的 tool/result（ToolCallRecovery 简化版）；autonomy.ts 收口（goal + loop 同插件）。危险点：interruptibleSleep 与 cancel 的竞态（场景 24 的 stopLoopAfterMs 探针会盯）。

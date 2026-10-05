@@ -27,6 +27,14 @@ export interface PreStepDecision {
     input?: string[];
 }
 
+/** turn-stopping 监听器手里的两个动作：steer 挽留（文本排 next-step，排空
+ *  循环开新 turn 续跑）；block 把本 turn 的收敛注记从 end-turn 改成 blocked
+ *  （mini 扩展——dsh 的 turn end reason 由机器独占，见 dsh-C5.md 第二段）。 */
+export interface TurnStoppingState {
+    steer: (text: string) => void;
+    block: (reason?: string) => void;
+}
+
 /** 内存版双队列 inbox。dsh 的 ReactLoopInbox 把队列变更持久化为 session 投影
  *  （agent/inbox/spliced 事件，重启不丢），mini 的持久化在 C8 一并考虑。 */
 export class Inbox {
@@ -115,7 +123,7 @@ declare module "../cordis/events.js" {
             next: () => PreStepDecision | Promise<PreStepDecision>,
         ): PreStepDecision | Promise<PreStepDecision>;
         /** 收敛前：监听器可 steer 文本挽留（serial 无 next；返回非空值会 bail 后继）。 */
-        "agent/turn-stopping"(state: { steer: (text: string) => void }): void | Promise<void>;
+        "agent/turn-stopping"(state: TurnStoppingState): void | Promise<void>;
         /** turn 真实收敛（end-turn/budget/aborted/blocked/concluded；tool-use 是
          *  step 级注记不发事件）。 */
         "agent/turn-end"(payload: { reason: string }): void;

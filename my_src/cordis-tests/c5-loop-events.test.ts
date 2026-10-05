@@ -46,7 +46,10 @@ test('agent 域 Events：pre-step waterfall 改写 / turn-stopping steer / turn-
 
   let captured = ''
   ctx.on('agent/turn-stopping', (state) => { state.steer('KEEP') })
-  await ctx.serial('agent/turn-stopping', { steer: (t: string) => { captured = t } })
+  await ctx.serial('agent/turn-stopping', {
+    steer: (t: string) => { captured = t },
+    block: () => { captured = 'BLOCKED' },
+  })
   assert.equal(captured, 'KEEP')
 
   ctx.emit('agent/turn-end', { reason: 'blocked' })

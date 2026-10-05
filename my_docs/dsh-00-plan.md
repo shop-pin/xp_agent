@@ -214,7 +214,7 @@
 | C2 | ✅ 完成（2026-10-04） | `dsh-C2.md`；pre-execute 瀑布 + approval seam + 单调 guard（deny 不可翻案）；cordis 76/76 |
 | C3 | ✅ 完成（2026-10-04） | `dsh-C3.md`；SessionLog 八类事件 + derive 纯投影 + pushUser/pushAssistant 双写入口；cordis 84/84、mock 22/22；请求体逐字节等价 |
 | C4 | ✅ 完成（2026-10-05） | `dsh-C4.md`；Inbox 双队列 + claim / AgentHandle（send/followup/steer/cancel/whenIdle，三态）/ AgentRegistry；runAgentLoop→runStepLoop（step 边界认领插话）；排空循环取代 wake/latch（请求体等价论证见章内）；场景 27（mid-turn 探针）；cordis 89/89、mock 23 场景全绿；建议 commit：`add agent handle and inbox with claim-driven turn loop` |
-| C5 | 🔶 第一段完成（2026-10-05） | `dsh-C5.md`；三事件埋点（pre-step/turn-stopping/turn-end）+ TurnConclusion（工具自结 turn）+ contextCleared 消亡；场景 28 事件探针；cordis 92/92、mock 24 场景全绿；建议 commit：`add agent loop events with tool turn-conclusion mechanism`；**第二段从 goal 迁移继续**（turn-stopping 挽留 + blocked 断言） |
+| C5 | 🔶 第二段完成（2026-10-05） | `dsh-C5.md`；第一段：三事件埋点 + TurnConclusion + contextCleared 消亡（建议 commit `add agent loop events with tool turn-conclusion mechanism`）；第二段：goal 迁移（GoalService + turn-stopping 监听器 + block → blocked 注记，pursueGoal while 消亡，场景 29）；cordis 97/97、mock 25 场景全绿；**第三段从 loop 迁移继续**（runLoopInterval/Dynamic 监听器化 + 失败补全 + autonomy 收口） |
 | C6..C8 | 未开始 | — |
 | D1..D6 | 未开始 | — |
 | E1..E3 | 未开始 | — |
