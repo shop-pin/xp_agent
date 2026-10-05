@@ -3,6 +3,7 @@ import { toolDefinitions, type ToolDef } from "./tools.js";
 import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
 import { SessionLog, type TokenUsage } from "./services/session-log.js";
+import { Inbox, type AgentHandle, type AgentStatus } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
 import { coreFsTools } from "./plugins/core-fs-tools.js";
 import { coreExecTools } from "./plugins/core-exec-tools.js";
@@ -28,7 +29,7 @@ import { randomUUID } from "crypto";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { printToolCall, printAssistantText, printInfo, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
+import { printToolCall, printAssistantText, printInfo, printError, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
 
 const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
@@ -52,6 +53,11 @@ function getContextWindow(model: string): number {
     return MODEL_CONTEXT[model] || 200000;
 }
 
+function isAbortLike(e: unknown): boolean {
+    const err = e as { name?: string; message?: string };
+    return err?.name === "AbortError" || String(err?.message ?? "").includes("aborted");
+}
+
 export interface AgentOptions {
     permissionMode?: PermissionMode;
     // 子 agent 三件套：整个 system 视为静态块（跳过 dynamic 段与首条消息 reminder）、
@@ -61,7 +67,7 @@ export interface AgentOptions {
     isSubAgent?: boolean;
 }
 
-export class Agent {
+export class Agent implements AgentHandle {
     private client: Anthropic;
     private messages: Anthropic.MessageParam[] = [];
     private mode: PermissionMode = "default";
@@ -72,6 +78,11 @@ export class Agent {
     // C3：会话事件日志——追加镜像 + 纯投影。线上工作集 this.messages 仍是请求
     // 体来源（压缩 T1–T4 原地改写它），日志与工作集的发散点即 D5 投影 replace 的缝
     private sessionLog: SessionLog;
+    // C4：handle 面与 inbox 驱动——输入是数据，认领发生在循环边界
+    readonly inbox: Inbox = new Inbox();
+    private statusValue: AgentStatus = "idle";
+    private driverPromise: Promise<void> | null = null;
+    private idleWaiters: Array<() => void> = [];
     private staticSystemPrompt: string;
     private hasCustomPrompt: boolean;
     private isSubAgent: boolean;
@@ -115,7 +126,7 @@ export class Agent {
     // 可能卡死在拒绝循环，降级回人工确认（或无人值守拒绝）
     private autoConsecutiveDenials = 0;
     private autoTotalDenials = 0;
-    // 中断支持：SIGINT 处理器经 abort() 取消在途 API 请求（isProcessing 判忙）
+    // 中断支持：SIGINT 处理器经 cancel() 收口（busy 判忙），abort 在途 API 请求
     private abortController: AbortController | null = null;
     // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
     private effectiveWindow: number;
@@ -904,47 +915,140 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.goalStop = true;
     }
 
-    /** 取消在途 API 请求（流式请求会立刻以 abort 错误失败，chat 向上抛）。 */
-    abort(): void {
+    // ---------- C4：handle 面与 inbox 驱动 ----------
+
+    /** handle 身份：注册表 key（AgentRegistry.create 用）。 */
+    get id(): string {
+        return this.sessionId;
+    }
+
+    get status(): AgentStatus {
+        return this.statusValue;
+    }
+
+    /** REPL SIGINT 判忙（含 maintenance 相位——比旧 isProcessing 覆盖更早的窗口）。 */
+    get busy(): boolean {
+        return this.statusValue !== "idle";
+    }
+
+    async send(text: string): Promise<void> {
+        if (this.statusValue === "idle") return this.followup(text);
+        this.inbox.append("next-step", text);
+        return this.ensureDriver();
+    }
+
+    async followup(text: string): Promise<void> {
+        this.inbox.append("next-turn", text);
+        return this.ensureDriver();
+    }
+
+    steer(text: string): void {
+        this.inbox.append("next-step", text);
+        if (this.statusValue === "idle") {
+            // 无 awaiter 的驱动：错误在此兜底（abort 静默——SIGINT 语义，不刷屏）
+            void this.ensureDriver().catch((e) => {
+                if (!isAbortLike(e)) printError(`Agent driver error: ${e instanceof Error ? e.message : String(e)}`);
+            });
+        }
+    }
+
+    whenIdle(): Promise<void> {
+        if (this.statusValue === "idle") return Promise.resolve();
+        return new Promise((resolve) => this.idleWaiters.push(resolve));
+    }
+
+    /** SIGINT 收口：停 loop/goal 标志、清 inbox（dsh 默认——打断后的下一条输入
+     *  获得干净上下文，旧插话不再暗处生效）、abort 在途请求。settle 以 abort
+     *  错误 reject 给 awaiter（保持旧 chat() 的抛错语义）。 */
+    cancel(_cause?: unknown): void {
+        this.stopLoop();
+        this.stopGoal();
+        this.inbox.clear();
         this.abortController?.abort();
     }
 
-    get isProcessing(): boolean {
-        return this.abortController !== null;
+    /** 兼容入口（goal/loop/subagent/one-shot 沿用）：followup + await settle。 */
+    async chat(userText: string): Promise<void> {
+        await this.followup(userText);
     }
 
-    async chat(userText: string): Promise<void> {
-        // 环境 reminder 只进主对话首条消息——子 agent 有自己的 system，不掺和
-        const content = this.messages.length === 0 && !this.hasCustomPrompt
-            ? `${userText}\n\n${buildUserContextReminder()}`
-            : userText;
-        // budget 超限截停会把历史末尾停在 user（tool_result 拒绝批次）上——此刻再
-        // 进一条 user 就是连续同角色，真实 Anthropic API 直接 400（roles must
-        // alternate）。合并语义（字符串拼接 / tool_result 批次追加 text 块）
-        // 收进 pushUser，工作集与日志两侧镜像同一套规则
-        this.pushUser(content);
+    private setStatus(s: AgentStatus): void {
+        this.statusValue = s;
+        if (s === "idle") {
+            const waiters = this.idleWaiters;
+            this.idleWaiters = [];
+            for (const w of waiters) w();
+        }
+    }
+
+    private ensureDriver(): Promise<void> {
+        if (!this.driverPromise) {
+            this.setStatus("running");
+            this.driverPromise = this.runDriver().finally(() => {
+                this.driverPromise = null;
+            });
+        }
+        return this.driverPromise;
+    }
+
+    /** 唤醒循环：排空 inbox 即收敛（drain-at-convergence——dsh 用 wake/latch，
+     *  等价性论证见 dsh-C4.md 第 3 节）。abort：补 turn/end 注记（C8 重放的
+     *  start/end 配对）后向上抛，settle 的 awaiter 拿到与旧 chat() 相同的语义。 */
+    private async runDriver(): Promise<void> {
+        try {
+            while (this.inbox.hasPending) {
+                const batch = this.inbox.claimTurn();
+                if (batch.length === 0) break;
+                await this.runOneTurn(batch);
+            }
+            this.setStatus("idle");
+        } catch (e) {
+            if (isAbortLike(e)) this.sessionLog.append({ type: "turn/end", reason: "aborted" });
+            this.setStatus("idle");
+            throw e;
+        }
+    }
+
+    /** 一个 turn：旧 chat() 的开场（maintenance 相位）+ step 循环（running 相位）。 */
+    private async runOneTurn(batch: string[]): Promise<void> {
+        for (const text of batch) {
+            // 环境 reminder 只进主对话首条消息——子 agent 有自己的 system，不掺和。
+            // 连续 user 的合并在 pushUser（工作集）与 SessionLog.append（日志）双侧镜像
+            const content = this.messages.length === 0 && !this.hasCustomPrompt
+                ? `${text}\n\n${buildUserContextReminder()}`
+                : text;
+            this.pushUser(content);
+        }
+        this.setStatus("maintenance");
         // T4 在 turn 边界检查：此刻最后一条消息是纯 user 文本，compactAnthropic 的
-        // slice 不变式才成立。放进 while 顶的话，工具轮的末尾是 tool_result——
+        // slice 不变式才成立。放进 step 循环顶的话，工具轮的末尾是 tool_result——
         // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发
         await this.checkAndCompact();
         // 语义召回：turn 边界发起异步 prefetch，不挡主循环；每轮请求前轮询一次，
         // selector 一落定立刻注入，模型尽早看到记忆
-        await this.startMemoryPrefetchForTurn(userText, this.messages);
+        await this.startMemoryPrefetchForTurn(batch.join("\n\n"), this.messages);
         if (!this.isSubAgent) await this.ensureMcp();
         const mcpTools: Anthropic.Tool[] = this.isSubAgent ? [] : this.mcpManager.getToolDefinitions();
-        // abort 生命周期覆盖整个 turn（请求 + 工具执行）：SIGINT 处理器读
-        // isProcessing 判忙、调 abort() 取消在途请求
+        this.setStatus("running");
+        // abort 生命周期覆盖整个 turn（请求 + 工具执行）
         this.abortController = new AbortController();
         try {
-            await this.runAgentLoop(mcpTools);
+            await this.runStepLoop(mcpTools);
         } finally {
             this.abortController = null;
         }
     }
 
-    /** 主 agent 循环：请求 → 工具 → 回灌，直到模型不再调用工具。 */
-    private async runAgentLoop(mcpTools: Anthropic.Tool[]): Promise<void> {
+    /** step 循环（旧 runAgentLoop）：一次请求为一个 step，直到模型不再调用工具。
+     *  step 边界认领 next-step 插话，经 pushUser 以 text 块并进 tool_result 批次
+     *  （C3 合并器语义——此刻新开 user 消息即连续同角色 400）。 */
+    private async runStepLoop(mcpTools: Anthropic.Tool[]): Promise<void> {
+        let firstStep = true;
         while (true) {
+            if (!firstStep) {
+                for (const steerText of this.inbox.claimStep()) this.pushUser(steerText);
+            }
+            firstStep = false;
             this.sessionLog.append({ type: "turn/start" });
             // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
             this.runCompressionPipeline();

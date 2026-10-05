@@ -124,7 +124,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         return;
     }
     if (oneshot) {
-        await agent.chat(oneshot);
+        await agent.send(oneshot);
         await agent.close(); // MCP 子进程 stdio 会挂住事件循环，one-shot 结束必须显式关闭
         return;
     }
@@ -176,21 +176,20 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         // the outer await finish.
         let closed = false;
         rl.on("close", () => { closed = true; resolve(); });
-        // SIGINT 两连退出：agent 处理中 → abort 在途请求、留在 REPL（经
-        // chat 抛出的 abort 错误回到 ask 循环）；空闲 → 第一次提示、第二次退出。
-        // stopLoop/stopGoal 先行——loop tick 间隙 agent 不在"处理中"，
-        // abort 路径够不着它们，只有停止标志能接住。rl 层挂一个（问题挂起时
-        // Ctrl+C 被原始模式下的 readline 拦截）、process 层挂一个（处理中无
-        // 问题挂起，终端信号直达进程）——两个路径互斥，不会双触发。
+        // SIGINT 两连退出：agent 处理中 → cancel（停 loop/goal 标志 + 清 inbox +
+        // abort 在途请求）、留在 REPL（send 的 settle 以 abort 错误 reject，经
+        // ask 的 catch 回到提示符）；空闲 → 第一次提示、第二次退出。
+        // rl 层挂一个（问题挂起时 Ctrl+C 被原始模式下的 readline 拦截）、
+        // process 层挂一个（处理中无问题挂起，终端信号直达进程）——两个路径
+        // 互斥，不会双触发。
         let sigintCount = 0;
         const handleInterrupt = () => {
-            agent.stopLoop();
-            agent.stopGoal();
-            if (agent.isProcessing) {
-                agent.abort();
+            const wasBusy = agent.busy;
+            agent.cancel();
+            if (wasBusy) {
                 console.log("\n  (interrupted)");
                 sigintCount = 0;
-                return; // chat 抛出的 abort 错误会走 ask 的 catch，重新出提示符
+                return; // settle 的 abort 错误会走 ask 的 catch，重新出提示符
             }
             sigintCount++;
             if (sigintCount >= 2) {
@@ -304,9 +303,9 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                         printInfo(`Invoking skill: ${skill.name}`);
                         try {
                             if (skill.context === "fork") {
-                                await agent.chat(`Use the skill tool to invoke "${skill.name}" with args: ${cmdArgs || "(none)"}`);
+                                await agent.send(`Use the skill tool to invoke "${skill.name}" with args: ${cmdArgs || "(none)"}`);
                             } else {
-                                await agent.chat(resolveSkillPrompt(skill, cmdArgs));
+                                await agent.send(resolveSkillPrompt(skill, cmdArgs));
                             }
                         } catch (e: any) {
                             if (!isAbort(e)) printError(String(e.message ?? e));
@@ -318,7 +317,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                 }
                 if (input) {
                     try {
-                        await agent.chat(input);
+                        await agent.send(input);
                     } catch (e: any) {
                         // 中断由 SIGINT 处理器报告过了，这里只报真错误
                         if (!isAbort(e)) printError(String(e.message ?? e));

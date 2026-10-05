@@ -1165,6 +1165,53 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "27": {
+    // C4：Agent handle 与 inbox。三阶段探针（midturn runner 驱动）：
+    //   1 mid-turn send → 排 next-step，step 边界以 text 块并进 tool_result 批次
+    //     （请求体差异逐条指认：req2 的 messageCount 仍为 3、插话文本在
+    //     lastUserText、tool_result 与插话同消息）
+    //   2 cancel → settle 以 abort reject、状态回 idle
+    //   3 turn 运行中 followup → 排 next-turn，收敛后自动开新 turn 消费
+    // delayMs 把响应卡住，三个探针全部落在"turn 运行中"，时序确定。
+    needsLog: true,
+    setup: (dir) => writeFileSync(join(dir, "greeting.txt"), "steer-me"),
+    runs: [{ midturn: { prompt: "Read greeting.txt and summarize it.", steer: "MIDTURN-STEER: also check the weather." } }],
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }], delayMs: 250 },
+          { text: "greeting.txt says steer-me; mid-turn note acknowledged." },
+          { text: "never delivered (cancelled)", delayMs: 250 },
+          { text: "phase three a done.", delayMs: 250 },
+          { text: "phase three b done." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      check("5 main requests (phase1: 2 + phase2 aborted: 1 + phase3: 2)", reqs.length === 5);
+      check("phase1: status running while request held by delayMs", samples["phase1-status"] === "running");
+      check("phase1: steer merged into the tool_result batch (messageCount stays 3)",
+        reqs[1]?.messageCount === 3);
+      check("phase1: steer text visible in the batch's text block (lastUserText)",
+        typeof reqs[1]?.lastUserText === "string" && reqs[1].lastUserText.includes("MIDTURN-STEER"));
+      check("phase1: tool result present in the same message", (reqs[1]?.toolResults || []).length === 1);
+      check("phase1: idle after turn", samples["phase1-after"] === "idle");
+      check("phase2: cancel rejects the awaiter with abort", samples["phase2-aborted"] === "true");
+      check("phase2: back to idle after cancel", samples["phase2-status"] === "idle");
+      check("phase3: followup queued while running", samples["phase3-followup-status"] === "running");
+      check("phase3: queued followup opened its own turn (req5 lastUserText, a fresh user message)",
+        typeof reqs[4]?.lastUserText === "string" && reqs[4].lastUserText.includes("phase three b")
+        && reqs[4]?.messageCount === 7);
+      check("phase3: idle after drain", samples["phase3-after"] === "idle");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1234,6 +1281,52 @@ if (s.runs) {
         const a = new agentMod.Agent({ permissionMode: r.mode || "default" });
         a.setConfirmFn(async () => r.confirm);
         await a.chat(r.prompt);
+        if (a.close) await a.close();
+      } else if (r.midturn !== undefined) {
+        // C4：handle/inbox 行为探针。响应被 delayMs 卡住，send/followup/cancel
+        // 全部落在"turn 运行中"——时序确定，不靠竞速
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        const isAbort = (e) => e?.name === "AbortError" || String(e?.message ?? "").includes("aborted");
+        const readEvents = () => {
+          let raw2 = "";
+          try { raw2 = readFileSync(logPath, "utf-8"); } catch { return []; } // 首个请求到达前文件尚不存在
+          const lines = raw2.split("\n").filter(Boolean);
+          const events = [];
+          for (const l of lines) { try { events.push(JSON.parse(l)); } catch { /* 写到一半的行 */ } }
+          return events;
+        };
+        const waitMainReq = async (n) => {
+          for (let i = 0; i < 400; i++) {
+            if (readEvents().filter((e) => e.type === "request" && e.track === "main").length >= n) return;
+            await new Promise((r2) => setTimeout(r2, 10));
+          }
+          throw new Error(`timeout waiting for main request #${n}`);
+        };
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        // 阶段 1：mid-turn send → step 边界以 text 块并入 tool_result 批次
+        const p1 = a.chat(r.midturn.prompt);
+        await waitMainReq(1);
+        sample("phase1-status", a.status);
+        a.send(r.midturn.steer);
+        await p1;
+        sample("phase1-after", a.status);
+        // 阶段 2：cancel → settle 以 abort reject、回 idle
+        let aborted = false;
+        const p2 = a.chat("cancel me").catch((e) => { aborted = isAbort(e); });
+        await waitMainReq(3);
+        a.cancel();
+        await p2;
+        sample("phase2-aborted", aborted);
+        sample("phase2-status", a.status);
+        // 阶段 3：turn 运行中 followup → 收敛后自动开新 turn（无需外部唤醒）
+        const p3 = a.chat("phase three a");
+        await waitMainReq(4);
+        a.followup("phase three b");
+        sample("phase3-followup-status", a.status);
+        await p3;
+        sample("phase3-after", a.status);
+        await a.whenIdle();
         if (a.close) await a.close();
       } else {
         await mod.runCli(r.argv);

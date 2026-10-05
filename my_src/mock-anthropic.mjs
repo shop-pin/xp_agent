@@ -14,6 +14,8 @@
 //   optional per-turn { "failWith": { "status": 429 } }  -> respond with that HTTP
 //     error (Anthropic error body) instead of the scripted message; the counter
 //     still advances, so the client's RETRY lands on the next turn.
+//   optional per-turn { "delayMs": N }  -> hold the response N ms before serving
+//     (widens the "turn is running" window for handle/inbox probes).
 //
 // Every request is appended to MOCK_LOG (JSONL) as an event the tests assert on.
 
@@ -76,6 +78,9 @@ export function startMock({ scenario, logPath } = {}) {
   let reqIndex = 0;
 
   const server = createServer((req, res) => {
+    // C4：客户端 abort（cancel 探针）后响应写出会打到已销毁的 socket——
+    // 没有这个防护，res 的 error 事件没人接，mock 进程直接崩
+    res.on("error", () => {});
     if (req.method !== "POST" || !req.url.startsWith("/v1/messages")) {
       res.writeHead(404); res.end("not found"); return;
     }
@@ -160,6 +165,10 @@ export function startMock({ scenario, logPath } = {}) {
         res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify(err)); return;
       }
       counters[track] = turnIndex + 1;
+
+      // C4：可选延迟——把响应卡住，让"turn 运行中"的窗口变宽（handle/inbox
+      // 场景的 send/followup/cancel 探针在延迟期内落子，时序确定不靠竞速）
+      if (turn.delayMs) await new Promise((r) => setTimeout(r, turn.delayMs));
 
       // Injected failure (ch20 retry tests): the counter advanced above, so the
       // client's retry lands on the NEXT turn — exactly like a real server.

@@ -206,12 +206,19 @@
 | A0 | ✅ 完成（2026-10-03） | `dsh-A0.md`：三个核心思想实物证据 + turn flow 草图 + 自测题 |
 | B1 | ✅ 完成（2026-10-03） | `dsh-B1.md`；cordis/context.ts + service.ts；框架测试 10/10 |
 | B2 | ✅ 完成（2026-10-03） | `dsh-B2.md`；fiber/registry/hooks + ctx.plugin()；**语义修正：全树共享服务表、provide 冲突抛错**（B1 测试/文档同步修正）；框架测试 22/22 |
-| B3 | 未开始（下次从这继续） | effect 模型：ctx.effect / fiber.dispose / 级联卸载 |
-| B4..B6 | 未开始 | — |
-| C1..C8 | 未开始 | — |
+| B3 | ✅ 完成（2026-10-04） | `dsh-B3.md`；ctx.effect / fiber.dispose 级联卸载 / apply 回滚；框架测试 32/32 |
+| B4 | ✅ 完成（2026-10-04） | `dsh-B4.md`；events.ts 五类派发 + fiber 持有监听器（卸载即摘除）；框架测试 42/42 |
+| B5 | ✅ 完成（2026-10-04） | `dsh-B5.md`；scope.ts 分层注册表 + nearest-wins；isolate/intercept 讲原理略实现；框架测试 51/51 |
+| B6 | ✅ 完成（2026-10-04） | `dsh-B6.md`；loader.ts 行合并 + 树 dump；B 阶段总验收（配置行增删即增删能力）；框架测试 59/59 |
+| C1 | ✅ 完成（2026-10-04） | `dsh-C1.md`；ctx.tools 注册表 + 内置工具迁插件（core-fs/core-exec/core-agent），executeTool switch 消亡；cordis 66/66 |
+| C2 | ✅ 完成（2026-10-04） | `dsh-C2.md`；pre-execute 瀑布 + approval seam + 单调 guard（deny 不可翻案）；cordis 76/76 |
+| C3 | ✅ 完成（2026-10-04） | `dsh-C3.md`；SessionLog 八类事件 + derive 纯投影 + pushUser/pushAssistant 双写入口；cordis 84/84、mock 22/22；请求体逐字节等价 |
+| C4 | ✅ 完成（2026-10-05） | `dsh-C4.md`；Inbox 双队列 + claim / AgentHandle（send/followup/steer/cancel/whenIdle，三态）/ AgentRegistry；runAgentLoop→runStepLoop（step 边界认领插话）；排空循环取代 wake/latch（请求体等价论证见章内）；场景 27（mid-turn 探针）；cordis 89/89、mock 23 场景全绿；建议 commit：`add agent handle and inbox with claim-driven turn loop` |
+| C5 | 未开始（下次从这继续） | 循环事件化 ★大章：pre-step/turn-stopping/turn-end 埋点 + autonomy 插件第一版 |
+| C6..C8 | 未开始 | — |
 | D1..D6 | 未开始 | — |
 | E1..E3 | 未开始 | — |
 
 > 约定：每章完成时在本表打勾，并在 `my_docs/dsh-<n>.md` 末尾附"翻车记档 + 自测题"。
 > 模式（2026-10-03 起）：每章 = Claude 写讲解 md → 自动实现代码 → 验证（cordis 测试 + 22 mock 回归）→ 复查文档 → 给 commit comment（用户自己提交）→ 问是否开下一章。
-> 已交付 commit：A0 `add dsh migration plan, chapter roadmap, and phase-A immersion notes`；B1 `add mini-cordis service container with proxy context and declaration merging`；B2 `add mini-cordis plugin fibers with lifecycle states and provide notification`。
+> 已交付 commit：A0 `add dsh migration plan, chapter roadmap, and phase-A immersion notes`；B1 `add mini-cordis service container with proxy context and declaration merging`；B2 `add mini-cordis plugin fibers with lifecycle states and provide notification`；B3 `add mini-cordis effect model with cascade disposal and apply rollback`；B4 `add mini-cordis event bus with five dispatch modes and fiber-owned listeners`；B5 `add mini-cordis scope primitive with layered registries and nearest-wins resolution`；B6 `add mini-cordis config loader with row merging and tree dump`；C1 `add mini-cordis tools registry and migrate tool execution to plugins`；C2 `add tool execution pipeline with monotonic approval waterfall`；C3 `add session event log with pure derive projection and dual-write message entry`。
