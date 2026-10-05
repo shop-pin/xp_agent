@@ -162,6 +162,66 @@ finally 为什么必须在 pursueGoal：abort（SIGINT）从 runStepLoop 直接�
 1. **runner 分支各管各的助手**：goalImpossible 分支用了 `sample` 但没定义——midturn/events 分支各自定义了自己的 sample，复制分支时只带了调用没带定义。三个分支三份本地助手已是坏味道，D6 加 schedule 探针时该提到 runner 顶层共享。
 2. **plugin config 的类型推导断在 ctx.plugin 边界**：`evaluate: (condition) => ...` 报 implicit any——`ctx.plugin(P, config)` 的 config 形参是 unknown（B2 的宽签名），GoalBridge 的类型进不去箭头函数参数。显式标注 `(condition: string)` 即可。教训：跨插件边界的回调参数永远显式标类型，别指望结构化推导。
 
-## 8. 下一段预告（C5 第三段：loop 迁移 + 失败补全）
+## 8. 第三段：loop 迁移 + 失败补全（章收官）
 
-runLoopInterval/runLoopDynamic → autonomy 插件监听器（interval 用 setTimeout 雏形，dynamic 的 schedule_wakeup 字段协议保留、D6 换 ctx.schedule）；step 抛错时为每个无果 tool/call 补 isError 的 tool/result（ToolCallRecovery 简化版）；autonomy.ts 收口（goal + loop 同插件）。危险点：interruptibleSleep 与 cancel 的竞态（场景 24 的 stopLoopAfterMs 探针会盯）。
+### 8.1 loop 的驱动形状：while 化进事件对
+
+goal 的续命是"当前 turn 停不停"；loop 相反——它要的是"**何时开下一个全新 turn**"。所以 loop 不挂 turn-stopping（那时 turn 已注定收敛，挽留没有意义），挂的是 **turn-end**：
+
+```
+runLoop: 解析 → intro → [dynamic: schedule_wakeup 上广告] → chat(tick 1) → await done
+                                                                              │
+   ┌──────────────────────────────────────────────────────────────────────────┘
+   ▼
+turn-end 监听器（每个 tick 收敛点）:
+   stopFlag? → "Loop stopped." + finish
+   dynamic 且无 wakeup → "converged" + finish
+   预算 / --max-ticks / LOOP_MAX → 停机 + finish
+   否则 → setTimeout(delay) → fire: wake(tick 指令) ──► inbox next-turn ──► 排空循环跑 tick ──► 又到 turn-end
+```
+
+旧 `runLoopInterval`/`runLoopDynamic` 的两个 while 与 `interruptibleSleep`（200ms 轮询的可中断睡眠）消亡；"睡眠"变成一个可 `clearTimeout` 的定时器，`interruptibleSleep` 与 cancel 的竞态问题随之消失——**轮询是给不可打断的等待模拟打断，定时器本来就可打断**。
+
+与 goal 同律的三分：LoopService（`ctx.loop`）持状态（spec/iterations/prompt/timer/done-deferred/pendingWakeup）；turn-end 监听器做决策；runLoop 管生命周期（首 tick + finally 摘工具清状态）。schedule_wakeup 工具的执行守卫从 Agent 私有布尔（`scheduleWakeupEnabled`）变成服务查询（`loop.wakeupEnabled`）。
+
+**done-悬挂陷阱（本段最重要的设计决策）**：tick N 的驱动若失败（abort/异常），turn-end 永远不会触发——`await done` 悬挂。双保险：① `cancel → stopLoop → service.stop()`（定时器期立即 finish，turn 期由监听器收尾）；② **bridge.wake 返回 settle promise**，定时器回调里 `void wake(...).catch(e => finish())`——tick 驱动的任何失败都在插件侧闭环。wake 若做成纯 fire-and-forget（把 catch 折进 Agent），循环状态就漏进了通用原语——D6 的 ctx.schedule 会复用 wake，那时耦合就是债。
+
+### 8.2 失败补全（ToolCallRecovery 简化版）
+
+C3 起的历史污染隐患：assistant 已结算 tool_use 批次、而批后代码（注记/推送）抛出非工具错误时，异常上抛、**批次留在历史里没有 tool_result**——之后每个请求都 400。单工具的 try/catch 罩不住批后注记这类位置。第三段给整批加外层护栏：**为每个无果 tool_use 补 `Tool call not executed: step failed (...)` 的 isError tool_result、pushUser 后原样上抛**——错误照报（调用方的 catch 语义不变），历史不留孤儿。场景 30 用注入的注记异常验证：两个 tool_use 的批次在批后注记处炸掉，下一请求里两个调用都有回应（真实结果 + 补齐的错误结果并存）。
+
+dsh 对照：真框架的 ToolCallRecovery 监听 session 事件流做恢复（工具并行执行、恢复点更多）；mini 的简化版只在批次边界兜底——覆盖面小一档，但"**无孤儿**"这条不变式与验收口径一致。
+
+### 8.3 autonomy 收口
+
+goal + loop 合并为单一 `autonomyPlugin`（本文件第三段起 plugins/autonomy.ts 是唯一自主性插件；plan 的循环行为在 C2/C5-1 已机制化，无需监听器）。桥收窄为一张表：
+
+| 桥 | 用途 | C6/D6 去向 |
+|---|---|---|
+| `evaluate(condition)` | goal 评估器（SDK 直调 + 读 messages） | C6 → `llm.sideCall` |
+| `getBudget()` | goal/loop 共用的预算检查 | D6 → 服务 |
+| `getMaxTurns()` | loop 的 --max-turns tick 上限 | D6 |
+| `wake(text)` | tick 注入：inbox next-turn + 唤醒驱动，**返回 settle promise** | D6 → ctx.schedule/due |
+
+### 第三段实现与验证记录
+
+**文件**：`plugins/autonomy.ts`（重写：LoopService + turn-end 监听器 + scheduleTick + goal/loop 合一）；`agent.ts`（runLoop 收缩为首 tick + await done、runLoopInterval/runLoopDynamic/interruptibleSleep/executeScheduleWakeup 与 loopStop/pendingWakeup/scheduleWakeupEnabled 字段消亡、schedule_wakeup 走服务、批次外层护栏）；`cordis-tests/c5-goal.test.ts`（桥扩容适配）；`run-mock.mjs`（场景 30 + recovery runner）。
+
+**验证**：cordis **97/97**；mock **26 场景全绿**——场景 24（interval 真 1 秒定时 × 2 tick 上限、dynamic 唤醒 5s→60s 钳制 + 400ms 打断、广告门控三态）请求序列与断言原样通过 = loop 迁移逐字节等价；新场景 30 锚失败补全（错误逃逸 + 两 tool_use 均有回应 + 真实结果存活 + 回 idle）。
+
+**翻车记档**（第三段）：
+1. **最顺的一段，但有一个设计期自救**：wake 的错误处理第一反应是折进 Agent（catch 里顺手 stopLoop）——写桥表时发现这会把 loop 状态泄漏进通用原语。改法：wake 返回 settle promise，定时器回调自管 catch → finish。教训与第二段的"所有权三分"同源：**回调里的 catch 是谁的状态，就由谁那一侧收**。
+2. **`await chat` 与 `await done` 的顺序依赖**：turn-end 监听器在 chat 的 settle **之前**运行（endTurn 在 drain 检查前发事件），所以 done 可能在 chat resolve 前就已 resolve（收敛场景）——`await chat; await done` 顺序无所谓，靠的是 finish 幂等（state 判空 + done 可重复调）。任何"先 A 后 B"的 await 链在这种事件驱动结构里都要问一句：回调可能比 awaiter 先跑完吗？
+
+## 9. 章验收对照（C5 完结）
+
+| 验收项（roadmap） | 结果 |
+|---|---|
+| plan/goal/loop/auto 全部场景绿 | 26 场景全绿（含 10/25 plan、15 goal+auto、24 loop、21 压缩） |
+| goal 评估 reject → turn/end 带 blocked | 场景 29：impossible → 注记恰为 `blocked` |
+| 循环埋点三事件 + turn/end reason | 场景 28（序列采样）+ 词汇表六词 |
+| contextCleared 消亡 | 场景 10/25 的 clear-and-execute 断言原样通过 |
+| 失败补全 | 场景 30 |
+| `contextCleared` 布尔、mode 状态机分支消亡 | 布尔已删；mode 的循环内分支清零（plan 只读契约在 C2、退出在 conclusion） |
+
+**C5 留给后章的债**：goal/loop 评估器与分类器的 SDK 直调（C6 收进 llm 服务）；schedule_wakeup 字段协议与裸 setTimeout（D6 换 ctx.schedule）；turn 注记的 per-request 粒度 vs dsh 的 turn/step 分层（D5/C8 重放时再对齐）。

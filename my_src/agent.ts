@@ -10,7 +10,7 @@ import { coreExecTools } from "./plugins/core-exec-tools.js";
 import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
-import { goalPlugin, GoalService } from "./plugins/autonomy.js";
+import { autonomyPlugin, GoalService, LoopService } from "./plugins/autonomy.js";
 import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
@@ -21,7 +21,7 @@ import {
     goalDirective, GOAL_EVALUATOR_SYSTEM, GOAL_TRANSCRIPT_FRAMING, goalJudgeUserMessage,
     parseGoalVerdict, type GoalVerdict,
     parseLoopInput, isDailyWording, OFFER_CLOUD_THRESHOLD_SECONDS,
-    SCHEDULE_WAKEUP_TOOL, clampWakeupDelay, dynamicLoopDirective, LOOP_MAX_ITERATIONS, type LoopSpec,
+    SCHEDULE_WAKEUP_TOOL, clampWakeupDelay, dynamicLoopDirective,
     loadAutoModeRules, buildClassifierSystem, buildClassifierTranscript, classifierUserMessage,
     parseBlockVerdict, AUTO_MODE_FAST_PATH_TOOLS, DENIAL_LIMITS,
 } from "./autonomy.js";
@@ -134,11 +134,7 @@ export class Agent implements AgentHandle {
     private sessionMemoryBytes = 0;
 
     // /loop dynamic——模型调 schedule_wakeup 时写入，loop 驱动在 turn 收敛后读取并清空
-    private pendingWakeup: { delaySeconds: number; reason: string; prompt: string } | null = null;
-    private loopStop = false; // 中断时置位，跳出运行中的 loop
-    // schedule_wakeup 只在 dynamic loop 活跃期间路由到内部执行器——
-    // 防止裸调或同名外部工具
-    private scheduleWakeupEnabled = false;
+    // （C5 第三段：状态迁 ctx.loop 服务，字段消亡）
 
     constructor(options: AgentOptions = {}) {
         this.mode = options.permissionMode || "default";
@@ -155,11 +151,16 @@ export class Agent implements AgentHandle {
         // （deny 规则硬底线 + 九段静态流水线），auto 在内层（veto 链表达"auto 优先"）
         this.cordis.plugin(approvalPlugin);
         this.cordis.plugin(autoApprovalPlugin);
-        // C5 第二段：goal 追逐迁 turn-stopping 监听器（plugins/autonomy.ts）。
-        // 桥 = 评估器与预算检查（C6 llm 服务落地后收窄）
-        this.cordis.plugin(goalPlugin, {
+        // C5：autonomy 插件（goal 的 turn-stopping 挽留 + loop 的 turn-end 调度）。
+        // 桥 = 评估器/预算/tick 上限/wake（C6 llm 服务落地后收窄）
+        this.cordis.plugin(autonomyPlugin, {
             evaluate: (condition: string) => this.evaluateGoal(condition),
             getBudget: () => this.checkBudget(),
+            getMaxTurns: () => this.maxTurns,
+            wake: (text: string) => {
+                this.inbox.append("next-turn", text);
+                return this.ensureDriver();
+            },
         });
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
@@ -757,7 +758,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     // *要不要*继续，/loop 决定*何时*开下一轮——固定间隔，或主模型经
     // schedule_wakeup 自选节奏。
 
-    /** /loop 入口：解析输入，然后驱动对应模式。输入非法时直接返回。 */
+    /** /loop 入口：解析 + 首 tick + 等整条 tick 链收敛。tick 间调度在 autonomy
+     *  插件的 turn-end 监听器（检查 → 定时 → wake 注入 inbox，排空循环跑下一个
+     *  tick）——C5 第三段起 while 驱动消亡。输入非法时直接返回。 */
     async runLoop(rawInput: string): Promise<void> {
         const spec = parseLoopInput(rawInput);
         if ("error" in spec) {
@@ -772,108 +775,38 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             printInfo("(Real Claude Code would offer to convert this to a persistent cloud schedule that keeps running after the session ends. This teaching build has no cloud backend — continuing in-session.)");
         }
 
-        this.loopStop = false;
+        const loop = this.cordis.require<LoopService>("loop");
+        const done = loop.start(spec);
         if (spec.mode === "interval") {
-            await this.runLoopInterval(spec);
+            printInfo(`⟳ /loop scheduled every ${spec.intervalLabel} (session-only, not persisted — dies when this process exits). Ctrl+C to stop.`);
+            printInfo(`⟳ loop tick 1`);
         } else {
-            await this.runLoopDynamic(spec);
+            // schedule_wakeup 只在 dynamic loop 期间广告（场景 24 的门控锚）
+            this.setScheduleWakeupToolVisible(true);
+            printInfo("⟳ /loop dynamic (self-paced) — the model schedules its own next run, or ends the loop. Ctrl+C to stop.");
         }
-    }
-
-    /** interval 模式：每 N 秒重跑 prompt，直到中断或迭代上限。 */
-    private async runLoopInterval(spec: LoopSpec): Promise<void> {
-        printInfo(`⟳ /loop scheduled every ${spec.intervalLabel} (session-only, not persisted — dies when this process exits). Ctrl+C to stop.`);
-        let iterations = 0;
-        while (!this.loopStop) {
-            iterations++;
-            printInfo(`⟳ loop tick ${iterations}`);
-            await this.chat(spec.prompt);
-
-            const budget = this.checkBudget();
-            if (budget.exceeded) { printInfo(`Loop stopped: ${budget.reason}`); break; }
-            // --max-turns 同时约束 loop tick：checkBudget 的轮计数只在工具轮增长，
-            // 纯文本循环永远撞不到它——这里把 --max-turns 当 tick 上限用
-            if (this.maxTurns !== null && iterations >= this.maxTurns) {
-                printInfo(`Loop stopped: tick limit reached (${iterations} >= ${this.maxTurns}).`);
-                break;
-            }
-            if (iterations >= LOOP_MAX_ITERATIONS) {
-                printInfo(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
-                break;
-            }
-            if (await this.interruptibleSleep(spec.intervalSeconds! * 1000)) { printInfo("Loop stopped."); break; }
-        }
-    }
-
-    /** dynamic 模式：跑一轮 tick，然后主模型经 schedule_wakeup 自排。
-     *  排了唤醒→等（钳过的）延迟，用它回传的 prompt 再跑；没排→收敛。
-     *  schedule_wakeup 只在 loop 期间暴露，退出时摘掉。 */
-    private async runLoopDynamic(spec: LoopSpec): Promise<void> {
-        printInfo("⟳ /loop dynamic (self-paced) — the model schedules its own next run, or ends the loop. Ctrl+C to stop.");
-        const hadTool = this.tools.some(t => t.name === "schedule_wakeup");
-        if (!hadTool) this.tools = [...this.tools, SCHEDULE_WAKEUP_TOOL];
-        this.scheduleWakeupEnabled = true;
-        let prompt = spec.prompt;
-        let iterations = 0;
         try {
-            while (!this.loopStop) {
-                iterations++;
-                this.pendingWakeup = null;
-                await this.chat(dynamicLoopDirective(prompt));
-
-                if (!this.pendingWakeup) {
-                    printInfo(`⟳ Loop converged after ${iterations} tick${iterations === 1 ? "" : "s"} (model scheduled no wakeup).`);
-                    break;
-                }
-                const budget = this.checkBudget();
-                if (budget.exceeded) { printInfo(`Loop stopped: ${budget.reason}`); break; }
-                if (this.maxTurns !== null && iterations >= this.maxTurns) {
-                    printInfo(`Loop stopped: tick limit reached (${iterations} >= ${this.maxTurns}).`);
-                    break;
-                }
-                if (iterations >= LOOP_MAX_ITERATIONS) {
-                    printInfo(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
-                    break;
-                }
-                const { delaySeconds, reason, prompt: nextPrompt } = this.pendingWakeup;
-                printInfo(`⟳ next run in ${delaySeconds}s — ${reason}`);
-                prompt = nextPrompt || prompt;
-                if (await this.interruptibleSleep(delaySeconds * 1000)) { printInfo("Loop stopped."); break; }
-            }
+            // tick 1 走 chat（followup 语义）；后续 tick 由监听器定时 wake 注入
+            await this.chat(spec.mode === "dynamic" ? dynamicLoopDirective(spec.prompt) : spec.prompt);
+            await done;
         } finally {
-            // schedule_wakeup 摘掉，别在 loop 之外继续暴露
-            if (!hadTool) this.tools = this.tools.filter(t => t.name !== "schedule_wakeup");
-            this.scheduleWakeupEnabled = false;
-            this.pendingWakeup = null;
+            // 任何出口（收敛/上限/中断/异常）摘工具清状态——旧版同一纪律
+            if (spec.mode === "dynamic") this.setScheduleWakeupToolVisible(false);
+            loop.finish();
         }
     }
 
-    /** schedule_wakeup 执行器：把请求的唤醒记下来，loop 驱动在 turn 收敛后读取。
-     *  延迟钳到 [60, 3600]。 */
-    private executeScheduleWakeup(input: Record<string, any>): string {
-        const delaySeconds = clampWakeupDelay(Number(input.delaySeconds));
-        const reason = typeof input.reason === "string" ? input.reason : "";
-        const prompt = typeof input.prompt === "string" ? input.prompt : "";
-        this.pendingWakeup = { delaySeconds, reason, prompt };
-        return `Wakeup scheduled in ${delaySeconds}s. The loop will resume then; end your turn now.`;
+    /** dynamic loop 的 schedule_wakeup 广告开关（幂等）。 */
+    private setScheduleWakeupToolVisible(on: boolean): void {
+        const has = this.tools.some((t) => t.name === "schedule_wakeup");
+        if (on && !has) this.tools = [...this.tools, SCHEDULE_WAKEUP_TOOL];
+        if (!on && has) this.tools = this.tools.filter((t) => t.name !== "schedule_wakeup");
     }
 
-    /** 可中断睡眠：loopStop 置位时提前返回 true，避免中断后还干等长间隔。 */
-    private interruptibleSleep(ms: number): Promise<boolean> {
-        return new Promise((resolve) => {
-            const start = Date.now();
-            const tick = () => {
-                if (this.loopStop) return resolve(true);
-                if (Date.now() - start >= ms) return resolve(false);
-                setTimeout(tick, Math.min(200, ms));
-            };
-            tick();
-        });
-    }
-
-    /** 停止运行中的 /loop（REPL 中断处理调用）。 */
+    /** 停止运行中的 /loop（REPL 中断处理经 cancel 调用）：定时器等待期立即
+     *  收尾；turn 进行中由 turn-end 监听器见到标志收尾。 */
     stopLoop(): void {
-        this.loopStop = true;
+        this.cordis.get<LoopService>("loop")?.stop();
     }
 
     /** 停止运行中的 /goal（REPL 中断处理经 cancel 调用；监听器见到标志不再续命）。 */
@@ -1144,46 +1077,61 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             let toolResult: Anthropic.ToolResultBlockParam[] = [];
             let conclusion: TurnConclusion | null = null;
-            for (const tu of toolUses) {
-                // 单工具全包 try/catch：任何意外抛错（畸形 input 打崩 UI 渲染、落盘
-                // 失败等）都转成 error tool_result 回灌。否则异常逃出循环时历史里
-                // 挂着无回应的 tool_use，之后每个请求都 400（历史永久污染）
-                let output: string;
-                try {
-                    printToolCall(tu.name, tu.input as Record<string, any>);
-                    this.sessionLog.append({ type: "tool/call", id: tu.id, name: tu.name, input: tu.input as Record<string, any> });
-                    // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
-                    // → 审批 → dispatch → post-execute）。auto 的分类器机制仍在
-                    // 本类，经 autoAdjudicate 句柄被 auto 监听器调用
-                    const outcome = await this.cordis.require<ToolsService>("tools").executeCall(
-                        { name: tu.name, input: tu.input as Record<string, any>, mode: this.mode, planFilePath: this.planFilePath || undefined },
-                        {
-                            readFileState: this.readFileState,
-                            dispatch: (n, i) => this.executeToolCall(n, i),
-                            autoAdjudicate: (n, i) => this.classifyToolCall(n, i),
-                        },
-                    );
-                    if (outcome.kind === "denied") {
-                        if (outcome.announce) printInfo(`Denied: ${outcome.announce}`);
-                        toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: outcome.content });
-                        this.sessionLog.append({ type: "tool/result", callId: tu.id, content: outcome.content, isError: true });
-                        continue;
+            try {
+                for (const tu of toolUses) {
+                    // 单工具全包 try/catch：任何意外抛错（畸形 input 打崩 UI 渲染、
+                    // 落盘失败等）都转成 error tool_result 回灌。否则异常逃出循环时
+                    // 历史里挂着无回应的 tool_use，之后每个请求都 400（历史永久污染）
+                    let output: string;
+                    try {
+                        printToolCall(tu.name, tu.input as Record<string, any>);
+                        this.sessionLog.append({ type: "tool/call", id: tu.id, name: tu.name, input: tu.input as Record<string, any> });
+                        // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
+                        // → 审批 → dispatch → post-execute）。auto 的分类器机制仍在
+                        // 本类，经 autoAdjudicate 句柄被 auto 监听器调用
+                        const outcome = await this.cordis.require<ToolsService>("tools").executeCall(
+                            { name: tu.name, input: tu.input as Record<string, any>, mode: this.mode, planFilePath: this.planFilePath || undefined },
+                            {
+                                readFileState: this.readFileState,
+                                dispatch: (n, i) => this.executeToolCall(n, i),
+                                autoAdjudicate: (n, i) => this.classifyToolCall(n, i),
+                            },
+                        );
+                        if (outcome.kind === "denied") {
+                            if (outcome.announce) printInfo(`Denied: ${outcome.announce}`);
+                            toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: outcome.content });
+                            this.sessionLog.append({ type: "tool/result", callId: tu.id, content: outcome.content, isError: true });
+                            continue;
+                        }
+                        // C5：工具自结 turn（plan 的 clear-and-execute 是第一个签发者）。
+                        // 工具输出不进 tool_result 批次（dropBatch：历史已清，批次会
+                        // 孤儿化 → 400），注入文本排 next-turn，drain 循环开新 turn——
+                        // 首条消息的 reminder 待遇由 runOneTurn 统一给
+                        if (outcome.conclusion) {
+                            conclusion = outcome.conclusion;
+                            break;
+                        }
+                        output = this.persistLargeResult(tu.name, outcome.output);
+                    } catch (e: any) {
+                        output = `Tool execution failed: ${e?.message ?? e}`;
+                        this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output, isError: true });
                     }
-                    // C5：工具自结 turn（plan 的 clear-and-execute 是第一个签发者）。
-                    // 工具输出不进 tool_result 批次（dropBatch：历史已清，批次会
-                    // 孤儿化 → 400），注入文本排 next-turn，drain 循环开新 turn——
-                    // 首条消息的 reminder 待遇由 runOneTurn 统一给
-                    if (outcome.conclusion) {
-                        conclusion = outcome.conclusion;
-                        break;
-                    }
-                    output = this.persistLargeResult(tu.name, outcome.output);
-                } catch (e: any) {
-                    output = `Tool execution failed: ${e?.message ?? e}`;
-                    this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output, isError: true });
+                    toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
+                    this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output });
                 }
-                toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: output });
-                this.sessionLog.append({ type: "tool/result", callId: tu.id, content: output });
+            } catch (e: any) {
+                // 失败补全（dsh ToolCallRecovery 简化版）：批次被非工具错误中断时，
+                // 为每个无果 tool_use 补 isError 的 tool_result 再上抛——错误照报，
+                // 历史不留孤儿（否则之后每个请求都 400）
+                for (const tu of toolUses) {
+                    if (!toolResult.some((r) => r.tool_use_id === tu.id)) {
+                        const content = `Tool call not executed: step failed (${e?.message ?? e})`;
+                        toolResult.push({ type: "tool_result", tool_use_id: tu.id, content });
+                        this.sessionLog.append({ type: "tool/result", callId: tu.id, content, isError: true });
+                    }
+                }
+                this.pushUser(toolResult);
+                throw e;
             }
             if (conclusion) {
                 if (!conclusion.dropBatch && toolResult.length > 0) {
@@ -1206,10 +1154,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (name === "agent") return this.executeAgentTool(input);
         if (name === "skill") return this.executeSkillTool(input);
         if (name === "schedule_wakeup") {
-            // 只有 dynamic loop 驱动才路由到这里；loop 之外工具不广告，
+            // 只有 dynamic loop 活跃期才路由到这里；loop 之外工具不广告，
             // 这道守卫挡住模型裸调或同名外部工具
-            if (!this.scheduleWakeupEnabled) return "schedule_wakeup is only available during /loop dynamic mode.";
-            return this.executeScheduleWakeup(input);
+            const loop = this.cordis.require<LoopService>("loop");
+            if (!loop.wakeupEnabled) return "schedule_wakeup is only available during /loop dynamic mode.";
+            const delaySeconds = clampWakeupDelay(Number(input.delaySeconds));
+            const reason = typeof input.reason === "string" ? input.reason : "";
+            const prompt = typeof input.prompt === "string" ? input.prompt : "";
+            loop.recordWakeup({ delaySeconds, reason, prompt });
+            return `Wakeup scheduled in ${delaySeconds}s. The loop will resume then; end your turn now.`;
         }
         if (name.startsWith("mcp__")) {
             // server 掉线/名字拆错等——作为 tool_result 回给模型自行处置，不在主循环里炸

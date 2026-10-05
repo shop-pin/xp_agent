@@ -5,7 +5,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '../cordis/context.js'
-import { goalPlugin, GoalService, type GoalBridge } from '../plugins/autonomy.js'
+import { autonomyPlugin, GoalService, type AutonomyBridge } from '../plugins/autonomy.js'
 import type { GoalVerdict } from '../autonomy.js'
 
 function rig(verdicts: GoalVerdict[], budget = { exceeded: false, reason: '' }) {
@@ -13,11 +13,13 @@ function rig(verdicts: GoalVerdict[], budget = { exceeded: false, reason: '' }) 
   let i = 0
   const steered: string[] = []
   const blocks: (string | undefined)[] = []
-  const bridge: GoalBridge = {
+  const bridge: AutonomyBridge = {
     evaluate: async () => verdicts[Math.min(i++, verdicts.length - 1)],
     getBudget: () => budget,
+    getMaxTurns: () => null,
+    wake: async () => {},
   }
-  ctx.plugin(goalPlugin, bridge)
+  ctx.plugin(autonomyPlugin, bridge)
   const goal = ctx.get<GoalService>('goal')!
   const fire = () => ctx.serial('agent/turn-stopping', {
     steer: (t: string) => steered.push(t),

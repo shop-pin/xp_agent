@@ -1280,6 +1280,48 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "30": {
+    // C5 第三段：失败补全（ToolCallRecovery 简化版）。两个 tool_use 的批次在
+    // 批后注记处被非工具错误打断 → 护栏补齐无果 tool_use 的 error tool_result
+    // 后上抛——错误照报、历史不留孤儿（下一请求两 tool_use 均有回应）。
+    needsLog: true,
+    setup: (dir) => {
+      writeFileSync(join(dir, "a.txt"), "alpha");
+      writeFileSync(join(dir, "b.txt"), "beta");
+    },
+    runs: [{ recovery: true }],
+    tracks: {
+      main: {
+        turns: [
+          {
+            tools: [
+              { name: "read_file", input: { file_path: "a.txt" } },
+              { name: "read_file", input: { file_path: "b.txt" } },
+            ],
+          },
+          { text: "Recovered; both files accounted for." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      check("2 main requests (interrupted turn + recovery follow-up)", reqs.length === 2);
+      check("the injected error still escaped to the caller", samples["recovery-error-escaped"] === "annotation exploded");
+      check("no orphan tool_use: both calls answered in the next request",
+        (reqs[1]?.toolResults || []).length === 2);
+      check("the un-run tool got an error tool_result",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("Tool call not executed: step failed")));
+      check("the executed tool's real result survived",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("alpha")));
+      check("driver idle after recovery", samples["recovery-status"] === "idle");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1444,6 +1486,35 @@ if (s.runs) {
         const ends = a.sessionLog.events.filter((e) => e.type === "turn/end").map((e) => e.reason);
         sample("goal-end-reasons", ends.join(","));
         sample("goal-idle", a.status);
+        if (a.close) await a.close();
+      } else if (r.recovery !== undefined) {
+        // C5 第三段：失败补全（ToolCallRecovery 简化版）。两个 tool_use 的批次，
+        // 在第一个工具的批后注记处注入异常（per-tool catch 罩不住的位置）——
+        // 外层护栏应补齐第二个工具的 error tool_result 后上抛；下一请求的历史
+        // 无孤儿（两个 tool_use 都有回应）
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const a = new agentMod.Agent();
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        const log = a.sessionLog;
+        const orig = log.append.bind(log);
+        let armed = true;
+        log.append = (e) => {
+          // 第一个成功 tool/result 注记（isError 无标记）= 批次进行中的位置
+          if (armed && e.type === "tool/result" && e.isError === undefined) {
+            armed = false;
+            throw new Error("annotation exploded");
+          }
+          return orig(e);
+        };
+        let escaped = "";
+        try {
+          await a.chat("read both files");
+        } catch (e) {
+          escaped = String(e?.message ?? e);
+        }
+        sample("recovery-error-escaped", escaped);
+        await a.chat("continue");
+        sample("recovery-status", a.status);
         if (a.close) await a.close();
       } else {
         await mod.runCli(r.argv);

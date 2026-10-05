@@ -1,35 +1,39 @@
-// plugins/autonomy.ts——C5 第二段：goal 迁移（autonomy 第一版）。
-// 参照物：runtime-types.ts 的 'agent/turn-stopping' 注释——"a listener that
-// objects steers (agent.steer(...)) and the machine re-reads its inbox"。
+// plugins/autonomy.ts——C5：自主性插件（goal + loop 监听器化，三段合流）。
+// 参照物：runtime-types.ts 的 'agent/turn-stopping'（"a listener that objects
+// steers and the machine re-reads its inbox"）与 'agent/turn-end'。
 //
-// 旧机制：pursueGoal 在 Agent 里包一层 while（chat → 评估 → 未达则再 chat）。
-// 新机制：goal 状态进 ctx.goal 服务；turn-stopping 监听器在每个 turn 收敛点
-// 评估——未达 steer 回灌 reason 续命（排空循环开新 turn），impossible 走
-// block（turn/end 注记 blocked）。pursueGoal 收缩为"首 turn + 收尾"。
+// 所有权三分（与 goal 同律）：**服务持状态、监听器做决策、入口管生命周期**——
+// pursueGoal/runLoop（Agent）负责首 turn 与 finally 收尾；abort 绕过事件监听器，
+// 清状态必须由发起方兜底。
 //
-// 所有权三分：**服务持状态、监听器做决策、pursueGoal 管生命周期**——abort
-// （SIGINT）绕过 turn-stopping，所以清状态必须由发起方在 finally 里兜底。
+// loop 的驱动形状：while 消亡，化进"turn-end 监听器（检查+定时）→ wake 注入
+// inbox → 排空循环跑下一个 tick"。interval 用裸 setTimeout 雏形；dynamic 的
+// schedule_wakeup 字段协议保留——D6 统一换 ctx.schedule 服务。
 //
-// C6 缝：evaluate/getBudget 是 Agent 借来的桥（评估器仍用 SDK 直调 + 读
-// messages）；llm.sideCall 服务落地后此桥收窄为配置一行。
+// C6 缝：AutonomyBridge 是 Agent 借来的桥（evaluate 仍 SDK 直调）——
+// llm.sideCall 落地后收窄。
 
 import { Service } from "../cordis/service.js";
 import type { Context } from "../cordis/context.js";
-import { GOAL_MAX_ITERATIONS, type GoalVerdict } from "../autonomy.js";
-import { printInfo } from "../ui.js";
+import {
+    GOAL_MAX_ITERATIONS, LOOP_MAX_ITERATIONS, dynamicLoopDirective,
+    type GoalVerdict, type LoopSpec,
+} from "../autonomy.js";
+import { printInfo, printError } from "../ui.js";
 import type { TurnStoppingState } from "../services/agents.js";
+
+function isAbortLike(e: unknown): boolean {
+    const err = e as { name?: string; message?: string };
+    return err?.name === "AbortError" || String(err?.message ?? "").includes("aborted");
+}
+
+// ---------- goal ----------
 
 export interface GoalState {
     condition: string;
     iterations: number;
     startedAt: number;
     lastReason?: string;
-}
-
-/** Agent 借给插件的桥（C6 收窄点，见文件头注释）。 */
-export interface GoalBridge {
-    evaluate(condition: string): Promise<GoalVerdict>;
-    getBudget(): { exceeded: boolean; reason: string };
 }
 
 export class GoalService extends Service {
@@ -52,10 +56,82 @@ export class GoalService extends Service {
     }
 }
 
-export const goalPlugin = {
-    name: "goal-pursuit",
-    apply(ctx: Context, bridge: GoalBridge) {
+// ---------- loop ----------
+
+export interface LoopState {
+    spec: LoopSpec;
+    iterations: number;
+    /** dynamic：当前 tick 的 prompt（wakeup 可回传新值顶替）。 */
+    prompt: string;
+    timer: ReturnType<typeof setTimeout> | null;
+    done: (() => void) | null;
+}
+
+export class LoopService extends Service {
+    state: LoopState | null = null;
+    stopFlag = false;
+    /** schedule_wakeup 工具的写入点；turn-end 监听器读走并清空。 */
+    pendingWakeup: { delaySeconds: number; reason: string; prompt: string } | null = null;
+
+    /** runLoop 的 await 锚：整条 tick 链收敛时 resolve。 */
+    start(spec: LoopSpec): Promise<void> {
+        this.stopFlag = false;
+        this.pendingWakeup = null;
+        return new Promise((resolve) => {
+            this.state = { spec, iterations: 1, prompt: spec.prompt, timer: null, done: resolve };
+        });
+    }
+
+    /** schedule_wakeup 的执行守卫：仅 dynamic loop 活跃期有效。 */
+    get wakeupEnabled(): boolean {
+        return this.state?.spec.mode === "dynamic";
+    }
+
+    recordWakeup(w: { delaySeconds: number; reason: string; prompt: string }): void {
+        this.pendingWakeup = w;
+    }
+
+    takeWakeup(): { delaySeconds: number; reason: string; prompt: string } | null {
+        const w = this.pendingWakeup;
+        this.pendingWakeup = null;
+        return w;
+    }
+
+    /** SIGINT：定时器等待期立即收尾；turn 进行中交给 turn-end 监听器。 */
+    stop(): void {
+        this.stopFlag = true;
+        if (this.state?.timer) {
+            printInfo("Loop stopped.");
+            this.finish();
+        }
+    }
+
+    finish(): void {
+        if (this.state?.timer) clearTimeout(this.state.timer);
+        this.state?.done?.();
+        this.state = null;
+        this.pendingWakeup = null;
+    }
+}
+
+// ---------- 插件 ----------
+
+/** Agent 借给插件的桥（C6 收窄点，见文件头注释）。 */
+export interface AutonomyBridge {
+    evaluate(condition: string): Promise<GoalVerdict>;
+    getBudget(): { exceeded: boolean; reason: string };
+    getMaxTurns(): number | null;
+    /** 排 next-turn 并唤醒驱动（tick 注入）。返回 settle promise，错误由调用方收。 */
+    wake(text: string): Promise<void>;
+}
+
+export const autonomyPlugin = {
+    name: "autonomy",
+    apply(ctx: Context, bridge: AutonomyBridge) {
         const goal = new GoalService(ctx, "goal");
+        const loop = new LoopService(ctx, "loop");
+
+        // goal：turn 收敛点评估——met 清状态 / impossible block / 未达 steer 续命
         ctx.on("agent/turn-stopping", async (state: TurnStoppingState) => {
             const g = goal.active;
             if (!g || goal.stopped) return;
@@ -92,11 +168,70 @@ export const goalPlugin = {
             if (goal.stopped) return;
             state.steer(`Hooks: Prompt hook condition was not met: ${verdict.reason}\n\nKeep working toward the goal.`);
         });
+
+        // loop：tick 收敛点决策——收敛/预算/上限停机，否则定时唤醒下一个 tick
+        ctx.on("agent/turn-end", () => {
+            const s = loop.state;
+            if (!s) return;
+            if (loop.stopFlag) {
+                // stop 落在 turn 进行中（定时器期由 stop() 自己收尾）
+                printInfo("Loop stopped.");
+                loop.finish();
+                return;
+            }
+            const dynamic = s.spec.mode === "dynamic";
+            const wakeup = loop.takeWakeup();
+            if (dynamic && !wakeup) {
+                printInfo(`⟳ Loop converged after ${s.iterations} tick${s.iterations === 1 ? "" : "s"} (model scheduled no wakeup).`);
+                loop.finish();
+                return;
+            }
+            const budget = bridge.getBudget();
+            if (budget.exceeded) {
+                printInfo(`Loop stopped: ${budget.reason}`);
+                loop.finish();
+                return;
+            }
+            const maxTurns = bridge.getMaxTurns();
+            if (maxTurns !== null && s.iterations >= maxTurns) {
+                printInfo(`Loop stopped: tick limit reached (${s.iterations} >= ${maxTurns}).`);
+                loop.finish();
+                return;
+            }
+            if (s.iterations >= LOOP_MAX_ITERATIONS) {
+                printInfo(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
+                loop.finish();
+                return;
+            }
+            if (dynamic) {
+                printInfo(`⟳ next run in ${wakeup!.delaySeconds}s — ${wakeup!.reason}`);
+                s.prompt = wakeup!.prompt || s.prompt;
+                scheduleTick(s, wakeup!.delaySeconds * 1000);
+            } else {
+                scheduleTick(s, s.spec.intervalSeconds! * 1000);
+            }
+        });
+
+        function scheduleTick(s: LoopState, ms: number): void {
+            s.timer = setTimeout(() => {
+                s.timer = null;
+                if (loop.state !== s || loop.stopFlag) return;
+                s.iterations++;
+                if (s.spec.mode === "interval") printInfo(`⟳ loop tick ${s.iterations}`);
+                const directive = s.spec.mode === "dynamic" ? dynamicLoopDirective(s.prompt) : s.prompt;
+                void bridge.wake(directive).catch((e) => {
+                    // tick 的驱动失败（abort/异常）——loop 收尾，runLoop 的 await 不悬挂
+                    if (!isAbortLike(e)) printError(`Loop tick failed: ${e instanceof Error ? e.message : String(e)}`);
+                    loop.finish();
+                });
+            }, ms);
+        }
     },
 };
 
 declare module "../cordis/context.js" {
     interface Context {
         goal?: GoalService;
+        loop?: LoopService;
     }
 }
