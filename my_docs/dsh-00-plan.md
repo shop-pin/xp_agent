@@ -219,8 +219,9 @@
 | C7 | ✅ 完成（2026-10-05） | `dsh-C7.md`；SystemPromptService（section 注册表 + 中央 order + {{var}} 严格插值 + assemble 两块/断点/trim）+ prompt-sections 插件（七节 + plan 节由 Agent 自注册）；buildDynamicSystemContext/getGitContext/staticSystemPrompt 消亡；**偏差记档：claude-md 不进 system（ch22 user 消息设计优先）、工具 schema 汇入=deferred 目录页**；cordis 107/107、mock 27 场景全绿；建议 commit：`add system prompt service with section registry and strict interpolation` |
 | C8 | ✅ 完成（2026-10-05，C 阶段收官） | `dsh-C8.md`；session-jsonl 插件（每事件落盘 + 半行丢弃 + 未闭合 turn 补合成 end）+ Agent.resume（derive 恢复消息 + 派生恢复 mode/cost/轮数/激活工具/goal）+ 惰性挂载防自复制；session.ts/autoSave/restoreSession 消亡；场景 4 断言变更（快照→事件流）+ 场景 32；cordis 112/112、mock 28 场景全绿；建议 commit：`add jsonl session persistence with replay resume and crash repair` |
 | D1 | ✅ 完成（2026-10-05） | `dsh-D1.md`；SkillRegistry（provider rank 竞争，user=10/project=20，回退可测）+ 目录注入迁 user message（pre-step 监听器，`<system-reminder>` 包裹，historyEmpty 只注一次；**否决传播礼仪**——inner 拒绝不翻案）；system skills 节消亡；场景 9 断言变更（正反双锚）；cordis 117/117、mock 28 场景全绿；建议 commit：`migrate skills to provider registry with user-message catalog` |
-| D2 | 未开始（下次从这继续） | MCP 插件化：mcp__ 命名纯函数 + syncTools 两代切换 |
-| — | 未开始 | D3..D6、E1..E3 | — |
+| D2 | ✅ 完成（2026-10-05） | `dsh-D2.md`；mcp-bridge 插件（publicToolName 64 字符契约 + SHA 短哈希、syncTools 两阶段换代 + squat 冲突回滚恢复、连接层迁入、惰性时机保持）；mcp.ts 删除；mcp__ 魔法名分支消亡（注册表公民）；cordis 123/123、mock 28 场景全绿（18/19 零断言变更 = 广告字节等价）；建议 commit：`migrate mcp to bridge plugin with normalized names and generation swap` |
+| D3 | 未开始（下次从这继续） | subagent 插件化：ctx.agents.create + per-agent scope（B5 红利） |
+| — | 未开始 | D4..D6、E1..E3 | — |
 | D1..D6 | 未开始 | — |
 | E1..E3 | 未开始 | — |
 

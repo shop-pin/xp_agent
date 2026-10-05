@@ -23,7 +23,7 @@ import { promptSectionsPlugin, SECTION_ORDERS } from "./plugins/prompt-sections.
 import { type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
-import { McpManager } from "./mcp.js";
+import { mcpBridgePlugin, McpBridge } from "./plugins/mcp-bridge.js";
 import { withRetry } from "./retry.js";
 import {
     goalDirective, GOAL_EVALUATOR_SYSTEM, GOAL_TRANSCRIPT_FRAMING, goalJudgeUserMessage,
@@ -98,7 +98,6 @@ export class Agent implements AgentHandle {
     private isSubAgent: boolean;
     // 子 agent 的最终文本收进 buffer 而非打印，runOnce 拼出来回传父级
     private outputBuffer: string[] | null = null;
-    private mcpManager = new McpManager();
     private readFileState: Map<string, number> = new Map();
     private confirmFn?: (message: string) => Promise<boolean>;
 
@@ -173,6 +172,8 @@ export class Agent implements AgentHandle {
         // D1：skills provider registry。目录注入走 pre-step 监听器（子 agent 不注
         // ——system/白名单已定界），工具与 slash 直调都查这个 registry
         this.cordis.plugin(skillsPlugin, { catalogInjection: !this.isSubAgent });
+        // D2：MCP 桥接（子 agent 不连接；ensure 保持 turn 开场的惰性时机）
+        this.cordis.plugin(mcpBridgePlugin, { enabled: !this.isSubAgent });
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -629,14 +630,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.cordis.plugin(sessionJsonlPlugin, { sessionId: this.sessionId });
     }
 
-    private async ensureMcp(): Promise<void> {
-        // loadAndConnect 幂等：已连/无配置时是 no-op
-        await this.mcpManager.loadAndConnect();
-    }
-
     // MCP 子进程 stdio 会挂住事件循环，one-shot/测试结束必须显式关闭
     async close(): Promise<void> {
-        await this.mcpManager.disconnectAll();
+        await this.cordis.get<McpBridge>("mcp")?.disconnectAll();
     }
 
     // 旁路查询：独立小请求（非流式、temperature 0、256 token 上限），
@@ -1006,8 +1002,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // 语义召回：turn 边界发起异步 prefetch，不挡主循环；每轮请求前轮询一次，
         // selector 一落定立刻注入，模型尽早看到记忆
         await this.startMemoryPrefetchForTurn(batch.join("\n\n"), this.messages);
-        if (!this.isSubAgent) await this.ensureMcp();
-        const mcpTools: Anthropic.Tool[] = this.isSubAgent ? [] : this.mcpManager.getToolDefinitions();
+        // D2：MCP 走桥接服务（ensure 保持惰性时机：turn 开场才连接+同步注册表）
+        const mcp = this.cordis.require<McpBridge>("mcp");
+        if (!this.isSubAgent) await mcp.ensure();
+        const mcpTools: Anthropic.Tool[] = this.isSubAgent ? [] : mcp.listToolDefinitions();
         this.setStatus("running");
         // abort 生命周期覆盖整个 turn（请求 + 工具执行）
         this.abortController = new AbortController();
@@ -1216,16 +1214,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             loop.recordWakeup({ delaySeconds, reason, prompt });
             return `Wakeup scheduled in ${delaySeconds}s. The loop will resume then; end your turn now.`;
         }
-        if (name.startsWith("mcp__")) {
-            // server 掉线/名字拆错等——作为 tool_result 回给模型自行处置，不在主循环里炸
-            try {
-                return await this.mcpManager.callTool(name, input);
-            } catch (e: any) {
-                return `Error: ${e.message ?? e}`;
-            }
-        }
-        // C1：switch 改查注册表。魔法名链（plan/agent/skill/schedule_wakeup/mcp__）
-        // 在上方已拦截；走到这里的都是注册表工具，未知名与旧 switch 的 default 同话术
+        // C1：switch 改查注册表。魔法名链（plan/agent/skill/schedule_wakeup）在上方
+        // 已拦截；mcp__ 自 D2 起也是注册表工具（mcp-bridge 插件两代切换注册），
+        // 未知名与旧 switch 的 default 同话术
         const def: ToolDefinition | undefined = this.cordis.require<ToolsService>("tools").get(name);
         if (!def) return `Unknown tool: ${name}`;
         return await def.execute(input, { readFileState: this.readFileState });
