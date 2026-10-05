@@ -41,7 +41,7 @@ test('agent 域 Events：pre-step waterfall 改写 / turn-stopping steer / turn-
     next()
     return { input: payload.input.map((t) => `R:${t}`) }
   })
-  const decision = await ctx.waterfall('agent/pre-step', { input: ['a'] }, () => ({ input: ['a'] }))
+  const decision = await ctx.waterfall('agent/pre-step', { input: ['a'], historyEmpty: false }, () => ({ input: ['a'] }))
   assert.deepEqual(decision, { input: ['R:a'] })
 
   let captured = ''

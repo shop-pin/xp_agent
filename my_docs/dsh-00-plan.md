@@ -218,8 +218,9 @@
 | C6 | ✅ 完成（2026-10-05） | `dsh-C6.md`；StreamChunk 六形词汇表 + LlmAdapter/LlmRuntime/assembleStream + `llm/stream` 瀑布；llm-anthropic（SSE→chunk + 非流式 sideCall）+ adapter-echo（二十行假后端，场景 31 整循环零 anthropic 请求）；5 处 SDK 直调收拢，`this.client` 字段消亡；**中立面只在响应侧**（请求保持 Anthropic 线格式，差距记档）；cordis 102/102、mock 27 场景全绿；建议 commit：`add llm adapter seam with chunk vocabulary and echo backend` |
 | C7 | ✅ 完成（2026-10-05） | `dsh-C7.md`；SystemPromptService（section 注册表 + 中央 order + {{var}} 严格插值 + assemble 两块/断点/trim）+ prompt-sections 插件（七节 + plan 节由 Agent 自注册）；buildDynamicSystemContext/getGitContext/staticSystemPrompt 消亡；**偏差记档：claude-md 不进 system（ch22 user 消息设计优先）、工具 schema 汇入=deferred 目录页**；cordis 107/107、mock 27 场景全绿；建议 commit：`add system prompt service with section registry and strict interpolation` |
 | C8 | ✅ 完成（2026-10-05，C 阶段收官） | `dsh-C8.md`；session-jsonl 插件（每事件落盘 + 半行丢弃 + 未闭合 turn 补合成 end）+ Agent.resume（derive 恢复消息 + 派生恢复 mode/cost/轮数/激活工具/goal）+ 惰性挂载防自复制；session.ts/autoSave/restoreSession 消亡；场景 4 断言变更（快照→事件流）+ 场景 32；cordis 112/112、mock 28 场景全绿；建议 commit：`add jsonl session persistence with replay resume and crash repair` |
-| D1 | 未开始（下次从这继续） | skills 插件化：provider registry（rank 竞争）+ 目录注入改 user message（断言变更必写） |
-| — | 未开始 | D2..D6、E1..E3 | — |
+| D1 | ✅ 完成（2026-10-05） | `dsh-D1.md`；SkillRegistry（provider rank 竞争，user=10/project=20，回退可测）+ 目录注入迁 user message（pre-step 监听器，`<system-reminder>` 包裹，historyEmpty 只注一次；**否决传播礼仪**——inner 拒绝不翻案）；system skills 节消亡；场景 9 断言变更（正反双锚）；cordis 117/117、mock 28 场景全绿；建议 commit：`migrate skills to provider registry with user-message catalog` |
+| D2 | 未开始（下次从这继续） | MCP 插件化：mcp__ 命名纯函数 + syncTools 两代切换 |
+| — | 未开始 | D3..D6、E1..E3 | — |
 | D1..D6 | 未开始 | — |
 | E1..E3 | 未开始 | — |
 

@@ -19,7 +19,6 @@ import type { Context } from "../cordis/context.js";
 import type { SystemPromptService } from "../services/system-prompt.js";
 import { buildStaticSystemPrompt } from "../prompt.js";
 import { buildMemoryPromptSection } from "../memory.js";
-import { buildSkillDescriptions } from "../skills.js";
 import { buildAgentDescriptions } from "../subagent.js";
 import { getDeferredToolNames } from "../services/tools.js";
 
@@ -95,12 +94,8 @@ export const promptSectionsPlugin = {
             group: "dynamic",
             render: () => buildMemoryPromptSection() || null,
         });
-        sp.registerSection({
-            id: "skills",
-            order: SECTION_ORDERS.skills,
-            group: "dynamic",
-            render: () => buildSkillDescriptions() || null,
-        });
+        // D1：skills 目录节消亡——catalog 改 user message（skills 插件的 pre-step
+        // 注入），system 不再含技能清单
         sp.registerSection({
             id: "agents",
             order: SECTION_ORDERS.agents,

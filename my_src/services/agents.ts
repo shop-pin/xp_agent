@@ -117,9 +117,10 @@ declare module "../cordis/context.js" {
 // payload 是 dsh 的子集（无 turn/step/signal——mini 的循环没有独立 phase 对象）。
 declare module "../cordis/events.js" {
     interface Events {
-        /** 组装前：可改写/拒绝本 step 的输入（waterfall，不调 next = 否决）。 */
+        /** 组装前：可改写/拒绝本 step 的输入（waterfall，不调 next = 否决）。
+         *  historyEmpty：会话首批输入（目录/reminder 类一次性注入的锚点）。 */
         "agent/pre-step"(
-            payload: { input: string[] },
+            payload: { input: string[]; historyEmpty: boolean },
             next: () => PreStepDecision | Promise<PreStepDecision>,
         ): PreStepDecision | Promise<PreStepDecision>;
         /** 收敛前：监听器可 steer 文本挽留（serial 无 next；返回非空值会 bail 后继）。 */

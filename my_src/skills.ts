@@ -1,6 +1,9 @@
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
-import { join, basename } from "path";
-import { homedir } from "os";
+// skills.ts——D1 后只剩纯函数层：SKILL.md 解析、$ARGUMENTS 展开、目录文本。
+// 发现与竞争（user/project 两层、同名覆盖）迁 plugins/skills-registry.ts 的
+// provider registry（rank 竞争）；catalog 注入改 user message（pre-step 改写）。
+
+import { readFileSync } from "fs";
+import { basename } from "path";
 import { parseFrontmatter } from "./frontmatter.js";
 
 export interface SkillDefinition {
@@ -15,7 +18,7 @@ export interface SkillDefinition {
     skillDir: string;
 }
 
-function parseSkillFile(
+export function parseSkillFile(
     filePath: string,
     source: "project" | "user",
     skillDir: string
@@ -66,65 +69,8 @@ export function resolveSkillPrompt(skill: SkillDefinition, args: string): string
     return prompt;
 }
 
-let cachedSkills: SkillDefinition[] | null = null;
-
-export function discoverSkills(): SkillDefinition[] {
-    if (cachedSkills) return cachedSkills;
-
-    const skills = new Map<string, SkillDefinition>();
-
-    // user 层先加载（低优先级），project 层后加载覆盖同名
-    loadSkillsFromDir(join(homedir(), ".claude", "skills"), "user", skills);
-    loadSkillsFromDir(join(process.cwd(), ".claude", "skills"), "project", skills);
-
-    cachedSkills = Array.from(skills.values());
-    return cachedSkills;
-}
-
-function loadSkillsFromDir(
-    baseDir: string,
-    source: "project" | "user",
-    skills: Map<string, SkillDefinition>
-): void {
-    if (!existsSync(baseDir)) return;
-    let entries: string[];
-    try {
-        entries = readdirSync(baseDir);
-    } catch { return; }
-
-    for (const entry of entries) {
-        const skillDir = join(baseDir, entry);
-        // 两级结构：只处理目录（混进来的散文件跳过）；statSync 对坏符号链接会抛
-        try {
-            if (!statSync(skillDir).isDirectory()) continue;
-        } catch { continue; }
-        const skillFile = join(skillDir, "SKILL.md");
-        if (!existsSync(skillFile)) continue;
-
-        const skill = parseSkillFile(skillFile, source, skillDir);
-        if (skill) skills.set(skill.name, skill);
-    }
-}
-
-export function getSkillByName(name: string): SkillDefinition | null {
-    return discoverSkills().find((s) => s.name === name) || null;
-}
-
-export function executeSkill(
-    skillName: string,
-    args: string
-): { prompt: string; allowedTools?: string[]; context: "inline" | "fork" } | null {
-    const skill = getSkillByName(skillName);
-    if (!skill) return null;
-    return {
-        prompt: resolveSkillPrompt(skill, args),
-        allowedTools: skill.allowedTools,
-        context: skill.context,
-    };
-}
-
-export function buildSkillDescriptions(): string {
-    const skills = discoverSkills();
+/** 目录文本：名字 + 描述（正文按需经 skill 工具加载）。D1 起进 user message。 */
+export function buildSkillDescriptions(skills: SkillDefinition[]): string {
     if (skills.length === 0) return "";
 
     const lines = ["# Available Skills", ""];
@@ -153,8 +99,4 @@ export function buildSkillDescriptions(): string {
         "To invoke a skill programmatically, use the `skill` tool with the skill name and optional arguments."
     );
     return lines.join("\n");
-}
-
-export function resetSkillCache(): void {
-    cachedSkills = null;
 }

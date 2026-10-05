@@ -15,6 +15,8 @@ import { autonomyPlugin, GoalService, LoopService } from "./plugins/autonomy.js"
 import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
 import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
 import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
+import { skillsPlugin, SkillRegistry } from "./plugins/skills-registry.js";
+import { resolveSkillPrompt } from "./skills.js";
 import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { SystemPromptService } from "./services/system-prompt.js";
 import { promptSectionsPlugin, SECTION_ORDERS } from "./plugins/prompt-sections.js";
@@ -168,6 +170,9 @@ export class Agent implements AgentHandle {
             group: "dynamic",
             render: () => (this.mode === "plan" ? this.buildPlanModePrompt() : null),
         });
+        // D1：skills provider registry。目录注入走 pre-step 监听器（子 agent 不注
+        // ——system/白名单已定界），工具与 slash 直调都查这个 registry
+        this.cordis.plugin(skillsPlugin, { catalogInjection: !this.isSubAgent });
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -881,6 +886,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return this.statusValue !== "idle";
     }
 
+    /** D1：skills registry 的 CLI 侧句柄（/skills 列表与 /<name> 直调都走它）。 */
+    get skills(): SkillRegistry {
+        return this.cordis.require<SkillRegistry>("skills");
+    }
+
     async send(text: string): Promise<void> {
         if (this.statusValue === "idle") return this.followup(text);
         this.inbox.append("next-step", text);
@@ -973,7 +983,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // 模型调用直接收敛（dsh：blocked；输入已 claim，不回队列不进消息）
         const decision = await this.cordis.waterfall(
             "agent/pre-step",
-            { input: batch },
+            { input: batch, historyEmpty: this.messages.length === 0 },
             (): PreStepDecision => ({ input: batch }),
         );
         if (decision.reject !== undefined) {
@@ -1021,7 +1031,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     // 首步的"整 turn 收敛"不同——mini 简化，偏差记 dsh-C5.md §2）
                     const steerDecision = await this.cordis.waterfall(
                         "agent/pre-step",
-                        { input: steers },
+                        { input: steers, historyEmpty: false },
                         (): PreStepDecision => ({ input: steers }),
                     );
                     if (steerDecision.reject === undefined) {
@@ -1423,23 +1433,24 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     }
 
     // skill 的双入口分流：fork 派给隔离子 agent（system=解析后模板，tools=白名单过滤
-    // 父工具集）；inline 把解析后文本作为 tool_result 注入主对话，模型看到后照做
+    // 父工具集）；inline 把解析后文本作为 tool_result 注入主对话，模型看到后照做。
+    // D1：查 ctx.skills registry（slash 直调同源——两条路径一个 registry）
     private async executeSkillTool(input: Record<string, any>): Promise<string> {
-        const { executeSkill } = await import("./skills.js");
-        const result = executeSkill(input.skill_name, input.args || "");
-        if (!result) return `Unknown skill: ${input.skill_name}`;
+        const skill = this.cordis.require<SkillRegistry>("skills").getByName(input.skill_name);
+        if (!skill) return `Unknown skill: ${input.skill_name}`;
+        const prompt = resolveSkillPrompt(skill, input.args || "");
 
-        if (result.context === "fork") {
+        if (skill.context === "fork") {
             // fork 不许继承 schedule_wakeup——它是本 agent dynamic loop 的驱动内部工具；
             // agent 同理，白名单里写了也不给（子 agent 不许再派生子 agent，递归失控）
-            const tools = (result.allowedTools
-                ? this.tools.filter(t => result.allowedTools!.includes(t.name) && t.name !== "agent")
+            const tools = (skill.allowedTools
+                ? this.tools.filter(t => skill.allowedTools!.includes(t.name) && t.name !== "agent")
                 : this.tools.filter(t => t.name !== "agent"))
                 .filter(t => t.name !== "schedule_wakeup");
 
             printSubAgentStart("skill-fork", input.skill_name);
             const subAgent = new Agent({
-                customSystemPrompt: result.prompt,
+                customSystemPrompt: prompt,
                 customTools: tools,
                 isSubAgent: true,
                 permissionMode: this.childPermissionMode(),
@@ -1457,7 +1468,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
         }
 
-        return `[Skill "${input.skill_name}" activated]\n\n${result.prompt}`;
+        return `[Skill "${input.skill_name}" activated]\n\n${prompt}`;
     }
 
     async runOnce(prompt: string): Promise<{ text: string; tokens: { input: number; output: number } }> {

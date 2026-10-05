@@ -2,7 +2,7 @@ import * as readline from "readline";
 import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
 import { getLatestSessionId } from "./plugins/session-jsonl.js";
-import { discoverSkills, getSkillByName, resolveSkillPrompt } from "./skills.js";
+import { resolveSkillPrompt } from "./skills.js";
 import { listMemories } from "./memory.js";
 import type { PermissionMode } from "./permissions.js";
 import { printWelcome, printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
@@ -275,7 +275,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     return;
                 }
                 if (input === "/skills") {
-                    const skills = discoverSkills();
+                    const skills = agent.skills.list();
                     if (skills.length === 0) {
                         printInfo("No skills found. Add skills to .claude/skills/<name>/SKILL.md");
                     } else {
@@ -294,7 +294,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     const spaceIdx = input.indexOf(" ");
                     const cmdName = spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
                     const cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : "";
-                    const skill = getSkillByName(cmdName);
+                    const skill = agent.skills.getByName(cmdName);
                     if (skill && skill.userInvocable) {
                         printInfo(`Invoking skill: ${skill.name}`);
                         try {

@@ -205,10 +205,10 @@ const scenarios = {
     },
   },
   "9": {
-    // chapter 9 → ch23 迁移：SKILL.md 新结构（.claude/skills/<name>/SKILL.md + frontmatter
-    // + $ARGUMENTS 占位符）。模型经 skill 工具 inline 调用：executeSkill 解析模板，
-    // tool_result 以 "[Skill activated]" 前缀注入主对话。CLI 的 /<name> 入口由 ch23b
-    // 覆盖（对齐 src 后 one-shot 不再解析斜杠命令）。
+    // chapter 9 → ch23 迁移 → D1：SKILL.md 新结构 + skill 工具 inline 调用。
+    // D1 断言变更说明：skills catalog 从 system 挪到**首条 user 消息**（pre-step
+    // 注入，<system-reminder> 包裹）——新增正面断言（firstUserText 含目录）与
+    // 反面断言（system 不再含 "# Available Skills"），tool_result 断言原样保留。
     needsLog: true,
     setup: (dir) => {
       mkdirSync(join(dir, ".claude", "skills", "commit"), { recursive: true });
@@ -228,6 +228,13 @@ const scenarios = {
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request");
+      check("skills catalog rides the first user message (D1: system -> user)",
+        typeof reqs[0]?.firstUserText === "string"
+        && reqs[0].firstUserText.includes("# Available Skills")
+        && reqs[0].firstUserText.includes("- **/commit**: Create a conventional commit message")
+        && reqs[0].firstUserText.includes("<system-reminder>"));
+      check("system no longer contains the skills catalog",
+        typeof reqs[0]?.system === "string" && !reqs[0].system.includes("# Available Skills"));
       check("three model calls (two skill invocations + finish)", reqs.length === 3);
       check("skill tool returns the activated template",
         (reqs[1]?.toolResults || []).some((t) => t.content.includes('[Skill "commit" activated]')
