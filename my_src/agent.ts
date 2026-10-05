@@ -1,8 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { toolDefinitions, type ToolDef } from "./tools.js";
-import { ToolsService, getActiveToolDefinitions, truncateResult, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
+import { ToolsService, getActiveToolDefinitions, truncateResult, activateTools, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
-import { SessionLog, type TokenUsage } from "./services/session-log.js";
+import { SessionLog, type TokenUsage, type SessionEvent } from "./services/session-log.js";
 import { LlmRuntime, assembleStream, type Settlement } from "./services/llm.js";
 import { Inbox, type AgentHandle, type AgentStatus, type PreStepDecision } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
@@ -14,6 +14,7 @@ import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin, GoalService, LoopService } from "./plugins/autonomy.js";
 import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
 import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
+import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
 import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { SystemPromptService } from "./services/system-prompt.js";
 import { promptSectionsPlugin, SECTION_ORDERS } from "./plugins/prompt-sections.js";
@@ -30,7 +31,6 @@ import {
     loadAutoModeRules, buildClassifierSystem, buildClassifierTranscript, classifierUserMessage,
     parseBlockVerdict, AUTO_MODE_FAST_PATH_TOOLS, DENIAL_LIMITS,
 } from "./autonomy.js";
-import { saveSession } from "./session.js";
 import { randomUUID } from "crypto";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
@@ -90,6 +90,8 @@ export class Agent implements AgentHandle {
     private statusValue: AgentStatus = "idle";
     private driverPromise: Promise<void> | null = null;
     private idleWaiters: Array<() => void> = [];
+    // C8：JSONL 持久化惰性挂载标记（见 ensurePersistence）
+    private persistenceAttached = false;
     private hasCustomPrompt: boolean;
     private isSubAgent: boolean;
     // 子 agent 的最终文本收进 buffer 而非打印，runOnce 拼出来回传父级
@@ -256,14 +258,14 @@ export class Agent implements AgentHandle {
     // 拼——请求时 buildAnthropicSystem() 按 mode 现算，省掉一份常驻 systemPrompt
     togglePlanMode(): string {
         if (this.mode === "plan") {
-            this.mode = this.prePlanMode || "default";
+            this.setMode(this.prePlanMode || "default");
             this.prePlanMode = null;
             this.planFilePath = null;
             printInfo(`Exited plan mode → ${this.mode} mode`);
             return this.mode;
         }
         this.prePlanMode = this.mode;
-        this.mode = "plan";
+        this.setMode("plan");
         this.planFilePath = this.generatePlanFilePath();
         printInfo(`Entered plan mode. Plan file: ${this.planFilePath}`);
         return "plan";
@@ -555,24 +557,71 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         });
     }
 
-    restoreSession(data: { anthropicMessages?: any[] }): void {
-        if (data.anthropicMessages) this.loadHistory(data.anthropicMessages);
+    /**
+     * C8：从 JSONL 会话日志恢复（重放即恢复）。持久化在首个 turn 才挂载——
+     * 此刻重放的事件不会被写回文件（防自复制），续跑的 append 自然接在同一
+     * 文件尾。半行丢弃 + 未闭合 turn/start 补合成 end（崩溃修复）；非消息
+     * 状态从注记与 assistant 事件**派生**恢复（mode/cost/currentTurns/
+     * lastInputTokenCount/激活工具/goal——超越旧版 JSON 快照 resume 的地方）。
+     */
+    resume(sessionId: string): boolean {
+        const lines = readSessionLines(sessionId);
+        if (lines === null) return false;
+        for (const line of lines) {
+            if ((line as { type: string }).type === "log/clear") {
+                this.sessionLog.clear();
+            } else {
+                this.sessionLog.append(line as SessionEvent);
+            }
+        }
+        repairUnclosedTurn(this.sessionLog);
+        this.messages = this.sessionLog.derive().messages;
+        this.sessionId = sessionId;
+
+        let activated: string[] | null = null;
+        let goalCondition: string | null = null;
+        for (const evt of this.sessionLog.events) {
+            if (evt.type === "meta/note" && evt.key === "mode") {
+                this.mode = evt.value as PermissionMode;
+            } else if (evt.type === "meta/note" && evt.key === "activated-tools") {
+                activated = evt.value as string[];
+            } else if (evt.type === "meta/note" && evt.key === "goal") {
+                goalCondition = (evt.value as { condition?: string } | null)?.condition ?? null;
+            }
+        }
+        // cost 四计数与轮数从 assistant 事件求和（不用额外记账事件——日志即真相）
+        let lastUsage: TokenUsage | null = null;
+        for (const evt of this.sessionLog.events) {
+            if (evt.type !== "assistant/message" || !evt.usage) continue;
+            this.totalInputTokens += evt.usage.input;
+            this.totalOutputTokens += evt.usage.output;
+            this.totalCacheReadTokens += evt.usage.cacheRead;
+            this.totalCacheCreationTokens += evt.usage.cacheCreation;
+            if (evt.content.some((b) => (b as { type?: string }).type === "tool_use")) this.currentTurns++;
+            lastUsage = evt.usage;
+        }
+        this.lastInputTokenCount = lastUsage
+            ? lastUsage.input + lastUsage.cacheRead + lastUsage.cacheCreation + lastUsage.output
+            : 0;
+        if (activated) activateTools(activated);
+        const goal = this.cordis.get<GoalService>("goal");
+        if (goal) {
+            if (goalCondition) goal.set(goalCondition);
+            else goal.clear();
+        }
         printInfo(`Session restored (${this.messages.length} messages).`);
+        return true;
     }
 
-    private autoSave(): void {
-        try {
-            saveSession(this.sessionId, {
-                metadata: {
-                    id: this.sessionId,
-                    model: MODEL,
-                    cwd: process.cwd(),
-                    startTime: this.sessionStartTime,
-                    messageCount: this.messages.length,
-                },
-                anthropicMessages: this.messages,
-            });
-        } catch { }
+    /**
+     * C8：惰性挂载持久化——首个 turn 才落文件。resume 在挂载前重放（不自复制）；
+     * 单测构造 Agent 不跑 turn，也就不写任何文件。子 agent 不持久化
+     * （对齐旧 autoSave 的 isSubAgent 语义）。
+     */
+    private ensurePersistence(): void {
+        if (this.isSubAgent || this.persistenceAttached) return;
+        this.persistenceAttached = true;
+        this.cordis.plugin(sessionJsonlPlugin, { sessionId: this.sessionId });
     }
 
     private async ensureMcp(): Promise<void> {
@@ -919,6 +968,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     /** 一个 turn：旧 chat() 的开场（maintenance 相位）+ step 循环（running 相位）。 */
     private async runOneTurn(batch: string[]): Promise<void> {
+        this.ensurePersistence();
         // pre-step（turn 首步形态）：组装前可改写/拒绝。拒绝 → 本 turn 不消耗
         // 模型调用直接收敛（dsh：blocked；输入已 claim，不回队列不进消息）
         const decision = await this.cordis.waterfall(
@@ -1042,7 +1092,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 this.endTurn(stopReason);
                 if (!this.isSubAgent) {
                     printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
-                    this.autoSave();
                 }
                 break;
             }
@@ -1063,7 +1112,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         content: `Tool call not executed: ${budget.reason}`,
                     };
                 }));
-                this.autoSave();
                 break;
             }
             // step 级标记（turn 继续）：只进注记，不发 agent/turn-end 事件
@@ -1177,7 +1225,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (name === "enter_plan_mode") {
             if (this.mode === "plan") return "Already in plan mode.";
             this.prePlanMode = this.mode;
-            this.mode = "plan";
+            this.setMode("plan");
             this.planFilePath = this.generatePlanFilePath();
             printInfo("Entered plan mode (read-only). Plan file: " + this.planFilePath);
             return `Entered plan mode. You are now in read-only mode.\n\nYour plan file: ${this.planFilePath}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode.`;
@@ -1212,7 +1260,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     targetMode = this.prePlanMode || "default";
                 }
 
-                this.mode = targetMode;
+                this.setMode(targetMode);
                 this.prePlanMode = null;
                 const savedPlanPath = this.planFilePath;
                 this.planFilePath = null;
@@ -1234,7 +1282,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
 
             // 无审批回调（one-shot/子 agent）：直接退出恢复原模式
-            this.mode = this.prePlanMode || "default";
+            this.setMode(this.prePlanMode || "default");
             this.prePlanMode = null;
             this.planFilePath = null;
             printInfo("Exited plan mode. Restored to " + this.mode + " mode.");

@@ -37,9 +37,33 @@ export type SessionEvent =
 
 export class SessionLog extends Service {
     private log: SessionEvent[] = [];
+    // C8：持久化订阅——onAppend 拿到的是**进入合并前的原始事件**（重放再走
+    // append 会得到同样的合并结果，JSONL 因此可以存原始流）
+    private appendListeners: Array<(evt: SessionEvent) => void> = [];
+    private clearListeners: Array<() => void> = [];
 
     get events(): readonly SessionEvent[] {
         return this.log;
+    }
+
+    onAppend(fn: (evt: SessionEvent) => void): () => void {
+        this.appendListeners.push(fn);
+        let active = true;
+        return () => {
+            if (!active) return;
+            active = false;
+            this.appendListeners = this.appendListeners.filter((f) => f !== fn);
+        };
+    }
+
+    onClear(fn: () => void): () => void {
+        this.clearListeners.push(fn);
+        let active = true;
+        return () => {
+            if (!active) return;
+            active = false;
+            this.clearListeners = this.clearListeners.filter((f) => f !== fn);
+        };
     }
 
     /**
@@ -48,6 +72,7 @@ export class SessionLog extends Service {
  * tool_result 批次（数组）追加 text 块。C4 起 WHO/WHEN 的裁决迁给 inbox。
      */
     append(evt: SessionEvent): void {
+        for (const fn of [...this.appendListeners]) fn(evt);
         if (evt.type === "user/message") {
             const last = this.log[this.log.length - 1];
             if (last && last.type === "user/message") {
@@ -120,6 +145,7 @@ export class SessionLog extends Service {
 
     /** 截断（clearHistory 路径）。真 append-only 的不可变会话在 D 阶段持久化时再立。 */
     clear(): void {
+        for (const fn of [...this.clearListeners]) fn();
         this.log = [];
     }
 }

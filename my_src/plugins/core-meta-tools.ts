@@ -6,6 +6,7 @@
 
 import type { Context } from "../cordis/context.js";
 import { activateTools, type ToolsService, type ToolDefinition, type JSONSchema } from "../services/tools.js";
+import type { SessionLog } from "../services/session-log.js";
 import { toolDefinitions } from "../tools.js";
 
 function schemaOf(name: string): Pick<ToolDefinition, "description" | "parameters" | "deferred"> {
@@ -63,7 +64,12 @@ export const coreMetaTools = {
                     ((t.description as string) || "").toLowerCase().includes(query)
                 );
                 if (matches.length === 0) return "No matching deferred tools found.";
-                activateTools(matches.map((m) => m.name));
+                const names = matches.map((m) => m.name);
+                activateTools(names);
+                // C8：激活态进会话日志（meta/note）——resume 重放后仍广告
+                ctx.get<SessionLog>("session-log")?.append({
+                    type: "meta/note", key: "activated-tools", value: names,
+                });
                 // 直接 return：命中即激活，返回完整 schema 让模型立刻会用
                 return JSON.stringify(matches.map((t) => ({
                     name: t.name,

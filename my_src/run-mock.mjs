@@ -6,7 +6,7 @@
 import { startMock } from "./mock-anthropic.mjs";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync } from "fs";
 import { createHash } from "crypto";
-import { tmpdir } from "os";
+import { tmpdir, homedir } from "os";
 import { join, dirname } from "path";
 import { pathToFileURL, fileURLToPath } from "url";
 
@@ -603,35 +603,30 @@ const scenarios = {
       { text: "Got it — your favorite color is blue." },
       { text: "Your favorite color is blue." },
     ],
-    // ch17 迁移：session 落在 HOME 沙箱的 ~/.mini-claude/sessions/<id>.json，
-    // 断言从"单文件+消息数组"升级为"目录+metadata+消息体"，并断言旧文件已消失
+    // ch17 → C8 迁移：持久化升级为 JSONL 事件日志。断言变更说明：旧 JSON 快照
+    // 的 metadata 块消亡（会话身份 = 文件名）；"两个文件"变"一个"——run2 的
+    // --resume 续写 run1 的文件（每事件即落盘，无"收敛时另存"）。消息内容与
+    // 数量改从事件流断言，请求级断言（messageCount/firstUserText）原样保留。
     verify: (dir, logPath) => {
       let ok = true;
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
       check("old cwd .mini-session.json is gone", !existsSync(join(dir, ".mini-session.json")));
       const sessionsDir = join(dir, ".mini-claude", "sessions");
       let files = [];
-      try { files = readdirSync(sessionsDir).filter((f) => f.endsWith(".json")); } catch { }
-      check("two session files under HOME sandbox (one per run)", files.length === 2);
-      // run2 留下的那份：2 restored + 1 new user + 1 new assistant = 4 条。
-      // resume 坏了的话 run2 只会存 2 条新消息，找不到 messageCount===4 的文件。
-      let run2 = null;
-      for (const f of files) {
-        try {
-          const data = JSON.parse(readFileSync(join(sessionsDir, f), "utf-8"));
-          if (data.metadata?.messageCount === 4) run2 = data;
-        } catch { }
+      try { files = readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl")); } catch { }
+      check("one jsonl session file (run2 resumed and extended run 1's log)", files.length === 1);
+      let evts = [];
+      if (files.length === 1) {
+        try { evts = readFileSync(join(sessionsDir, files[0]), "utf-8").trim().split("\n").map((l) => JSON.parse(l)); } catch { }
       }
-      check("run2 session carries full metadata", !!run2
-        && typeof run2.metadata?.id === "string"
-        && typeof run2.metadata?.startTime === "string"
-        && typeof run2.metadata?.model === "string"
-        && run2.metadata?.cwd === dir);
-      check("run2 session ends with 4 messages (2 restored + 2 new)",
-        Array.isArray(run2?.anthropicMessages) && run2.anthropicMessages.length === 4);
-      check("run2's first user msg is run 1's text",
-        typeof run2?.anthropicMessages?.[0]?.content === "string"
-        && run2.anthropicMessages[0].content.includes("Remember that my favorite color is blue."));
+      const userMsgs = evts.filter((e) => e.type === "user/message");
+      const asstMsgs = evts.filter((e) => e.type === "assistant/message");
+      check("event log spans both runs (2 user + 2 assistant message events)",
+        userMsgs.length === 2 && asstMsgs.length === 2);
+      check("run 1's input is the first logged user message",
+        typeof userMsgs[0]?.content === "string" && userMsgs[0].content.includes("Remember that my favorite color is blue."));
+      check("run 2's input is the last logged user message",
+        typeof userMsgs[1]?.content === "string" && userMsgs[1].content.includes("What is my favorite color?"));
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request");
       check("two model calls total (one per run)", reqs.length === 2);
@@ -1345,6 +1340,49 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "32": {
+    // C8：JSONL 持久化（persist runner 三阶段）。
+    //   ① 会话跑 2 个请求（tool + text），事件逐条落盘
+    //   ② 新 Agent resume：请求历史续接（messageCount=5、首条 user 含 reminder、
+    //      工具结果存活）、system 逐字节一致、cost 从 assistant 事件派生恢复
+    //   ③ 崩溃修复：半行丢弃 + 未闭合 turn/start 补合成 turn/end(recovered)，
+    //      消息数不受污染行影响
+    needsLog: true,
+    setup: (dir) => writeFileSync(join(dir, "greeting.txt"), "hello from persistence."),
+    runs: [{ persist: true }],
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "read_file", input: { file_path: "greeting.txt" } }] },
+          { text: "greeting.txt says: hello from persistence." },
+          { text: "It said: hello from persistence." },
+        ],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      check("3 main requests (2 before resume + 1 continue)", reqs.length === 3);
+      check("resume found the jsonl session", samples["resume-ok"] === "true");
+      check("cost derived from assistant events (nonzero after resume)", samples["resume-cost"] === "true");
+      check("continued request carries the full replayed history (5 msgs)",
+        reqs[2]?.messageCount === 5);
+      check("first user message (with reminder) survived the round trip",
+        typeof reqs[2]?.firstUserText === "string" && reqs[2].firstUserText.includes("read greeting.txt"));
+      check("tool results survived the round trip",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("hello from persistence")));
+      check("system byte-identical across the resume boundary",
+        reqs[2]?.system === reqs[0]?.system && typeof reqs[0]?.system === "string");
+      check("crash tail repaired: half-line dropped, unclosed turn closed",
+        samples["crash-ok"] === "true" && samples["crash-last-end"] === "recovered");
+      check("crash repair did not pollute messages (6 = both runs' history)", samples["crash-msgs"] === "6");
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1551,6 +1589,30 @@ if (s.runs) {
         sample("echo-text", (last?.content || []).map((b) => b.text ?? "").join(""));
         sample("echo-usage", String((last?.usage?.input ?? 0) + (last?.usage?.output ?? 0)));
         if (a.close) await a.close();
+      } else if (r.persist !== undefined) {
+        // C8：JSONL 持久化三阶段——①跑两个请求的会话；②新 Agent 从文件 resume
+        // 后继续（请求历史/工具结果/system 逐字节续接 + cost 派生恢复）；
+        // ③崩溃修复（半行丢弃 + 未闭合 turn/start 补合成 end）
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        const a = new agentMod.Agent();
+        await a.chat("read greeting.txt then summarize");
+        const sid = a.sessionId;
+        await a.close();
+        const b = new agentMod.Agent();
+        sample("resume-ok", b.resume(sid));
+        sample("resume-cost", b.getCurrentCostUsd() > 0);
+        await b.chat("continue: what did it say?");
+        await b.close();
+        // 崩溃尾巴：一行合法的未闭合 turn/start + 一行写了一半的事件
+        const sessDir = join(homedir(), ".mini-claude", "sessions");
+        appendFileSync(join(sessDir, `${sid}.jsonl`), '{"type":"turn/start"}\n{"type":"user/mes');
+        const c = new agentMod.Agent();
+        sample("crash-ok", c.resume(sid));
+        const ends = c.sessionLog.events.filter((e) => e.type === "turn/end").map((e) => e.reason);
+        sample("crash-last-end", ends[ends.length - 1]);
+        sample("crash-msgs", c.history().length);
+        if (c.close) await c.close();
       } else {
         await mod.runCli(r.argv);
       }

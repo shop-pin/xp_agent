@@ -21,6 +21,7 @@ import {
 } from "../autonomy.js";
 import { printInfo, printError } from "../ui.js";
 import type { TurnStoppingState } from "../services/agents.js";
+import type { SessionLog } from "../services/session-log.js";
 
 function isAbortLike(e: unknown): boolean {
     const err = e as { name?: string; message?: string };
@@ -44,6 +45,10 @@ export class GoalService extends Service {
     set(condition: string): GoalState {
         this.active = { condition, iterations: 0, startedAt: Date.now() };
         this.stopped = false;
+        // C8：goal 状态进会话日志（meta/note）——resume 重放后 showGoal 可见
+        this.ctx.get<SessionLog>("session-log")?.append({
+            type: "meta/note", key: "goal", value: { condition },
+        });
         return this.active;
     }
 
@@ -53,6 +58,7 @@ export class GoalService extends Service {
 
     clear(): void {
         this.active = null;
+        this.ctx.get<SessionLog>("session-log")?.append({ type: "meta/note", key: "goal", value: null });
     }
 }
 

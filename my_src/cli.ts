@@ -1,7 +1,7 @@
 import * as readline from "readline";
 import { pathToFileURL } from "url";
 import { Agent } from "./agent.js";
-import { loadSession, getLatestSessionId } from "./session.js";
+import { getLatestSessionId } from "./plugins/session-jsonl.js";
 import { discoverSkills, getSkillByName, resolveSkillPrompt } from "./skills.js";
 import { listMemories } from "./memory.js";
 import type { PermissionMode } from "./permissions.js";
@@ -84,12 +84,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     if (resume) {
         const sessionId = getLatestSessionId();
         if (sessionId) {
-            const session = loadSession(sessionId);
-            if (session) {
-                agent.restoreSession({ anthropicMessages: session.anthropicMessages });
-            } else {
-                printInfo("No session found to resume.");
-            }
+            // C8：resume = JSONL 重放（消息 + mode/cost/激活工具/goal 一并恢复）
+            if (!agent.resume(sessionId)) printInfo("No session found to resume.");
         } else {
             printInfo("No previous sessions found.");
         }
