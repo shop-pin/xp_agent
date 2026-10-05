@@ -1,11 +1,6 @@
 import { existsSync, readFileSync, readdirSync } from "fs";
-import { execSync } from "child_process";
 import { join, dirname } from "path";
 import * as os from "os";
-import { buildMemoryPromptSection } from "./memory.js";
-import { buildSkillDescriptions } from "./skills.js";
-import { buildAgentDescriptions } from "./subagent.js";
-import { getDeferredToolNames } from "./services/tools.js";
 
 const REGEXP = /^@(\S+)[ \t]*$/gm;
 const MAX_DEPTH = 5;
@@ -95,35 +90,9 @@ You help with software engineering tasks using the tools available to you.
  - Keep responses short and concise. Lead with the answer.
  - Reference code as file_path:line_number.`;
 
-function getGitContext(): string {
-    const opts = {
-        encoding: "utf-8" as const,
-        timeout: 3000,
-    }
-    try {
-        const branch = execSync("git rev-parse --abbrev-ref HEAD", opts);
-        const log = execSync("git log --oneline -5", opts);
-        const status = execSync("git status --short", opts);
-        return `# Git context\nbranch: ${branch}\nlog: ${log}\nstatus: ${status}`;
-    } catch {
-        return "";
-    }
-}
-
-// 动态上下文（含 memory 索引）：随项目/机器而变，且模型写记忆的瞬间索引会变——
-// 所以绝不进 cache_control 静态块，单独作为第二个 system 块
-export function buildDynamicSystemContext(): string {
-    const memorySection = buildMemoryPromptSection();
-    const skillsSection = buildSkillDescriptions();
-    const agentSection = buildAgentDescriptions();
-    // deferred 工具的"目录页"：schema 不广告，但名字要说，模型才知道去搜什么。
-    // 每次请求现算——tool_search 激活一个，它就从名单里消失
-    const deferredNames = getDeferredToolNames();
-    const deferredSection = deferredNames.length > 0
-        ? `\n\nThe following deferred tools are available via tool_search: ${deferredNames.join(", ")}. Use tool_search to fetch their full schemas when needed.`
-        : "";
-    return `# Environment\nWorking directory: ${process.cwd()}\nPlatform: ${os.platform()} ${os.arch()}\nShell: ${process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : (process.env.SHELL || "/bin/sh")}\n${getGitContext()}${memorySection}${skillsSection}${agentSection}${deferredSection}`;
-}
+// C7：动态上下文的拼装迁 services/system-prompt.ts + plugins/prompt-sections.ts
+// （buildDynamicSystemContext/getGitContext 消亡）。本文件保留：CLAUDE.md 加载
+// （@import 防环）、首条 user 消息的 reminder、静态主体文本。
 
 // 缓存的静态主体：所有用户、所有会话都完全一致，才能吃到前缀缓存
 export function buildStaticSystemPrompt(): string {

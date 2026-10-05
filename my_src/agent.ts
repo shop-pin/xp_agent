@@ -14,7 +14,9 @@ import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin, GoalService, LoopService } from "./plugins/autonomy.js";
 import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
 import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
-import { buildStaticSystemPrompt, buildDynamicSystemContext, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
+import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
+import { SystemPromptService } from "./services/system-prompt.js";
+import { promptSectionsPlugin, SECTION_ORDERS } from "./plugins/prompt-sections.js";
 import { type PermissionMode } from "./permissions.js";
 import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
@@ -88,7 +90,6 @@ export class Agent implements AgentHandle {
     private statusValue: AgentStatus = "idle";
     private driverPromise: Promise<void> | null = null;
     private idleWaiters: Array<() => void> = [];
-    private staticSystemPrompt: string;
     private hasCustomPrompt: boolean;
     private isSubAgent: boolean;
     // 子 agent 的最终文本收进 buffer 而非打印，runOnce 拼出来回传父级
@@ -152,6 +153,19 @@ export class Agent implements AgentHandle {
         new LlmRuntime(this.cordis, "llm");
         this.cordis.plugin(llmAnthropicPlugin);
         this.cordis.plugin(adapterEchoPlugin);
+        // C7：system prompt 服务 + 分节插件（子 agent 关动态节——env/memory/...
+        // 是主对话的环境噪音）。plan 节读本类 mode/planFilePath 私有状态，自注册
+        new SystemPromptService(this.cordis, "system-prompt");
+        this.cordis.plugin(promptSectionsPlugin, {
+            staticPrompt: options.customSystemPrompt || buildStaticSystemPrompt(),
+            dynamicEnabled: !options.customSystemPrompt,
+        });
+        this.cordis.require<SystemPromptService>("system-prompt").registerSection({
+            id: "plan",
+            order: SECTION_ORDERS.plan,
+            group: "dynamic",
+            render: () => (this.mode === "plan" ? this.buildPlanModePrompt() : null),
+        });
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -172,7 +186,6 @@ export class Agent implements AgentHandle {
         });
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
-        this.staticSystemPrompt = options.customSystemPrompt || buildStaticSystemPrompt();
         this.effectiveWindow = getContextWindow(MODEL) - 20000;
         // --plan 启动即规划：plan 文件路径在此生成，提示注入走请求时的
         // buildAnthropicSystem() planSuffix（本类没有常驻 systemPrompt 字段）
@@ -628,18 +641,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     // system 拆成两个块：静态主体打 cache_control 断点（断点前的所有内容，
     // 含工具 schema，命中服务端前缀缓存）；动态上下文（环境 + memory 索引）
-    // 放断点之后——模型写一条记忆索引就变，进了静态块等于每次写记忆都作废缓存
+    // 放断点之后——模型写一条记忆索引就变，进了静态块等于每次写记忆都作废缓存。
+    // C7：拼装收进 SystemPromptService.assemble（两块结构/断点/trim 语义不变）
     private buildAnthropicSystem(): Anthropic.TextBlockParam[] {
-        // plan 提示进动态尾巴：进出 plan 模式它就变，混进静态块等于每次进出
-        // plan 都作废一次前缀缓存
-        const planSuffix = this.mode === "plan" ? this.buildPlanModePrompt() : "";
-        // 子 agent（customSystemPrompt）：整个 system 当静态块，dynamic 段是主对话的环境噪音
-        const dynamicText = ((this.hasCustomPrompt ? "" : buildDynamicSystemContext()) + planSuffix).trim();
-        const blocks: Anthropic.TextBlockParam[] = [
-            { type: "text", text: this.staticSystemPrompt, cache_control: { type: "ephemeral" } },
-        ];
-        if (dynamicText) blocks.push({ type: "text", text: dynamicText });
-        return blocks;
+        return this.cordis.require<SystemPromptService>("system-prompt").assemble().system;
     }
 
     // 返回消息列表的**拷贝**，最后一条消息的最后一个 content block 打断点：
