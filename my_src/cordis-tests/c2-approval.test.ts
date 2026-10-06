@@ -17,8 +17,27 @@ import type { ApprovalService } from '../services/approval.js'
 import { coreFsTools } from '../plugins/core-fs-tools.js'
 import { coreExecTools } from '../plugins/core-exec-tools.js'
 import { coreMetaTools } from '../plugins/core-meta-tools.js'
+import { LlmRuntime, type LlmAdapter } from '../services/llm.js'
+import { SessionLog } from '../services/session-log.js'
 
 const EXECUTED = 'EXECUTED'
+const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }
+
+/** 分类器桩（D6 起缝在 ctx.llm）：script 每次旁调返回一行 `<block>` 裁决文本，
+ *  计数器锚"分类器被惊动几次"。 */
+function fakeClassifierLlm(ctx: Context, script: () => string): { calls: () => number } {
+  let n = 0
+  const llm = new LlmRuntime(ctx, 'llm')
+  const adapter: LlmAdapter = {
+    async *stream() {},
+    async sideCall() {
+      n++
+      return { text: script(), usage: ZERO_USAGE }
+    },
+  }
+  llm.registerAdapter('anthropic', adapter)
+  return { calls: () => n }
+}
 
 interface Harness {
   ctx: Context
@@ -50,11 +69,7 @@ function exec(h: Harness, opts?: Partial<ToolExec>): (name: string, input: Recor
   return (name, input, mode = 'default', planPath?: string) =>
     h.tools.executeCall(
       { name, input, mode, planFilePath: planPath },
-      {
-        dispatch: async () => EXECUTED,
-        autoAdjudicate: async () => ({ action: 'deny', message: '[Auto Mode] adjudicator-says-no' }),
-        ...opts,
-      },
+      { dispatch: async () => EXECUTED, ...opts },
     )
 }
 
@@ -159,8 +174,9 @@ test('ask 缓存：default 模式同 message 确认一次后免问；auto 模式
     assert.equal(h.providerCalls.length, 1) // 缓存命中，不再问
 
     const ha = buildTree(true)
-    // auto 下 run_shell 不是 fast-path：让 adjudicator 回 confirm，ask 才会浮出
-    const runA = exec(ha, { autoAdjudicate: async () => ({ action: 'confirm', message: 'rm -rf a' }) })
+    // auto 下 run_shell 不是 fast-path：树里没有 llm 服务 → 分类器不可用 →
+    // 有人（interactive provider 在）转人工 confirm，ask 才会浮出
+    const runA = exec(ha)
     await runA('run_shell', { command: 'rm -rf a' }, 'auto')
     await runA('run_shell', { command: 'rm -rf a' }, 'auto')
     assert.equal(ha.providerCalls.length, 2) // auto 的 confirm 不缓存——每次都问
@@ -183,45 +199,54 @@ test('fail-closed：ask 时没有审批服务的树直接拒', async () => {
 // ---------- auto 模式 ----------
 
 test('auto fast-path：只读工具放行且不惊动分类器；web_fetch 刻意不走 fast-path', async () => {
-  let adjudicatorCalls = 0
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new SessionLog(ctx, 'session-log')
   ctx.plugin(approvalPlugin)
   ctx.plugin(autoApprovalPlugin)
+  const fake = fakeClassifierLlm(ctx, () => '<block>no</block>')
   const outcome1 = await tools.executeCall(
     { name: 'read_file', input: { file_path: 'x' }, mode: 'auto' },
-    { dispatch: async () => EXECUTED, autoAdjudicate: async () => { adjudicatorCalls++; return { action: 'deny', message: 'no' } } },
+    { dispatch: async () => EXECUTED },
   )
   assert.equal(outcome1.kind, 'result')
-  assert.equal(adjudicatorCalls, 0)
+  assert.equal(fake.calls(), 0)
   const outcome2 = await tools.executeCall(
     { name: 'web_fetch', input: { url: 'https://x' }, mode: 'auto' },
-    { dispatch: async () => EXECUTED, autoAdjudicate: async () => { adjudicatorCalls++; return { action: 'allow' } } },
+    { dispatch: async () => EXECUTED },
   )
   assert.equal(outcome2.kind, 'result')
-  assert.equal(adjudicatorCalls, 1) // web_fetch 必须过分类器
+  assert.equal(fake.calls(), 1) // web_fetch 必须过分类器（stage1 放行即完成，一次调用）
 })
 
-test('auto 裁决映射：adjudicator 的 deny/confirm 分别落 deny/ask', async () => {
+test('auto 裁决映射：分类器 block/deny 落 deny；分类器不可用 + 有人 → confirm 落 ask', async () => {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new SessionLog(ctx, 'session-log')
   ctx.plugin(approvalPlugin)
   ctx.plugin(autoApprovalPlugin)
+  // 两段都裁 block → deny 话术逐字节同旧（[Auto Mode] + reason）
+  fakeClassifierLlm(ctx, () => '<block>yes</block><reason>outbound</reason>')
   const denied = await tools.executeCall(
     { name: 'run_shell', input: { command: 'curl x' }, mode: 'auto' },
-    { dispatch: async () => EXECUTED, autoAdjudicate: async () => ({ action: 'deny', message: '[Auto Mode] outbound' }) },
+    { dispatch: async () => EXECUTED },
   )
   assert.equal(denied.kind === 'denied' && denied.content, 'Denied: [Auto Mode] outbound')
 
-  const approval = ctx.require<ApprovalService>('approval')
+  // 没有分类器的树 + interactive provider 在 → autoFallback 转人工（旧 confirm 路径）
+  const ctx2 = new Context()
+  const tools2 = new ToolsService(ctx2, 'tools')
+  ctx2.plugin(approvalPlugin)
+  ctx2.plugin(autoApprovalPlugin)
+  const approval = ctx2.require<ApprovalService>('approval')
   const asked: string[] = []
   approval.setInteractiveProvider(async (_c, m) => { asked.push(m); return 'deny' })
-  const confirmPath = await tools.executeCall(
+  const confirmPath = await tools2.executeCall(
     { name: 'run_shell', input: { command: 'curl x' }, mode: 'auto' },
-    { dispatch: async () => EXECUTED, autoAdjudicate: async () => ({ action: 'confirm', message: '[Auto Mode blocked] suspicious' }) },
+    { dispatch: async () => EXECUTED },
   )
   assert.equal(confirmPath.kind === 'denied' && confirmPath.content, 'User denied this action.')
-  assert.deepEqual(asked, ['[Auto Mode blocked] suspicious'])
+  assert.deepEqual(asked, ['run_shell (auto-mode classifier unavailable)'])
 })
 
 // ---------- post-execute ----------

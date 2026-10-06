@@ -29,12 +29,9 @@ import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
 import { mcpBridgePlugin, McpBridge } from "./plugins/mcp-bridge.js";
 import { withRetry } from "./retry.js";
 import {
-    goalDirective, GOAL_EVALUATOR_SYSTEM, GOAL_TRANSCRIPT_FRAMING, goalJudgeUserMessage,
-    parseGoalVerdict, type GoalVerdict,
+    goalDirective,
     parseLoopInput, isDailyWording, OFFER_CLOUD_THRESHOLD_SECONDS,
-    SCHEDULE_WAKEUP_TOOL, clampWakeupDelay, dynamicLoopDirective,
-    loadAutoModeRules, buildClassifierSystem, buildClassifierTranscript, classifierUserMessage,
-    parseBlockVerdict, AUTO_MODE_FAST_PATH_TOOLS, DENIAL_LIMITS,
+    SCHEDULE_WAKEUP_TOOL, dynamicLoopDirective,
 } from "./autonomy.js";
 import { randomUUID } from "crypto";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
@@ -83,7 +80,6 @@ export class Agent implements AgentHandle {
     // 子 agent 的最终文本收进 buffer 而非打印，runOnce 拼出来回传父级
     private outputBuffer: string[] | null = null;
     private readFileState: Map<string, number> = new Map();
-    private confirmFn?: (message: string) => Promise<boolean>;
 
     // prePlanMode 记住进入前的模式——退出时精确恢复（acceptEdits 进 plan，
     // 出来还是 acceptEdits，而不是掉回 default）
@@ -110,15 +106,11 @@ export class Agent implements AgentHandle {
     // （D5：lastInputTokenCount / lastApiCallTime / effectiveWindow 迁
     // CompactionService——压缩仪表跟层走）
 
-    // transcript 分类器的 DENIAL_LIMITS 追踪：连拦 3 次或累计 20 次 → 分类器
-    // 可能卡死在拒绝循环，降级回人工确认（或无人值守拒绝）
-    private autoConsecutiveDenials = 0;
-    private autoTotalDenials = 0;
     // 中断支持：SIGINT 处理器经 cancel() 收口（busy 判忙），abort 在途 API 请求
     private abortController: AbortController | null = null;
 
-    // /loop dynamic——模型调 schedule_wakeup 时写入，loop 驱动在 turn 收敛后读取并清空
-    // （C5 第三段：状态迁 ctx.loop 服务，字段消亡）
+    // （D6：loop 定时与 schedule_wakeup 意图都归 ctx.schedule 服务——
+    // LoopService 退役为纯状态，本类不再有任何回传字段）
 
     constructor(options: AgentOptions = {}) {
         this.mode = options.permissionMode || "default";
@@ -180,9 +172,8 @@ export class Agent implements AgentHandle {
         this.cordis.plugin(approvalPlugin);
         this.cordis.plugin(autoApprovalPlugin);
         // C5：autonomy 插件（goal 的 turn-stopping 挽留 + loop 的 turn-end 调度）。
-        // 桥 = 评估器/预算/tick 上限/wake（C6 llm 服务落地后收窄）
+        // 桥 = 预算/tick 上限/wake（D6 起评估器随监听器住插件，llm 走注册表）
         this.cordis.plugin(autonomyPlugin, {
-            evaluate: (condition: string) => this.evaluateGoal(condition),
             getBudget: () => this.checkBudget(),
             getMaxTurns: () => this.maxTurns,
             wake: (text: string) => {
@@ -360,11 +351,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return truncateResult(`[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. You can use read_file to see the full result.]\n\nPreview (first 200 lines):\n${preview}`);
     }
 
-    // REPL 注入复用已有 readline 的确认回调。双写：confirmFn 留在本类供
-    // autoFallback 的 headless 判定；同时包装成审批服务的 interactive provider
-    //（展示职责在 provider 里——问什么先打出来，回调只收 y/n）
+    // REPL 注入复用已有 readline 的确认回调。包装成审批服务的 interactive
+    // provider（展示职责在 provider 里——问什么先打出来，回调只收 y/n）；
+    // D6 起 auto 分类器的 headless 判定也问审批服务（hasInteractiveProvider）
     setConfirmFn(fn: (message: string) => Promise<boolean>): void {
-        this.confirmFn = fn;
         const approval = this.cordis.get<ApprovalService>("approval");
         approval?.setInteractiveProvider(async (_call, message) => {
             printConfirmation(message);
@@ -514,58 +504,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
     }
 
-    /** 对刚结束的 turn 做一次评估。transcript 以独立 assistant 消息发送
-     *  （前置 framing user 消息把它定性为数据）——被评审的 turn 无法伪造
-     *  user/judge 文本混进评估上下文，这是防注入的关键。 */
-    private async evaluateGoal(condition: string): Promise<GoalVerdict> {
-        const transcript = this.extractLastAssistantText();
-        const messages = [
-            { role: "user" as const, content: GOAL_TRANSCRIPT_FRAMING },
-            { role: "assistant" as const, content: transcript || "(no assistant output)" },
-            { role: "user" as const, content: goalJudgeUserMessage(condition) },
-        ];
-        try {
-            const raw = await this.runEvaluatorQuery(GOAL_EVALUATOR_SYSTEM, messages);
-            return parseGoalVerdict(raw);
-        } catch (e: any) {
-            // 评估器出错 → 按未达处理（fail-closed，绝不能误清 goal）
-            return { ok: false, reason: `evaluator error: ${e?.message ?? e}` };
-        }
-    }
-
-    /** 角色分离的评估器查询，返回模型文本。与 buildSideQuery 的差别：收完整
-     *  messages 数组（buildSideQuery 是单 user 消息，供 memory 召回用）。 */
-    private async runEvaluatorQuery(
-        system: string,
-        messages: { role: "user" | "assistant"; content: string }[],
-    ): Promise<string> {
-        const { text } = await this.cordis.require<LlmRuntime>("llm").sideCall({
-            route: this.llmRoute,
-            model: MODEL,
-            maxTokens: 512,
-            system,
-            temperature: 0,
-            messages,
-        });
-        return text;
-    }
-
-    /** 最近一条 assistant turn 的文本，供评审。 */
-    private extractLastAssistantText(): string {
-        const view = this.history();
-        for (let i = view.length - 1; i >= 0; i--) {
-            const m: any = view[i];
-            if (m.role !== "assistant") continue;
-            if (typeof m.content === "string") return m.content;
-            if (Array.isArray(m.content)) {
-                return m.content
-                    .filter((b: any) => b.type === "text")
-                    .map((b: any) => b.text)
-                    .join("");
-            }
-        }
-        return "";
-    }
 
     // /goal 是被动闸门（每轮评估），/loop 相反：主动自排程。/goal 决定
     // *要不要*继续，/loop 决定*何时*开下一轮——固定间隔，或主模型经
@@ -902,14 +840,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         printToolCall(tu.name, tu.input as Record<string, any>);
                         this.sessionLog.append({ type: "tool/call", id: tu.id, name: tu.name, input: tu.input as Record<string, any> });
                         // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
-                        // → 审批 → dispatch → post-execute）。auto 的分类器机制仍在
-                        // 本类，经 autoAdjudicate 句柄被 auto 监听器调用
+                        // → 审批 → dispatch → post-execute）。D6 起 auto 分类器机制
+                        // 也在 auto-approval 插件里（句柄消亡，管线只借中断信号）
                         const outcome = await this.cordis.require<ToolsService>("tools").executeCall(
                             { name: tu.name, input: tu.input as Record<string, any>, mode: this.mode, planFilePath: this.planFilePath || undefined },
                             {
                                 readFileState: this.readFileState,
                                 dispatch: (n, i) => this.executeToolCall(n, i),
-                                autoAdjudicate: (n, i) => this.classifyToolCall(n, i),
+                                signal: this.abortController?.signal,
                             },
                         );
                         if (outcome.kind === "denied") {
@@ -967,20 +905,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     private async executeToolCall(name: string, input: Record<string, any>): Promise<string | TurnConclusion> {
         if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
         if (name === "skill") return this.executeSkillTool(input);
-        if (name === "schedule_wakeup") {
-            // 只有 dynamic loop 活跃期才路由到这里；loop 之外工具不广告，
-            // 这道守卫挡住模型裸调或同名外部工具
-            const loop = this.cordis.require<LoopService>("loop");
-            if (!loop.wakeupEnabled) return "schedule_wakeup is only available during /loop dynamic mode.";
-            const delaySeconds = clampWakeupDelay(Number(input.delaySeconds));
-            const reason = typeof input.reason === "string" ? input.reason : "";
-            const prompt = typeof input.prompt === "string" ? input.prompt : "";
-            loop.recordWakeup({ delaySeconds, reason, prompt });
-            return `Wakeup scheduled in ${delaySeconds}s. The loop will resume then; end your turn now.`;
-        }
-        // C1：switch 改查注册表。魔法名链（plan/agent/skill/schedule_wakeup）在上方
-        // 已拦截；mcp__ 自 D2 起也是注册表工具（mcp-bridge 插件两代切换注册），
-        // 未知名与旧 switch 的 default 同话术
+        // C1：switch 改查注册表。魔法名只剩 plan/skill（B 阶段语义，非注册表
+        // 工具）；D6 起 schedule_wakeup 也是注册表公民（autonomy 插件注册），
+        // mcp__ 自 D2 起同——未知名与旧 switch 的 default 同话术
         const def: ToolDefinition | undefined = this.cordis.require<ToolsService>("tools").get(name);
         if (!def) return `Unknown tool: ${name}`;
         return await def.execute(input, { readFileState: this.readFileState });
@@ -1061,92 +988,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     private clearHistoryKeepSystem() {
         this.sessionLog.clear();
         this.cordis.require<CompactionService>("compaction").lastInputTokenCount = 0;
-    }
-
-    // auto 模式下分类器取代人工确认框：deny 规则照旧硬拦，只读工具走
-    // fast-path，其余交给读"推理盲"transcript 投影的 LLM 裁决。
-
-    /** Auto Mode 下的工具裁决。返回 allow/deny（与 checkPermission 同形）或
-     *  confirm——拒绝上限触发时交还人工。
-     *
-     *  两段式（对齐真实 Claude Code 的 both 模式）：stage 1 是激进的廉价闸
-     *  （不看用户意图、不认 ALLOW 例外——任一规则**可能**命中就拦）；stage 1
-     *  放行即完成（一次调用）。stage 1 拦了才进 stage 2 的审慎裁决——这一段
-     *  权衡 transcript 里的用户意图、能解除拦截，它的结论是最终结论。 */
-    private async classifyToolCall(
-        toolName: string,
-        input: Record<string, any>,
-    ): Promise<{ action: "allow" | "deny" | "confirm"; message?: string }> {
-        // 硬底线（deny 规则）已由 approval 监听器在外层先行（C2）：走到这里的
-        // 调用都过了 deny 规则，本函数专注 fast-path 与分类器两段裁决
-        if (AUTO_MODE_FAST_PATH_TOOLS.has(toolName)) return { action: "allow" };
-
-        if (!this.cordis.get<LlmRuntime>("llm")?.hasRoute(this.llmRoute)) {
-            // 没有可用评估器 → fail-closed。有人在（交互模式）交人工，否则直接拒
-            return this.autoFallback(`${toolName} (auto-mode classifier unavailable)`);
-        }
-        let verdict: { block: boolean; reason: string };
-        try {
-            const rules = loadAutoModeRules();
-            const transcript = buildClassifierTranscript(this.history() as any, { toolName, input });
-            const system = buildClassifierSystem(rules);
-            // CLAUDE.md 走 user 消息，不进 system——它是不可信的仓库内容
-            const claudeMd = loadClaudeMd();
-            // stage 1 — 廉价闸：token 预算只够输出 <block>…
-            const s1raw = await this.runClassifierQuery(system, classifierUserMessage(rules, transcript, rules.suffix_stage1, claudeMd), 256);
-            const s1 = parseBlockVerdict(s1raw);
-            if (!s1.block) {
-                verdict = s1;
-            } else {
-                // stage 2 — 审慎裁决：token 更宽裕，允许裁决前先输出 <thinking> 块
-                const s2raw = await this.runClassifierQuery(system, classifierUserMessage(rules, transcript, rules.suffix_stage2, claudeMd), 1024);
-                verdict = parseBlockVerdict(s2raw);
-            }
-        } catch (e: any) {
-            // 任何装配或分类器错误 → fail-closed（拦），与真 CC 的铁闸一致。
-            // 把资产加载也包进来：规则文件缺失/损坏不能炸掉整轮、孤儿化 tool_use
-            verdict = { block: true, reason: `classifier error: ${e?.message ?? e}` };
-        }
-
-        if (!verdict.block) {
-            this.autoConsecutiveDenials = 0;
-            return { action: "allow" };
-        }
-
-        this.autoConsecutiveDenials++;
-        this.autoTotalDenials++;
-        if (
-            this.autoConsecutiveDenials >= DENIAL_LIMITS.maxConsecutive ||
-            this.autoTotalDenials >= DENIAL_LIMITS.maxTotal
-        ) {
-            // 拒绝太多——分类器可能卡死了。交互模式交还人工；无人值守拒绝
-            // （真 CC 在这里直接中止 agent）
-            printInfo(`Auto Mode: denial limit reached — handing back to manual confirmation.`);
-            return this.autoFallback(`[Auto Mode blocked] ${verdict.reason}`);
-        }
-        return { action: "deny", message: `[Auto Mode] ${verdict.reason}` };
-    }
-
-    /** Auto Mode 兜底：有人就转人工确认，无人（headless）直接拒。绝不返回
-     *  "allow"——意义就在于不让未裁决的动作跑掉。auto 的 confirm 带的是
-     *  单次动作摘要而非路径，一次批准不能给后续同类动作开白名单。 */
-    private autoFallback(message: string): { action: "deny" | "confirm"; message: string } {
-        if (this.confirmFn) return { action: "confirm", message };
-        return { action: "deny", message: `${message} (headless — denied)` };
-    }
-
-    /** 单消息分类器查询，max_tokens 由调用方给定——两段各自定预算
-     *  （stage 1 小闸，stage 2 有思考空间）。temperature 0 保证裁决确定性。 */
-    private async runClassifierQuery(system: string, user: string, maxTokens: number): Promise<string> {
-        const { text } = await this.cordis.require<LlmRuntime>("llm").sideCall({
-            route: this.llmRoute,
-            model: MODEL,
-            maxTokens: maxTokens,
-            system,
-            temperature: 0,
-            messages: [{ role: "user", content: user }],
-        }, this.abortController?.signal);
-        return text;
     }
 
     // 权限模式子 agent 继承规则（防洗白）：裁决在 plugins/subagent.ts 的

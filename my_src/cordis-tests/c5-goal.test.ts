@@ -1,20 +1,37 @@
 // C5 第二段单测：goal 插件的 turn-stopping 决策表。
-// 桥（evaluate/getBudget）注入脚本化桩——不需要 API；全链路（真实评估器 +
-// 请求序列）由场景 15（三态）与场景 29（blocked 注记断言）背书。
+// 桩挂在评估器的真实缝上（D6 起评估器住插件，sideCall 走 ctx.llm）——假适配器
+// 回脚本化 verdict JSON，parseGoalVerdict 真解析；全链路（请求序列）由场景 15
+// （三态）与场景 29（blocked 注记断言）背书。
 // 运行：npm run cordis（tsc && node --test "dist/cordis-tests/*.test.js"）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '../cordis/context.js'
 import { autonomyPlugin, GoalService, type AutonomyBridge } from '../plugins/autonomy.js'
+import { LlmRuntime } from '../services/llm.js'
+import { SessionLog } from '../services/session-log.js'
+import { ToolsService } from '../services/tools.js'
 import type { GoalVerdict } from '../autonomy.js'
+
+const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }
 
 function rig(verdicts: GoalVerdict[], budget = { exceeded: false, reason: '' }) {
   const ctx = new Context()
   let i = 0
+  // agent 树的保底公民：评估器读投影、goal.set 落 meta/note 都要它；
+  // autonomy 插件还要求 tools（schedule_wakeup 注册）
+  new ToolsService(ctx, 'tools')
+  new SessionLog(ctx, 'session-log')
+  const llm = new LlmRuntime(ctx, 'llm')
+  llm.registerAdapter('anthropic', {
+    async *stream() {},
+    async sideCall() {
+      const v = verdicts[Math.min(i++, verdicts.length - 1)]
+      return { text: JSON.stringify(v), usage: ZERO_USAGE }
+    },
+  })
   const steered: string[] = []
   const blocks: (string | undefined)[] = []
   const bridge: AutonomyBridge = {
-    evaluate: async () => verdicts[Math.min(i++, verdicts.length - 1)],
     getBudget: () => budget,
     getMaxTurns: () => null,
     wake: async () => {},

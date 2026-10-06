@@ -36,14 +36,9 @@ export interface ToolExec {
     /** agent 的完整分发链（魔法名 → 注册表）——管线管权限，分发归 agent。
      *  返回 string 即工具输出；返回 TurnConclusion 即工具自结 turn（C5）。 */
     dispatch?: (name: string, input: Record<string, any>) => Promise<string | TurnConclusion>;
-    /** auto 模式的分类器裁决（C2 起由监听器调用；机制留在 Agent）。 */
-    autoAdjudicate?: (name: string, input: Record<string, any>) => Promise<AutoVerdict>;
-}
-
-/** auto 模式分类器的裁决形状（与旧 checkPermission 同形）。 */
-export interface AutoVerdict {
-    action: "allow" | "deny" | "confirm";
-    message?: string;
+    /** 在途请求的中断信号（D6 起取代 autoAdjudicate 句柄——分类器机制
+     *  已迁 auto-approval 插件，管线只需要"能被取消"这件事本身）。 */
+    signal?: AbortSignal;
 }
 
 // ---------- C2：执行管线——pre-execute 瀑布 + 审批 + 执行 + post-execute 瀑布 ----------
@@ -62,8 +57,8 @@ export interface PreExecCall {
     planFilePath?: string;
     /** 注册表定义（permissionHint 元数据在这里）；mcp__/未知名为 undefined。 */
     def?: ToolDefinition;
-    /** auto 模式的分类器句柄（逐调用传入；机制留在 Agent）。 */
-    autoAdjudicate?: (name: string, input: Record<string, any>) => Promise<AutoVerdict>;
+    /** 在途请求的中断信号（分类器旁调要能随 turn 一起被取消）。 */
+    signal?: AbortSignal;
 }
 
 /** executeCall 的结果：正常输出，或被拒（announce = 需要打印的拒绝原因）。 */
@@ -223,7 +218,7 @@ export class ToolsService extends Service {
             mode: call.mode,
             planFilePath: call.planFilePath,
             def: this.get(call.name),
-            autoAdjudicate: exec.autoAdjudicate,
+            signal: exec.signal,
         };
         // 无监听器的裸树 → inner 默认 allow；策略由插件提供
         const decision = await this.ctx.waterfall("tools/pre-execute", preCall, (): PreExecDecision => ({ type: "allow" }));

@@ -65,6 +65,11 @@ export interface LlmAdapter {
 export class LlmRuntime extends Service {
     private adapters = new Map<string, LlmAdapter>();
 
+    /** 缺省路由（env 换后端的唯一开关，D6 起旁路插件同源取用——不再各抄一遍环境变量）。 */
+    get defaultRoute(): string {
+        return process.env.MINI_CLAUDE_LLM_ROUTE || "anthropic";
+    }
+
     registerAdapter(route: string, adapter: LlmAdapter): () => void {
         if (this.adapters.has(route)) {
             throw new Error(`[mini-cordis] llm route "${route}" already registered`);
