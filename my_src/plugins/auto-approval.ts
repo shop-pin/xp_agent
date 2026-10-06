@@ -21,7 +21,7 @@ import {
     loadAutoModeRules, buildClassifierSystem, buildClassifierTranscript, classifierUserMessage,
     parseBlockVerdict,
 } from "../autonomy.js";
-import { printInfo } from "../ui.js";
+import { UiService } from "../services/ui-service.js";
 
 /** auto 模式分类器的裁决形状（与旧 checkPermission 同形）。 */
 export interface AutoVerdict {
@@ -102,7 +102,7 @@ async function classify(ctx: Context, call: PreExecCall, denials: { consecutive:
     if (denials.consecutive >= DENIAL_LIMITS.maxConsecutive || denials.total >= DENIAL_LIMITS.maxTotal) {
         // 拒绝太多——分类器可能卡死了。交互模式交还人工；无人值守拒绝
         // （真 CC 在这里直接中止 agent）
-        printInfo(`Auto Mode: denial limit reached — handing back to manual confirmation.`);
+        ctx.require<UiService>("ui").info(`Auto Mode: denial limit reached — handing back to manual confirmation.`);
         return autoFallback(ctx, `[Auto Mode blocked] ${verdict.reason}`);
     }
     return { action: "deny", message: `[Auto Mode] ${verdict.reason}` };

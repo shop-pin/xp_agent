@@ -18,13 +18,14 @@ import type { Context } from "../cordis/context.js";
 import { checkPermissionRules, isDangerous } from "../permissions.js";
 import { monotonic, type PreExecCall, type PreExecDecision } from "../services/tools.js";
 import { ApprovalService, type ApprovalProvider } from "../services/approval.js";
-import { printConfirmation } from "../ui.js";
+import { UiService } from "../services/ui-service.js";
 
 export { ApprovalService };
 
 // 旧 confirmDangerous 的展示职责留在这里：问什么先打出来，回调只收 y/n
-const replFallbackProvider: ApprovalProvider = async (_call, message) => {
-    printConfirmation(message);
+//（E1：横幅经 ctx.ui 渲染器出——provider 改为 apply 里闭包 ui 的工厂产物）
+const makeReplFallbackProvider = (ui: UiService): ApprovalProvider => async (_call, message) => {
+    ui.confirmation(message);
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise<"allow-once" | "deny">((resolve) => {
         rl.question("  Allow? (y/n): ", (answer) => {
@@ -89,7 +90,7 @@ export const approvalPlugin = {
     name: "approval",
     apply(ctx: Context) {
         const approval = new ApprovalService(ctx, "approval");
-        approval.setFallbackProvider(replFallbackProvider);
+        approval.setFallbackProvider(makeReplFallbackProvider(ctx.require<UiService>("ui")));
         ctx.on("tools/pre-execute", monotonic(staticPipeline));
     },
 };

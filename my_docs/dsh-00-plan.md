@@ -224,7 +224,9 @@
 | D4 | ✅ 完成（2026-10-06） | `dsh-D4.md`；AgentHandle.inject（next-step 不唤醒）+ memory 插件（turn 边界发起、落定即注入——轮询与就地改写消亡）；**注入入日志（C3 的 memory 盲区闭合，设计决策记档）**；pre-step payload 增 boundary；场景 8 零断言变更；cordis 131/131、mock 28 场景全绿；建议 commit：`migrate memory recall to turn-boundary plugin with inject seam` |
 | D5 | ✅ 完成（2026-10-06） | `dsh-D5.md`；compaction 插件（T1–T3 → message/replace 链式投影、T4 → history/truncate 重建 + /compact 直调、仪表随层迁移）+ snippable 元数据（SNIPPABLE_TOOLS 消亡）；**this.messages 工作集退役——请求组装走 derive()，日志升格唯一存储（"日志即真相"兑现）**；连续 user 合并迁投影层 fold（ch27 抓到的归属错位回归，翻车记档 §4）；场景 7/21/4/32 零断言变更；cordis 131/131、mock 27 场景全绿；commit：`migrate compaction to projection events with append-only log and derive-driven requests` |
 | D6 | ✅ 完成（2026-10-06，D 阶段收官） | `dsh-D6.md`；ScheduleService（键控 after/cancel + wakeup 意图槽，LoopService shed timer/pendingWakeup）+ goal 评估器/auto 分类器机制迁插件（autoAdjudicate 句柄消亡 → ToolExec.signal + approval.hasInteractiveProvider）+ schedule_wakeup 注册表化（**B5 最后魔法名退役**）；桥瘦到 3 方法；llm.defaultRoute 统一路由出处；confirmFn 死字段消亡；测试桩从句柄缝移到 llm 缝（c2/c5）；场景 7/15/19/24/26/29/31 零断言变更；cordis 131/131、mock 27 场景全绿 |
-| E1..E3 | 未开始（下次从这继续） | — |
+| E1 | ✅ 完成（2026-10-06） | `dsh-E1.md`；CommandService + commands 插件（cli slash if 链 130 行消亡，横幅消费注册表）+ UiService（消息面订阅 session-log 渲染 tool/call、叙事面 ctx.ui.\*，引擎 48 直印点清零、渲染器可替换）+ SIGINT→cancel(cause)；ui.ts 死函数清退；测试树补 ui 公民（4 文件 7 树）；mock 27 全绿零断言变更、cordis 131/131；**REPL 手测清单待用户终端过一遍**（文档 §4） |
+| E2 | 未开始（下次从这继续） | bundle/profile 简版：插件清单分层（base + app patch）+ `--patch` 覆盖 + `--dump-config`；验收：同一份 my_src 组装出"全功能"与"无 auto-mode"两个 agent |
+| E3 | 未开始 | snapshot 回归与收官（对齐 dsh `test:snapshot`：录请求/事件序列，无 key 重放断言）+ mini-cordis vs 真 Cordis 差异清单 + dsh 源码导读地图 |
 
 > 约定：每章完成时在本表打勾，并在 `my_docs/dsh-<n>.md` 末尾附"翻车记档 + 自测题"。
 > 模式（2026-10-03 起）：每章 = Claude 写讲解 md → 自动实现代码 → 验证（cordis 测试 + 22 mock 回归）→ 复查文档 → 给 commit comment（用户自己提交）→ 问是否开下一章。

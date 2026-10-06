@@ -20,7 +20,7 @@ import type { PermissionMode } from "../permissions.js";
 import type { ToolDef } from "../tools.js";
 import { toolDefinitions } from "../tools.js";
 import { getSubAgentConfig, type SubAgentType } from "../subagent.js";
-import { printSubAgentStart, printSubAgentEnd } from "../ui.js";
+import { UiService } from "../services/ui-service.js";
 
 /** 排除表（数据即文档）：agent 防递归失控；schedule_wakeup 是 loop 驱动内部工具。 */
 export const DEFAULT_EXCLUDES: ReadonlySet<string> = new Set(["agent", "schedule_wakeup"]);
@@ -86,6 +86,7 @@ export const subagentPlugin = {
         if (config.enabled === false) return;
         const agents = ctx.require<AgentRegistry>("agents");
         const tools = ctx.require<ToolsService>("tools");
+        const ui = ctx.require<UiService>("ui");
         const def = toolDefinitions.find((t) => t.name === "agent")!;
         tools.register({
             name: "agent",
@@ -97,7 +98,7 @@ export const subagentPlugin = {
                 const description = input.description || "sub-agent task";
                 const prompt = input.prompt || "";
 
-                printSubAgentStart(type, description);
+                ui.subAgentStart(type, description);
                 const preset = buildPresetFromType(type, config.bridge.parentMode());
                 const child: AgentHandle = agents.create({
                     customSystemPrompt: preset.systemPrompt,
@@ -109,10 +110,10 @@ export const subagentPlugin = {
                     const result = await child.runOnce(prompt);
                     // 子对话的消耗也是真实成本：token 增量记回父级，费用统计才完整
                     config.bridge.addTokens(result.tokens.input, result.tokens.output);
-                    printSubAgentEnd(type, description);
+                    ui.subAgentEnd(type, description);
                     return result.text || "(Sub-agent produced no output)";
                 } catch (e: any) {
-                    printSubAgentEnd(type, description);
+                    ui.subAgentEnd(type, description);
                     return `Sub-agent error: ${e.message}`;
                 }
             },

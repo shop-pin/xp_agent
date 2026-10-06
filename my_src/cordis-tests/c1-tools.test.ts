@@ -21,10 +21,12 @@ import { coreExecTools } from '../plugins/core-exec-tools.js'
 import { coreMetaTools } from '../plugins/core-meta-tools.js'
 import { subagentPlugin } from '../plugins/subagent.js'
 import { AgentRegistry } from '../services/agents.js'
+import { UiService } from '../services/ui-service.js'
 
 function buildTree(): { ctx: Context; tools: ToolsService } {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui') // subagent 插件 apply 时 require（E1：树的保底公民）
   new AgentRegistry(ctx, 'agents')
   ctx.plugin(coreFsTools)
   ctx.plugin(coreExecTools)

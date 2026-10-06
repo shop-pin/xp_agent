@@ -1,21 +1,5 @@
 import chalk from "chalk";
 
-export function printWelcome() {
-    console.log(
-        chalk.bold.cyan("\n  Mini Claude Code") +
-        chalk.gray(" — A minimal coding agent\n")
-    );
-    console.log(chalk.gray("  Type your request, or 'exit' to quit."));
-    console.log(chalk.gray("  Commands: /clear /plan /cost /compact /memory /skills"));
-    console.log(chalk.gray("  /goal <condition>  Pursue a goal across turns until an evaluator judges it met"));
-    console.log(chalk.gray("  /goal              Show the active goal's status"));
-    console.log(chalk.gray("  /loop [interval] <prompt>  Re-run a prompt on an interval (5m/2h) or self-paced\n"));
-}
-
-export function printUserPrompt() {
-    process.stdout.write(chalk.bold.green("\n> "));
-}
-
 export function printAssistantText(text: string) {
     process.stdout.write(text);
 }
@@ -26,46 +10,6 @@ export function printToolCall(name: string, input: Record<string, any>) {
     console.log(chalk.yellow(`\n  ${icon} ${name}`) + chalk.gray(` ${summary}`));
 }
 
-export function printToolResult(name: string, result: string) {
-    if ((name === "edit_file" || name === "write_file") && !result.startsWith("Error")) {
-        printFileChangeResult(name, result);
-        return;
-    }
-    const maxLen = 500;
-    const truncated =
-        result.length > maxLen
-            ? result.slice(0, maxLen) + chalk.gray(`\n  ... (${result.length} chars total)`)
-            : result;
-    const lines = truncated.split("\n").map((l) => "  " + l);
-    console.log(chalk.dim(lines.join("\n")));
-}
-
-function printFileChangeResult(name: string, result: string) {
-    const lines = result.split("\n");
-    console.log(chalk.dim("  " + lines[0]));
-
-    const maxDisplayLines = 40;
-    const contentLines = lines.slice(1);
-    const displayLines = contentLines.slice(0, maxDisplayLines);
-
-    for (const line of displayLines) {
-        if (!line.trim()) {
-            continue;
-        } else if (line.startsWith("@@")) {
-            console.log(chalk.cyan("  " + line));
-        } else if (line.startsWith("- ")) {
-            console.log(chalk.red("  " + line));
-        } else if (line.startsWith("+ ")) {
-            console.log(chalk.green("  " + line));
-        } else {
-            console.log(chalk.dim("  " + line));
-        }
-    }
-    if (contentLines.length > maxDisplayLines) {
-        console.log(chalk.gray(`  ... (${contentLines.length - maxDisplayLines} more lines)`));
-    }
-}
-
 export function printError(msg: string) {
     console.error(chalk.red(`\n  Error: ${msg}`));
 }
@@ -74,10 +18,6 @@ export function printConfirmation(command: string): void {
     console.log(
         chalk.yellow("\n  ⚠ Dangerous command: ") + chalk.white(command)
     );
-}
-
-export function printDivider() {
-    console.log(chalk.gray("\n  " + "─".repeat(50)));
 }
 
 export function printCost(inputTokens: number, outputTokens: number, cacheRead = 0, cacheCreation = 0) {

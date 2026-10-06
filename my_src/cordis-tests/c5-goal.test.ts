@@ -10,6 +10,7 @@ import { autonomyPlugin, GoalService, type AutonomyBridge } from '../plugins/aut
 import { LlmRuntime } from '../services/llm.js'
 import { SessionLog } from '../services/session-log.js'
 import { ToolsService } from '../services/tools.js'
+import { UiService } from '../services/ui-service.js'
 import type { GoalVerdict } from '../autonomy.js'
 
 const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }
@@ -18,8 +19,9 @@ function rig(verdicts: GoalVerdict[], budget = { exceeded: false, reason: '' }) 
   const ctx = new Context()
   let i = 0
   // agent 树的保底公民：评估器读投影、goal.set 落 meta/note 都要它；
-  // autonomy 插件还要求 tools（schedule_wakeup 注册）
+  // autonomy 插件还要求 tools（schedule_wakeup 注册）与 ui（叙事面）
   new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui')
   new SessionLog(ctx, 'session-log')
   const llm = new LlmRuntime(ctx, 'llm')
   llm.registerAdapter('anthropic', {

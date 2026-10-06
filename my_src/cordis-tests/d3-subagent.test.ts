@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 import { Context } from '../cordis/context.js'
 import { ToolsService } from '../services/tools.js'
 import { AgentRegistry } from '../services/agents.js'
+import { UiService } from '../services/ui-service.js'
 import {
   subagentPlugin, buildPresetFromType, buildPresetFromSkill,
   childModeOf, DEFAULT_EXCLUDES, type SubagentBridge,
@@ -48,6 +49,7 @@ test('buildPresetFromSkill：白名单在父工具集上解析 + 排除表兜底
 test('插件注册 agent 工具（真 execute）；enabled=false 不注册', () => {
   const ctx = new Context()
   new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui') // subagent 插件 apply 时 require（E1：树的保底公民）
   new AgentRegistry(ctx, 'agents')
   ctx.plugin(subagentPlugin, { bridge })
   const def = ctx.require<ToolsService>('tools').get('agent')

@@ -19,7 +19,7 @@ import type { TokenUsage } from "../services/session-log.js";
 import type { ToolsService } from "../services/tools.js";
 import type { LlmRuntime } from "../services/llm.js";
 import { MODEL } from "../services/llm.js";
-import { printInfo } from "../ui.js";
+import { UiService } from "../services/ui-service.js";
 
 const MODEL_CONTEXT: Record<string, number> = {
     "glm-4.7-flash": 128000,
@@ -55,6 +55,10 @@ export class CompactionService extends Service {
         return this.ctx.require<SessionLog>("session-log");
     }
 
+    private get ui(): UiService {
+        return this.ctx.require<UiService>("ui");
+    }
+
     /** 每个 assistant 结算后记账（agent 循环调用）。 */
     recordUsage(usage: TokenUsage): void {
         this.lastInputTokenCount = usage.input + usage.cacheRead + usage.cacheCreation + usage.output;
@@ -72,9 +76,9 @@ export class CompactionService extends Service {
     /** T4 门：唯一要花 API 的一层。0.85 线，turn 边界才检查。 */
     async checkAndCompact(): Promise<void> {
         if (this.lastInputTokenCount > this.effectiveWindow * 0.85) {
-            printInfo("Context window filling up, compacting conversation...");
+            this.ui.info("Context window filling up, compacting conversation...");
             const compacted = await this.compact();
-            if (compacted) printInfo("Conversation compacted.");
+            if (compacted) this.ui.info("Conversation compacted.");
         }
     }
 
@@ -231,7 +235,7 @@ export class CompactionService extends Service {
             carryTail = false;
         } else {
             // ③ 或未知形态——fail-closed：不发注定非法的摘要请求
-            printInfo("Cannot compact here: history ends mid-tool-batch. Try again after the next exchange.");
+            this.ui.info("Cannot compact here: history ends mid-tool-batch. Try again after the next exchange.");
             return false;
         }
         const llm = this.ctx.get<LlmRuntime>("llm");

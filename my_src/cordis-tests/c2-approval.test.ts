@@ -19,6 +19,7 @@ import { coreExecTools } from '../plugins/core-exec-tools.js'
 import { coreMetaTools } from '../plugins/core-meta-tools.js'
 import { LlmRuntime, type LlmAdapter } from '../services/llm.js'
 import { SessionLog } from '../services/session-log.js'
+import { UiService } from '../services/ui-service.js'
 
 const EXECUTED = 'EXECUTED'
 const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }
@@ -49,6 +50,7 @@ interface Harness {
 function buildTree(autoYes: boolean): Harness {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui') // approval/auto 插件 apply 时 require（E1：树的保底公民）
   // 工具插件必须先注册：permissionHint 元数据在 def 上，九段流水线要读它
   //（dispatch 桩接管执行，工具的 execute 不会真跑）
   ctx.plugin(coreFsTools)
@@ -201,6 +203,7 @@ test('fail-closed：ask 时没有审批服务的树直接拒', async () => {
 test('auto fast-path：只读工具放行且不惊动分类器；web_fetch 刻意不走 fast-path', async () => {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui')
   new SessionLog(ctx, 'session-log')
   ctx.plugin(approvalPlugin)
   ctx.plugin(autoApprovalPlugin)
@@ -222,6 +225,7 @@ test('auto fast-path：只读工具放行且不惊动分类器；web_fetch 刻�
 test('auto 裁决映射：分类器 block/deny 落 deny；分类器不可用 + 有人 → confirm 落 ask', async () => {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui')
   new SessionLog(ctx, 'session-log')
   ctx.plugin(approvalPlugin)
   ctx.plugin(autoApprovalPlugin)
@@ -236,6 +240,7 @@ test('auto 裁决映射：分类器 block/deny 落 deny；分类器不可用 + �
   // 没有分类器的树 + interactive provider 在 → autoFallback 转人工（旧 confirm 路径）
   const ctx2 = new Context()
   const tools2 = new ToolsService(ctx2, 'tools')
+  new UiService(ctx2, 'ui')
   ctx2.plugin(approvalPlugin)
   ctx2.plugin(autoApprovalPlugin)
   const approval = ctx2.require<ApprovalService>('approval')

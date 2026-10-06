@@ -37,7 +37,9 @@ import { randomUUID } from "crypto";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { printToolCall, printAssistantText, printInfo, printError, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
+import { UiService } from "./services/ui-service.js";
+import { CommandService } from "./services/commands.js";
+import { commandsPlugin, type CommandsBridge } from "./plugins/commands.js";
 
 // D5：四层压缩（T1 budget → T2 snip → T3 microcompact → T4 compact）整体迁
 // plugins/compaction.ts——事件化（message/replace + history/truncate），
@@ -68,6 +70,8 @@ export class Agent implements AgentHandle {
     private cordis: Context;
     // 会话事件日志——唯一存储（D5：请求组装走 derive，C3 的双写/发散点闭合）
     private sessionLog: SessionLog;
+    // E1：REPL 命令注册表（cli 只消费 dispatch；注册在 commands 插件）
+    readonly commands: CommandService;
     // C4：handle 面与 inbox 驱动——输入是数据，认领发生在循环边界
     readonly inbox: Inbox = new Inbox();
     private statusValue: AgentStatus = "idle";
@@ -120,6 +124,11 @@ export class Agent implements AgentHandle {
         this.cordis = new Context();
         new ToolsService(this.cordis, "tools");
         this.sessionLog = new SessionLog(this.cordis, "session-log");
+        // E1：UI 消费者化——消息面（tool/call）由本服务订阅日志渲染，引擎不直印；
+        // 叙事面经 ctx.ui.* 出（渲染器可替换）。命令注册表同批落地（cli 只消费）。
+        const uiService = new UiService(this.cordis, "ui");
+        uiService.attachSessionLog();
+        this.commands = new CommandService(this.cordis, "commands");
         // C6：LLM seam 先立服务，适配器插件经 inject 等它（首个业务级 inject 依赖）
         new LlmRuntime(this.cordis, "llm");
         this.cordis.plugin(llmAnthropicPlugin);
@@ -140,6 +149,9 @@ export class Agent implements AgentHandle {
         // D1：skills provider registry。目录注入走 pre-step 监听器（子 agent 不注
         // ——system/白名单已定界），工具与 slash 直调都查这个 registry
         this.cordis.plugin(skillsPlugin, { catalogInjection: !this.isSubAgent });
+        // E1：REPL slash 命令 = 插件注册（cli 只剩 dispatch 消费）。依赖 skills
+        // 注册表（技能回退），故随其后
+        this.cordis.plugin(commandsPlugin, this.commandsBridge());
         // D2：MCP 桥接（子 agent 不连接；ensure 保持 turn 开场的惰性时机）
         this.cordis.plugin(mcpBridgePlugin, { enabled: !this.isSubAgent });
         // D3：子 agent 走 registry + preset（agent 工具的 execute 在插件里；
@@ -190,6 +202,28 @@ export class Agent implements AgentHandle {
         }
     }
 
+    /** E1：叙事面出口（渲染器可替换；输出与旧 print* 逐字节一致）。 */
+    private get ui(): UiService {
+        return this.cordis.require<UiService>("ui");
+    }
+
+    /** E1：REPL 动词 → agent 能力（命令插件经它注册 slash 命令）。 */
+    private commandsBridge(): CommandsBridge {
+        return {
+            clearHistory: () => this.clearHistory(),
+            togglePlanMode: () => this.togglePlanMode(),
+            showCost: () => this.showCost(),
+            compact: () => this.compactAnthropic(),
+            showGoal: () => this.showGoal(),
+            startGoal: async (condition: string) => {
+                const directive = this.setGoal(condition);
+                await this.pursueGoal(directive);
+            },
+            runLoop: (rest: string) => this.runLoop(rest),
+            send: (text: string) => this.send(text),
+        };
+    }
+
     /** D5：消息视图 = 日志投影（工作集消亡；每次现 derive，深拷贝安全）。 */
     history(): Anthropic.MessageParam[] {
         return this.sessionLog.derive().messages;
@@ -237,13 +271,13 @@ export class Agent implements AgentHandle {
             this.setMode(this.prePlanMode || "default");
             this.prePlanMode = null;
             this.planFilePath = null;
-            printInfo(`Exited plan mode → ${this.mode} mode`);
+            this.ui.info(`Exited plan mode → ${this.mode} mode`);
             return this.mode;
         }
         this.prePlanMode = this.mode;
         this.setMode("plan");
         this.planFilePath = this.generatePlanFilePath();
-        printInfo(`Entered plan mode. Plan file: ${this.planFilePath}`);
+        this.ui.info(`Entered plan mode. Plan file: ${this.planFilePath}`);
         return "plan";
     }
 
@@ -306,7 +340,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         const cacheInfo = (cached || this.totalCacheCreationTokens)
             ? `\n  Cache: ${cached} read / ${this.totalCacheCreationTokens} write (${hitRate}% of input from cache)`
             : "";
-        printInfo(
+        this.ui.info(
             `Tokens: ${this.totalInputTokens} in / ${this.totalOutputTokens} out${cacheInfo}\n  Estimated cost: $${total.toFixed(4)}${budgetInfo}${turnInfo}`
         );
     }
@@ -357,7 +391,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     setConfirmFn(fn: (message: string) => Promise<boolean>): void {
         const approval = this.cordis.get<ApprovalService>("approval");
         approval?.setInteractiveProvider(async (_call, message) => {
-            printConfirmation(message);
+            this.ui.confirmation(message);
             return (await fn(message)) ? "allow-once" : "deny";
         });
     }
@@ -413,7 +447,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if (goalCondition) goal.set(goalCondition);
             else goal.clear();
         }
-        printInfo(`Session restored (${this.sessionLog.derive().messages.length} messages).`);
+        this.ui.info(`Session restored (${this.sessionLog.derive().messages.length} messages).`);
         return true;
     }
 
@@ -471,7 +505,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
      *  状态在 ctx.goal 服务；追逐决策在 goal 插件的 turn-stopping 监听器。 */
     setGoal(condition: string): string {
         this.cordis.require<GoalService>("goal").set(condition);
-        printInfo(`◎ /goal active — Stop hook condition: "${condition}"`);
+        this.ui.info(`◎ /goal active — Stop hook condition: "${condition}"`);
         return goalDirective(condition);
     }
 
@@ -479,12 +513,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     showGoal(): void {
         const goal = this.cordis.get<GoalService>("goal")?.active;
         if (!goal) {
-            printInfo("No active goal. Set one with /goal <condition>.");
+            this.ui.info("No active goal. Set one with /goal <condition>.");
             return;
         }
         const secs = ((Date.now() - goal.startedAt) / 1000).toFixed(1);
         const last = goal.lastReason ? `\n  last reason: ${goal.lastReason}` : "";
-        printInfo(
+        this.ui.info(
             `◎ /goal active\n  condition: ${goal.condition}\n  iterations: ${goal.iterations}\n  elapsed: ${secs}s${last}`
         );
     }
@@ -498,7 +532,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (!goal.active) return;
         try {
             await this.chat(directive);
-            if (goal.stopped) printInfo("Goal pursuit interrupted.");
+            if (goal.stopped) this.ui.info("Goal pursuit interrupted.");
         } finally {
             goal.clear();
         }
@@ -515,7 +549,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async runLoop(rawInput: string): Promise<void> {
         const spec = parseLoopInput(rawInput);
         if ("error" in spec) {
-            printInfo(spec.error);
+            this.ui.info(spec.error);
             return;
         }
         // 云排程决策点（间隔 ≥60min 或 daily 措辞）——教学版只提示不实现
@@ -523,18 +557,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             (spec.mode === "interval" && spec.intervalSeconds! >= OFFER_CLOUD_THRESHOLD_SECONDS) ||
             isDailyWording(rawInput);
         if (wantsCloud) {
-            printInfo("(Real Claude Code would offer to convert this to a persistent cloud schedule that keeps running after the session ends. This teaching build has no cloud backend — continuing in-session.)");
+            this.ui.info("(Real Claude Code would offer to convert this to a persistent cloud schedule that keeps running after the session ends. This teaching build has no cloud backend — continuing in-session.)");
         }
 
         const loop = this.cordis.require<LoopService>("loop");
         const done = loop.start(spec);
         if (spec.mode === "interval") {
-            printInfo(`⟳ /loop scheduled every ${spec.intervalLabel} (session-only, not persisted — dies when this process exits). Ctrl+C to stop.`);
-            printInfo(`⟳ loop tick 1`);
+            this.ui.info(`⟳ /loop scheduled every ${spec.intervalLabel} (session-only, not persisted — dies when this process exits). Ctrl+C to stop.`);
+            this.ui.info(`⟳ loop tick 1`);
         } else {
             // schedule_wakeup 只在 dynamic loop 期间广告（场景 24 的门控锚）
             this.setScheduleWakeupToolVisible(true);
-            printInfo("⟳ /loop dynamic (self-paced) — the model schedules its own next run, or ends the loop. Ctrl+C to stop.");
+            this.ui.info("⟳ /loop dynamic (self-paced) — the model schedules its own next run, or ends the loop. Ctrl+C to stop.");
         }
         try {
             // tick 1 走 chat（followup 语义）；后续 tick 由监听器定时 wake 注入
@@ -602,7 +636,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (this.statusValue === "idle") {
             // 无 awaiter 的驱动：错误在此兜底（abort 静默——SIGINT 语义，不刷屏）
             void this.ensureDriver().catch((e) => {
-                if (!isAbortLike(e)) printError(`Agent driver error: ${e instanceof Error ? e.message : String(e)}`);
+                if (!isAbortLike(e)) this.ui.error(`Agent driver error: ${e instanceof Error ? e.message : String(e)}`);
             });
         }
     }
@@ -621,12 +655,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     /** SIGINT 收口：停 loop/goal 标志、清 inbox（dsh 默认——打断后的下一条输入
      *  获得干净上下文，旧插话不再暗处生效）、abort 在途请求。settle 以 abort
-     *  错误 reject 给 awaiter（保持旧 chat() 的抛错语义）。 */
-    cancel(_cause?: unknown): void {
+     *  错误 reject 给 awaiter（保持旧 chat() 的抛错语义）。E1：busy 时经 ui
+     *  报告 cause——CLI 不再需要判忙和打印，中断的知识收口在这里。 */
+    cancel(cause?: unknown): void {
+        const busy = this.busy;
         this.stopLoop();
         this.stopGoal();
         this.inbox.clear();
         this.abortController?.abort();
+        if (busy && cause != null) this.ui.info(String(cause));
     }
 
     /** 兼容入口（goal/loop/subagent/one-shot 沿用）：followup + await settle。 */
@@ -746,7 +783,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.sessionLog.append({ type: "turn/start" });
             // T1–T3 零成本层：每次发请求前过一遍（D5：事件化——追加 replace 投影）
             this.cordis.require<CompactionService>("compaction").runPipeline();
-            if (!this.isSubAgent) startSpinner();
+            if (!this.isSubAgent) this.ui.spinnerStart();
             let firstText = true;
             let settlement: Settlement;
             // C3：system 进日志（对比去重——动态段未变不重复 append）。
@@ -771,12 +808,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     (t) => {
                         // src 同款协调：首个 text 先停 spinner 再打印，避免 \r 重画
                         // 吃掉流式输出；纯工具调用响应没有 text，靠 finally 兜底
-                        if (!this.isSubAgent && firstText) { stopSpinner(); firstText = false; }
+                        if (!this.isSubAgent && firstText) { this.ui.spinnerStop(); firstText = false; }
                         this.emitText(t);
                     },
                 ));
             } finally {
-                if (!this.isSubAgent) stopSpinner();
+                if (!this.isSubAgent) this.ui.spinnerStop();
             }
             this.emitText("\n");
             // 四计数：缓存读/写分开累计；lastInputTokenCount = 本次 prompt 全量 + 输出
@@ -802,7 +839,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 });
                 this.endTurn(stopReason);
                 if (!this.isSubAgent) {
-                    printCost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
+                    this.ui.cost(this.totalInputTokens, this.totalOutputTokens, this.totalCacheReadTokens, this.totalCacheCreationTokens);
                 }
                 break;
             }
@@ -813,7 +850,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.currentTurns++;
             const budget = this.checkBudget();
             if (budget.exceeded) {
-                printInfo(`Budget exceeded: ${budget.reason}`);
+                this.ui.info(`Budget exceeded: ${budget.reason}`);
                 this.endTurn("budget");
                 this.pushUser(toolUses.map((tu) => {
                     this.sessionLog.append({ type: "tool/result", callId: tu.id, content: `Tool call not executed: ${budget.reason}`, isError: true });
@@ -837,7 +874,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     // 历史里挂着无回应的 tool_use，之后每个请求都 400（历史永久污染）
                     let output: string;
                     try {
-                        printToolCall(tu.name, tu.input as Record<string, any>);
+                        // 工具调用直印已消亡（E1）——UI 服务订阅日志，tool/call 事件驱动渲染
                         this.sessionLog.append({ type: "tool/call", id: tu.id, name: tu.name, input: tu.input as Record<string, any> });
                         // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
                         // → 审批 → dispatch → post-execute）。D6 起 auto 分类器机制
@@ -851,7 +888,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             },
                         );
                         if (outcome.kind === "denied") {
-                            if (outcome.announce) printInfo(`Denied: ${outcome.announce}`);
+                            if (outcome.announce) this.ui.info(`Denied: ${outcome.announce}`);
                             toolResult.push({ type: "tool_result", tool_use_id: tu.id, content: outcome.content });
                             this.sessionLog.append({ type: "tool/result", callId: tu.id, content: outcome.content, isError: true });
                             continue;
@@ -919,7 +956,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.prePlanMode = this.mode;
             this.setMode("plan");
             this.planFilePath = this.generatePlanFilePath();
-            printInfo("Entered plan mode (read-only). Plan file: " + this.planFilePath);
+            this.ui.info("Entered plan mode (read-only). Plan file: " + this.planFilePath);
             return `Entered plan mode. You are now in read-only mode.\n\nYour plan file: ${this.planFilePath}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode.`;
         }
 
@@ -959,7 +996,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 if (result.choice === "clear-and-execute") {
                     this.clearHistoryKeepSystem();
-                    printInfo(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
+                    this.ui.info(`Plan approved. Context cleared, executing in ${targetMode} mode.`);
                     // C5：签发 TurnConclusion 而非私有信号位——循环按结论收束本
                     // turn，注入文本经 inbox 开新 turn（旧 contextCleared 改道消亡）
                     return {
@@ -969,7 +1006,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     };
                 }
 
-                printInfo(`Plan approved. Executing in ${targetMode} mode.`);
+                this.ui.info(`Plan approved. Executing in ${targetMode} mode.`);
                 return `User approved the plan. Permission mode: ${targetMode}\n\n## Approved Plan:\n${planContent}\n\nProceed with implementation.`;
             }
 
@@ -977,7 +1014,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.setMode(this.prePlanMode || "default");
             this.prePlanMode = null;
             this.planFilePath = null;
-            printInfo("Exited plan mode. Restored to " + this.mode + " mode.");
+            this.ui.info("Exited plan mode. Restored to " + this.mode + " mode.");
             return `Exited plan mode. Permission mode restored to: ${this.mode}\n\n## Your Plan:\n${planContent}`;
         }
 
@@ -1009,7 +1046,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             // schedule_wakeup 防驱动内部工具外流），创建走 ctx.agents
             const preset = buildPresetFromSkill(skill, this.mode, this.tools);
 
-            printSubAgentStart("skill-fork", input.skill_name);
+            this.ui.subAgentStart("skill-fork", input.skill_name);
             const subAgent = this.cordis.require<AgentRegistry>("agents").create({
                 customSystemPrompt: prompt,
                 customTools: preset.tools,
@@ -1021,10 +1058,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 const subResult = await subAgent.runOnce(input.args || "Execute this skill task.");
                 this.totalInputTokens += subResult.tokens.input;
                 this.totalOutputTokens += subResult.tokens.output;
-                printSubAgentEnd("skill-fork", input.skill_name);
+                this.ui.subAgentEnd("skill-fork", input.skill_name);
                 return subResult.text || "(Skill produced no output)";
             } catch (e: any) {
-                printSubAgentEnd("skill-fork", input.skill_name);
+                this.ui.subAgentEnd("skill-fork", input.skill_name);
                 return `Skill fork error: ${e.message}`;
             }
         }
@@ -1053,7 +1090,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (this.outputBuffer) {
             this.outputBuffer.push(text);
         } else {
-            printAssistantText(text);
+            this.ui.text(text);
         }
     }
 }

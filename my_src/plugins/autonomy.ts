@@ -22,7 +22,7 @@ import {
     parseGoalVerdict, clampWakeupDelay, SCHEDULE_WAKEUP_TOOL,
     type GoalVerdict, type LoopSpec,
 } from "../autonomy.js";
-import { printInfo, printError } from "../ui.js";
+import { UiService } from "../services/ui-service.js";
 import type { TurnStoppingState } from "../services/agents.js";
 import type { SessionLog } from "../services/session-log.js";
 import { MODEL, LlmRuntime } from "../services/llm.js";
@@ -102,9 +102,13 @@ export class LoopService extends Service {
     stop(): void {
         this.stopFlag = true;
         if (this.ctx.get<ScheduleService>("schedule")?.has("loop-tick")) {
-            printInfo("Loop stopped.");
+            this.ui.info("Loop stopped.");
             this.finish();
         }
+    }
+
+    private get ui(): UiService {
+        return this.ctx.require<UiService>("ui");
     }
 
     finish(): void {
@@ -178,6 +182,8 @@ export const autonomyPlugin = {
         const schedule = new ScheduleService(ctx, "schedule");
         const goal = new GoalService(ctx, "goal");
         const loop = new LoopService(ctx, "loop");
+        // 叙事面出口（E1）——goal/loop 的状态旁白经 ui 渲染器出
+        const ui = ctx.require<UiService>("ui");
 
         // D6：schedule_wakeup 收口为注册表公民——B5 的最后一个魔法名在此消亡。
         // schema 仍由 agent 广播（this.tools 数组是广告线，只在 dynamic loop 期
@@ -204,12 +210,12 @@ export const autonomyPlugin = {
             if (verdict.ok) {
                 const turns = g.iterations + 1;
                 const secs = ((Date.now() - g.startedAt) / 1000).toFixed(1);
-                printInfo(`✓ Goal achieved (${turns} turn${turns === 1 ? "" : "s"}, ${secs}s): ${verdict.reason}`);
+                ui.info(`✓ Goal achieved (${turns} turn${turns === 1 ? "" : "s"}, ${secs}s): ${verdict.reason}`);
                 goal.clear();
                 return;
             }
             if (verdict.impossible) {
-                printInfo(`Hooks: Prompt hook condition judged impossible: ${verdict.reason}`);
+                ui.info(`Hooks: Prompt hook condition judged impossible: ${verdict.reason}`);
                 goal.clear();
                 state.block(verdict.reason);
                 return;
@@ -217,16 +223,16 @@ export const autonomyPlugin = {
             // 未达：记录并决定是否还允许下一轮
             g.iterations++;
             g.lastReason = verdict.reason;
-            printInfo(`Hooks: Prompt hook condition was not met: ${verdict.reason}`);
+            ui.info(`Hooks: Prompt hook condition was not met: ${verdict.reason}`);
 
             const budget = bridge.getBudget();
             if (budget.exceeded) {
-                printInfo(`Goal stopped: ${budget.reason}`);
+                ui.info(`Goal stopped: ${budget.reason}`);
                 goal.clear();
                 return;
             }
             if (g.iterations >= GOAL_MAX_ITERATIONS) {
-                printInfo(`Goal stopped: reached ${GOAL_MAX_ITERATIONS} iterations without meeting the condition.`);
+                ui.info(`Goal stopped: reached ${GOAL_MAX_ITERATIONS} iterations without meeting the condition.`);
                 goal.clear();
                 return;
             }
@@ -240,36 +246,36 @@ export const autonomyPlugin = {
             if (!s) return;
             if (loop.stopFlag) {
                 // stop 落在 turn 进行中（定时器期由 stop() 自己收尾）
-                printInfo("Loop stopped.");
+                ui.info("Loop stopped.");
                 loop.finish();
                 return;
             }
             const dynamic = s.spec.mode === "dynamic";
             const wakeup = schedule.takeWakeup();
             if (dynamic && !wakeup) {
-                printInfo(`⟳ Loop converged after ${s.iterations} tick${s.iterations === 1 ? "" : "s"} (model scheduled no wakeup).`);
+                ui.info(`⟳ Loop converged after ${s.iterations} tick${s.iterations === 1 ? "" : "s"} (model scheduled no wakeup).`);
                 loop.finish();
                 return;
             }
             const budget = bridge.getBudget();
             if (budget.exceeded) {
-                printInfo(`Loop stopped: ${budget.reason}`);
+                ui.info(`Loop stopped: ${budget.reason}`);
                 loop.finish();
                 return;
             }
             const maxTurns = bridge.getMaxTurns();
             if (maxTurns !== null && s.iterations >= maxTurns) {
-                printInfo(`Loop stopped: tick limit reached (${s.iterations} >= ${maxTurns}).`);
+                ui.info(`Loop stopped: tick limit reached (${s.iterations} >= ${maxTurns}).`);
                 loop.finish();
                 return;
             }
             if (s.iterations >= LOOP_MAX_ITERATIONS) {
-                printInfo(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
+                ui.info(`Loop stopped: reached ${LOOP_MAX_ITERATIONS} ticks.`);
                 loop.finish();
                 return;
             }
             if (dynamic) {
-                printInfo(`⟳ next run in ${wakeup!.delaySeconds}s — ${wakeup!.reason}`);
+                ui.info(`⟳ next run in ${wakeup!.delaySeconds}s — ${wakeup!.reason}`);
                 s.prompt = wakeup!.prompt || s.prompt;
                 schedule.after("loop-tick", wakeup!.delaySeconds * 1000, () => fireTick(s));
             } else {
@@ -282,11 +288,11 @@ export const autonomyPlugin = {
         function fireTick(s: LoopState): void {
             if (!loop.state || loop.stopFlag) return;
             s.iterations++;
-            if (s.spec.mode === "interval") printInfo(`⟳ loop tick ${s.iterations}`);
+            if (s.spec.mode === "interval") ui.info(`⟳ loop tick ${s.iterations}`);
             const directive = s.spec.mode === "dynamic" ? dynamicLoopDirective(s.prompt) : s.prompt;
             void bridge.wake(directive).catch((e) => {
                 // tick 的驱动失败（abort/异常）——loop 收尾，runLoop 的 await 不悬挂
-                if (!isAbortLike(e)) printError(`Loop tick failed: ${e instanceof Error ? e.message : String(e)}`);
+                if (!isAbortLike(e)) ui.error(`Loop tick failed: ${e instanceof Error ? e.message : String(e)}`);
                 loop.finish();
             });
         }

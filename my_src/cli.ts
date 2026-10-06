@@ -1,11 +1,27 @@
 import * as readline from "readline";
 import { pathToFileURL } from "url";
+import chalk from "chalk";
 import { Agent } from "./agent.js";
 import { getLatestSessionId } from "./plugins/session-jsonl.js";
-import { resolveSkillPrompt } from "./skills.js";
-import { listMemories } from "./memory.js";
 import type { PermissionMode } from "./permissions.js";
-import { printWelcome, printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
+import { printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
+import type { CommandService } from "./services/commands.js";
+
+/** E1：欢迎横幅消费命令注册表——命令清单不再是 cli 的硬编码知识。 */
+function printWelcome(commands: CommandService) {
+    console.log(
+        chalk.bold.cyan("\n  Mini Claude Code") +
+        chalk.gray(" — A minimal coding agent\n")
+    );
+    console.log(chalk.gray("  Type your request, or 'exit' to quit."));
+    console.log(chalk.gray("  Commands: " + commands.list().map((c) => `/${c.name}`).join(" ")));
+    for (const c of commands.list()) {
+        if (c.name === "goal" || c.name === "loop") {
+            console.log(chalk.gray(`  /${c.name} — ${c.description}`));
+        }
+    }
+    console.log("");
+}
 
 const USAGE = `
 Usage: mini-claude [options] [prompt]
@@ -165,25 +181,25 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
             askChoice();
         });
     });
-    printWelcome();
+    printWelcome(agent.commands);
     return await new Promise<void>((resolve) => {
         // stdin EOF (Ctrl+D on an empty line) closes the readline interface
         // mid-flight; asking a closed interface throws. Stop asking and let
         // the outer await finish.
         let closed = false;
         rl.on("close", () => { closed = true; resolve(); });
-        // SIGINT 两连退出：agent 处理中 → cancel（停 loop/goal 标志 + 清 inbox +
-        // abort 在途请求）、留在 REPL（send 的 settle 以 abort 错误 reject，经
-        // ask 的 catch 回到提示符）；空闲 → 第一次提示、第二次退出。
+        // SIGINT 两连退出：agent 处理中 → cancel(cause)（停 loop/goal 标志 +
+        // 清 inbox + abort 在途请求，busy 时由 agent 自己报告打断）、留在 REPL
+        // （send 的 settle 以 abort 错误 reject，经 ask 的 catch 回到提示符）；
+        // 空闲 → 第一次提示、第二次退出。
         // rl 层挂一个（问题挂起时 Ctrl+C 被原始模式下的 readline 拦截）、
         // process 层挂一个（处理中无问题挂起，终端信号直达进程）——两个路径
         // 互斥，不会双触发。
         let sigintCount = 0;
         const handleInterrupt = () => {
             const wasBusy = agent.busy;
-            agent.cancel();
+            agent.cancel(wasBusy ? "(interrupted)" : undefined);
             if (wasBusy) {
-                console.log("\n  (interrupted)");
                 sigintCount = 0;
                 return; // settle 的 abort 错误会走 ask 的 catch，重新出提示符
             }
@@ -210,112 +226,21 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
                     resolve();
                     return;
                 }
-                if (input === "/clear") {
-                    agent.clearHistory();
-                    console.log(`(history cleared)`);
-                    ask();
-                    return;
-                }
-                if (input === "/plan") {
-                    agent.togglePlanMode();
-                    ask();
-                    return;
-                }
-                if (input === "/cost") {
-                    agent.showCost();
-                    ask();
-                    return;
-                }
-                if (input === "/compact") {
-                    try {
-                        await agent.compactAnthropic();
-                    } catch (e: any) {
-                        printError(String(e.message ?? e));
-                    }
-                    ask();
-                    return;
-                }
-                if (input === "/memory") {
-                    const memories = listMemories();
-                    if (memories.length === 0) {
-                        printInfo("No memories saved yet.");
-                    } else {
-                        printInfo(`${memories.length} memories:`);
-                        for (const m of memories) {
-                            console.log(`    [${m.type}] ${m.name} — ${m.description}`);
-                        }
-                    }
-                    ask();
-                    return;
-                }
-                if (input === "/goal" || input.startsWith("/goal ")) {
-                    const condition = input.slice("/goal".length).trim();
-                    if (!condition) {
-                        agent.showGoal();
-                        ask();
-                        return;
-                    }
-                    const directive = agent.setGoal(condition);
-                    try {
-                        await agent.pursueGoal(directive);
-                    } catch (e: any) {
-                        if (!isAbort(e)) printError(String(e.message ?? e));
-                    }
-                    ask();
-                    return;
-                }
-                if (input === "/loop" || input.startsWith("/loop ")) {
-                    const rest = input.slice("/loop".length).trim();
-                    try {
-                        await agent.runLoop(rest);
-                    } catch (e: any) {
-                        if (!isAbort(e)) printError(String(e.message ?? e));
-                    }
-                    ask();
-                    return;
-                }
-                if (input === "/skills") {
-                    const skills = agent.skills.list();
-                    if (skills.length === 0) {
-                        printInfo("No skills found. Add skills to .claude/skills/<name>/SKILL.md");
-                    } else {
-                        printInfo(`${skills.length} skills:`);
-                        for (const s of skills) {
-                            const tag = s.userInvocable ? `/${s.name}` : s.name;
-                            console.log(`    ${tag} (${s.source}) — ${s.description}`);
-                        }
-                    }
-                    ask();
-                    return;
-                }
-                // Skill invocation: /<skill-name> [args]——inline 直接注入解析后的模板；
-                // fork 借模型之手走 skill 工具，由 executeSkillTool 派发隔离子 agent
-                if (input.startsWith("/")) {
-                    const spaceIdx = input.indexOf(" ");
-                    const cmdName = spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
-                    const cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : "";
-                    const skill = agent.skills.getByName(cmdName);
-                    if (skill && skill.userInvocable) {
-                        printInfo(`Invoking skill: ${skill.name}`);
-                        try {
-                            if (skill.context === "fork") {
-                                await agent.send(`Use the skill tool to invoke "${skill.name}" with args: ${cmdArgs || "(none)"}`);
-                            } else {
-                                await agent.send(resolveSkillPrompt(skill, cmdArgs));
-                            }
-                        } catch (e: any) {
-                            if (!isAbort(e)) printError(String(e.message ?? e));
-                        }
-                        ask();
-                        return;
-                    }
-                    // 未知命令——按普通输入透传
-                }
+                // E1：斜杠分发 = 查命令注册表（静态命令 → 技能回退都在表那侧）；
+                // 谁都不认 → 普通输入透传给 agent。错误打印收口在 dispatch 的
+                // 调用方（命令 handler 内部的 runGuarded 已挡住 agent 驱动命令）
                 if (input) {
                     try {
-                        await agent.send(input);
+                        const handled = await agent.commands.dispatch(input);
+                        if (!handled) {
+                            try {
+                                await agent.send(input);
+                            } catch (e: any) {
+                                // 中断由 SIGINT 处理器报告过了，这里只报真错误
+                                if (!isAbort(e)) printError(String(e.message ?? e));
+                            }
+                        }
                     } catch (e: any) {
-                        // 中断由 SIGINT 处理器报告过了，这里只报真错误
                         if (!isAbort(e)) printError(String(e.message ?? e));
                     }
                 }
