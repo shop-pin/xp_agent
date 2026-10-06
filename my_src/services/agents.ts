@@ -82,6 +82,9 @@ export interface AgentHandle {
     followup(text: string): Promise<void>;
     /** 插话：next-step；idle 时也开 turn（对齐 dsh "An idle driver starts a turn"）。 */
     steer(text: string): void;
+    /** 下一请求注入：排 next-step 但**不唤醒**（对齐 dsh inject()——idle 时挂起
+     *  等 followup/steer 唤醒；running 时最近 step 边界认领）。D4。 */
+    inject(text: string): void;
     /** 停止驱动（loop/goal 标志 + 清 inbox + abort 在途请求）。 */
     cancel(cause?: unknown): void;
     /** 收敛到静默后 resolve（含排空循环里的后续 turn）。 */
@@ -128,9 +131,10 @@ declare module "../cordis/context.js" {
 declare module "../cordis/events.js" {
     interface Events {
         /** 组装前：可改写/拒绝本 step 的输入（waterfall，不调 next = 否决）。
-         *  historyEmpty：会话首批输入（目录/reminder 类一次性注入的锚点）。 */
+         *  historyEmpty：会话首批输入（目录/reminder 类一次性注入的锚点）；
+         *  boundary：turn 开场的首批认领，还是 step 边界的插话认领（D4）。 */
         "agent/pre-step"(
-            payload: { input: string[]; historyEmpty: boolean },
+            payload: { input: string[]; historyEmpty: boolean; boundary: "turn" | "step" },
             next: () => PreStepDecision | Promise<PreStepDecision>,
         ): PreStepDecision | Promise<PreStepDecision>;
         /** 收敛前：监听器可 steer 文本挽留（serial 无 next；返回非空值会 bail 后继）。 */

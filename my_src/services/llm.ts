@@ -16,6 +16,10 @@ import type { TokenUsage } from "./session-log.js";
 
 /** 流式词汇表（中立面的全部）。block-start 携带 tool_use 的 id/name——聚合器
  *  建块必需，词汇表为必要信息让路（C3 同款裁决：验收 > 规格字面）。 */
+
+/** 默认模型 id（D4 起自 agent.ts 迁入——memory 插件的 selector 旁调同源）。 */
+export const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
+
 export type StreamChunk =
     | { t: "text-delta"; text: string }
     | { t: "tool-call-delta"; partialJson: string }

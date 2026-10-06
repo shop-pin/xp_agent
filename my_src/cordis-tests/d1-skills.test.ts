@@ -41,7 +41,7 @@ test('同 source 二次注册抛错；不同名不竞争', () => {
 test('目录注入（真实 provider）：catalog 追加在末项、reminder 包裹、非首批不注；无 skills 原样过', async () => {
   const empty = new Context()
   empty.plugin(skillsPlugin)
-  const passthrough = await empty.waterfall('agent/pre-step', { input: ['hello'], historyEmpty: true }, () => ({ input: ['hello'] }))
+  const passthrough = await empty.waterfall('agent/pre-step', { input: ['hello'], historyEmpty: true, boundary: 'turn' }, () => ({ input: ['hello'] }))
   assert.deepEqual((passthrough as { input: string[] }).input, ['hello'])
 
   const ctx = new Context()
@@ -50,7 +50,7 @@ test('目录注入（真实 provider）：catalog 追加在末项、reminder 包
     source: 'test', rank: 99, list: () => [fake('commit', 'Create commits')],
   })
   const fire = (input: string[], historyEmpty: boolean) =>
-    ctx.waterfall('agent/pre-step', { input, historyEmpty }, () => ({ input }))
+    ctx.waterfall('agent/pre-step', { input, historyEmpty, boundary: historyEmpty ? 'turn' as const : 'step' as const }, () => ({ input }))
 
   const first = (await fire(['do work'], true)) as { input: string[] }
   assert.equal(first.input.length, 1)
@@ -69,7 +69,7 @@ test('目录注入（真实 provider）：catalog 追加在末项、reminder 包
 test('catalogInjection=false（子 agent）：监听器不改写', async () => {
   const ctx = new Context()
   ctx.plugin(skillsPlugin, { catalogInjection: false })
-  const decision = await ctx.waterfall('agent/pre-step', { input: ['sub task'], historyEmpty: true }, () => ({ input: ['sub task'] }))
+  const decision = await ctx.waterfall('agent/pre-step', { input: ['sub task'], historyEmpty: true, boundary: 'turn' }, () => ({ input: ['sub task'] }))
   assert.deepEqual((decision as { input: string[] }).input, ['sub task'])
 })
 

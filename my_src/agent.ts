@@ -3,7 +3,7 @@ import { toolDefinitions, type ToolDef } from "./tools.js";
 import { ToolsService, getActiveToolDefinitions, truncateResult, activateTools, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
 import { SessionLog, type TokenUsage, type SessionEvent } from "./services/session-log.js";
-import { LlmRuntime, assembleStream, type Settlement } from "./services/llm.js";
+import { LlmRuntime, assembleStream, MODEL, type Settlement } from "./services/llm.js";
 import { Inbox, type AgentHandle, type AgentStatus, type PreStepDecision } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
 import { coreFsTools } from "./plugins/core-fs-tools.js";
@@ -17,13 +17,13 @@ import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
 import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
 import { skillsPlugin, SkillRegistry } from "./plugins/skills-registry.js";
 import { subagentPlugin, buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
+import { memoryPlugin } from "./plugins/memory.js";
 import { AgentRegistry } from "./services/agents.js";
 import { resolveSkillPrompt } from "./skills.js";
 import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { SystemPromptService } from "./services/system-prompt.js";
 import { promptSectionsPlugin, SECTION_ORDERS } from "./plugins/prompt-sections.js";
 import { type PermissionMode } from "./permissions.js";
-import { startMemoryPrefetch, formatMemoriesForInjection, type MemoryPrefetch, type SideQueryFn } from "./memory.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
 import { mcpBridgePlugin, McpBridge } from "./plugins/mcp-bridge.js";
 import { withRetry } from "./retry.js";
@@ -40,8 +40,6 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { printToolCall, printAssistantText, printInfo, printError, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
-
-const MODEL = process.env.ANTHROPIC_MODEL_ID || "glm-4.7-flash";
 
 // T1 budget → T2 snip → T3 microcompact → T4 auto-compact。
 // T1–T3 零 API 成本（原地改 this.messages），T4 是唯一花一次摘要请求的层。
@@ -138,10 +136,6 @@ export class Agent implements AgentHandle {
     private abortController: AbortController | null = null;
     // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
     private effectiveWindow: number;
-    // 语义召回：prefetch 句柄 + 防重复注入簿记（按记忆文件绝对路径）
-    private memoryPrefetch: MemoryPrefetch | null = null;
-    private alreadySurfacedMemories: Set<string> = new Set();
-    private sessionMemoryBytes = 0;
 
     // /loop dynamic——模型调 schedule_wakeup 时写入，loop 驱动在 turn 收敛后读取并清空
     // （C5 第三段：状态迁 ctx.loop 服务，字段消亡）
@@ -187,6 +181,12 @@ export class Agent implements AgentHandle {
                     this.totalOutputTokens += output;
                 },
             },
+            enabled: !this.isSubAgent,
+        });
+        // D4：memory 召回——turn 边界发 prefetch，落定经 inject() 排队，
+        // 由最近 claim 点进消息与日志（循环内轮询与日志盲区一并消亡）
+        this.cordis.plugin(memoryPlugin, {
+            bridge: { inject: (text: string) => this.inject(text) },
             enabled: !this.isSubAgent,
         });
         this.cordis.plugin(coreFsTools);
@@ -653,59 +653,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         await this.cordis.get<McpBridge>("mcp")?.disconnectAll();
     }
 
-    // 旁路查询：独立小请求（非流式、temperature 0、256 token 上限），
-    // 给 memory selector 这类"让模型做决策"的辅助调用用，主对话历史不掺和
-    private buildSideQuery(): SideQueryFn {
-        return async (system, userMessage) => {
-            const { text } = await this.cordis.require<LlmRuntime>("llm").sideCall({
-                route: this.llmRoute,
-                model: MODEL,
-                maxTokens: 256,
-                system,
-                temperature: 0,
-                messages: [{ role: "user", content: userMessage }],
-            });
-            return text;
-        };
-    }
-
-    // 消费已落定的 prefetch：把召回的记忆追加进最后一条 user 消息（保持
-    // user/assistant 交替不变式），并记入已曝光集合——同一条记忆一个会话只注入一次
-    private async consumeMemoryPrefetchIfReady(messages: Anthropic.MessageParam[]): Promise<void> {
-        const pf = this.memoryPrefetch;
-        if (!pf || !pf.settled || pf.consumed) return;
-        pf.consumed = true;
-        const memories = await pf.promise;
-        if (memories.length === 0) return;
-        const injectionText = formatMemoriesForInjection(memories);
-        const last = messages[messages.length - 1];
-        if (last && last.role === "user") {
-            if (typeof last.content === "string" || last.content == null) {
-                last.content = (last.content || "") + "\n\n" + injectionText;
-            } else if (Array.isArray(last.content)) {
-                (last.content as any[]).push({ type: "text", text: injectionText });
-            }
-        } else {
-            messages.push({ role: "user", content: injectionText });
-        }
-        for (const m of memories) {
-            this.alreadySurfacedMemories.add(m.path);
-            this.sessionMemoryBytes += Buffer.byteLength(m.content);
-        }
-    }
-
-    // turn 边界调用（chat() 开头）：先排掉上一轮遗留的 prefetch——若它在上一轮
-    // 最后一次 API 调用之后才落定，不排走就永久丢失；再为本轮发起新的召回。
-    // 子 agent 跳过：记忆召回是主对话的机制，隔离子任务不该触发旁路查询
-    private async startMemoryPrefetchForTurn(userMessage: string, messages: Anthropic.MessageParam[]): Promise<void> {
-        if (this.isSubAgent) return;
-        await this.consumeMemoryPrefetchIfReady(messages);
-        const sq = this.buildSideQuery();
-        this.memoryPrefetch = startMemoryPrefetch(
-            userMessage, sq,
-            this.alreadySurfacedMemories, this.sessionMemoryBytes,
-        );
-    }
+    // （D4：buildSideQuery/consumeMemoryPrefetchIfReady/startMemoryPrefetchForTurn
+    // 迁 plugins/memory.ts——selector 旁调、落定注入、簿记全在插件闭包）
 
     // system 拆成两个块：静态主体打 cache_control 断点（断点前的所有内容，
     // 含工具 schema，命中服务端前缀缓存）；动态上下文（环境 + memory 索引）
@@ -926,6 +875,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
     }
 
+    /** D4：下一请求注入——排 next-step 但**不唤醒**（对齐 dsh inject()：idle 时
+     *  挂起等 followup/steer 唤醒；running 时最近 step 边界认领）。注入经 claim →
+     *  pushUser 进消息与日志——model-visible ⟺ logged，注入不再是日志盲区。 */
+    inject(text: string): void {
+        this.inbox.append("next-step", text);
+    }
+
     whenIdle(): Promise<void> {
         if (this.statusValue === "idle") return Promise.resolve();
         return new Promise((resolve) => this.idleWaiters.push(resolve));
@@ -997,7 +953,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // 模型调用直接收敛（dsh：blocked；输入已 claim，不回队列不进消息）
         const decision = await this.cordis.waterfall(
             "agent/pre-step",
-            { input: batch, historyEmpty: this.messages.length === 0 },
+            { input: batch, historyEmpty: this.messages.length === 0, boundary: "turn" },
             (): PreStepDecision => ({ input: batch }),
         );
         if (decision.reject !== undefined) {
@@ -1017,9 +973,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // slice 不变式才成立。放进 step 循环顶的话，工具轮的末尾是 tool_result——
         // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发
         await this.checkAndCompact();
-        // 语义召回：turn 边界发起异步 prefetch，不挡主循环；每轮请求前轮询一次，
-        // selector 一落定立刻注入，模型尽早看到记忆
-        await this.startMemoryPrefetchForTurn(batch.join("\n\n"), this.messages);
+        // D4：语义召回在 memory 插件（pre-step 的 turn 边界发起，落定经 inject()
+        // 排队——不再有循环内轮询与就地改写）
         // D2：MCP 走桥接服务（ensure 保持惰性时机：turn 开场才连接+同步注册表）
         const mcp = this.cordis.require<McpBridge>("mcp");
         if (!this.isSubAgent) await mcp.ensure();
@@ -1047,7 +1002,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     // 首步的"整 turn 收敛"不同——mini 简化，偏差记 dsh-C5.md §2）
                     const steerDecision = await this.cordis.waterfall(
                         "agent/pre-step",
-                        { input: steers, historyEmpty: false },
+                        { input: steers, historyEmpty: false, boundary: "step" },
                         (): PreStepDecision => ({ input: steers }),
                     );
                     if (steerDecision.reject === undefined) {
@@ -1059,7 +1014,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.sessionLog.append({ type: "turn/start" });
             // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
             this.runCompressionPipeline();
-            await this.consumeMemoryPrefetchIfReady(this.messages);
             if (!this.isSubAgent) startSpinner();
             let firstText = true;
             let settlement: Settlement;
