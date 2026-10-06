@@ -122,6 +122,8 @@ export interface ToolDefinition {
     permissionHint?: PermissionHint;
     /** deferred 工具不随 schema 广告，tool_search 命中后激活。 */
     deferred?: boolean;
+    /** D5：结果可剪（T2 snip 的对象集合——旧 SNIPPABLE_TOOLS 集合变元数据）。 */
+    snippable?: boolean;
     /** execute 函数体自 tools.ts 的 switch 原样迁出；多数工具是同步的。 */
     execute(input: Record<string, any>, exec: ToolExec): string | Promise<string>;
 }

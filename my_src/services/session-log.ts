@@ -33,12 +33,44 @@ export type SessionEvent =
     | { type: "tool/result"; callId: string; content: string; isError?: boolean }
     | { type: "turn/start" }
     | { type: "turn/end"; reason: string }
-    | { type: "meta/note"; key: string; value: unknown };
+    | { type: "meta/note"; key: string; value: unknown }
+    /** D5 投影 replace：按 events 下标（seq）定位一条消息事件，整条 content 换血。
+     *  链式——后续 replace 看到的是前一 replace 之后的投影（与旧原地改写的
+     *  顺序语义一致：T1 截断后 T2 在截断结果上判剪）。 */
+    | { type: "message/replace"; target: number; content: string | Anthropic.ContentBlockParam[] }
+    /** D5：T4 重建——投影清空，其后的消息事件从零累积（日志本体只增不改）。 */
+    | { type: "history/truncate"; reason: string };
+
+/** 折叠节点：seq = 事件在 events 数组中的下标（append-only 下的稳定身份）。 */
+export interface FoldedNode {
+    seq: number;
+    message: Anthropic.MessageParam;
+}
+
+/** 连续 user 合并（投影层）：字符串拼进字符串（\n\n 分隔）；批次宿主追加
+ *  text 块——语义与工作集时代 pushUser 的双侧镜像逐字节一致。 */
+function mergeUserContent(
+    prev: string | Anthropic.ContentBlockParam[],
+    add: string | Anthropic.ContentBlockParam[],
+): string | Anthropic.ContentBlockParam[] {
+    if (typeof prev === "string" && typeof add === "string") {
+        return prev ? `${prev}\n\n${add}` : add;
+    }
+    const blocks = (Array.isArray(prev)
+        ? prev.slice()
+        : prev ? [{ type: "text", text: prev }] : []) as Anthropic.ContentBlockParam[];
+    if (typeof add === "string") {
+        blocks.push({ type: "text", text: add });
+    } else {
+        blocks.push(...add);
+    }
+    return blocks;
+}
 
 export class SessionLog extends Service {
     private log: SessionEvent[] = [];
-    // C8：持久化订阅——onAppend 拿到的是**进入合并前的原始事件**（重放再走
-    // append 会得到同样的合并结果，JSONL 因此可以存原始流）
+    // C8：持久化订阅——onAppend 拿到的是原始事件（append 纯追加；合并/压缩
+    // 都在投影层，重放同一事件流必得同一视图，JSONL 因此可以存原始流）
     private appendListeners: Array<(evt: SessionEvent) => void> = [];
     private clearListeners: Array<() => void> = [];
 
@@ -67,25 +99,12 @@ export class SessionLog extends Service {
     }
 
     /**
-     * 追加事件。连续 user/message 在入口合并（防 API 400：roles must alternate），
-     * 语义与迁移前 chat() 的合并完全一致：字符串拼进字符串（\n\n 分隔）；
- * tool_result 批次（数组）追加 text 块。C4 起 WHO/WHEN 的裁决迁给 inbox。
+     * 追加事件——纯追加，不做任何合并。连续 user 的合并语义在投影层
+     * （fold：注记事件隔在中间也算相邻，与工作集时代 pushUser 一致）；
+     * 在 append 合并则要回改已落盘的事件，重放即发散——日志即真相的红线。
      */
     append(evt: SessionEvent): void {
         for (const fn of [...this.appendListeners]) fn(evt);
-        if (evt.type === "user/message") {
-            const last = this.log[this.log.length - 1];
-            if (last && last.type === "user/message") {
-                if (typeof last.content === "string" && typeof evt.content === "string") {
-                    last.content = last.content ? `${last.content}\n\n${evt.content}` : evt.content;
-                } else {
-                    const blocks = (Array.isArray(last.content) ? last.content : []) as Anthropic.ContentBlockParam[];
-                    blocks.push({ type: "text", text: typeof evt.content === "string" ? evt.content : "" });
-                    last.content = blocks;
-                }
-                return;
-            }
-        }
         this.log.push(evt);
     }
 
@@ -99,33 +118,73 @@ export class SessionLog extends Service {
     }
 
     /**
-     * 纯投影：事件流 → 请求参数。同一事件流重放任意次结果一致；返回深拷贝，
-     * 调用方改写不影响日志。只取最新一条 system（动态段会变，旧的不进请求）；
-     * tool/turn/meta 注记不进请求。
-     * D5 缝：压缩投影 replace 将挂在 user 事件 → MessageParam 的映射处
-     *（按事件序号查投影表，被压缩改写的 tool_result 在此换皮）。
+     * 纯投影（D5 起接管请求组装）：事件流 → 请求参数。同一事件流重放任意次
+     * 结果一致；返回深拷贝，调用方改写不影响日志。只取最新一条 system；注记
+     * （tool/turn/meta）不进请求；**message/replace 链式换血、history/truncate
+     * 清空重建**——压缩自此只追加事件，日志本体只增不改。
      */
     derive(): { system: Anthropic.TextBlockParam[]; messages: Anthropic.MessageParam[] } {
+        const { system, nodes } = this.fold();
+        return { system, messages: nodes.map((n) => n.message) };
+    }
+
+    /** 折叠中间态：带 seq 的消息节点——压缩层定位与换血的接口。 */
+    nodes(): FoldedNode[] {
+        return this.fold().nodes;
+    }
+
+    private fold(): { system: Anthropic.TextBlockParam[]; nodes: FoldedNode[] } {
         let system: Anthropic.TextBlockParam[] = [];
-        const messages: Anthropic.MessageParam[] = [];
-        for (const evt of this.log) {
+        const nodes: FoldedNode[] = [];
+        const bySeq = new Map<number, FoldedNode>();
+        this.log.forEach((evt, seq) => {
             switch (evt.type) {
                 case "system/message":
                     try {
                         system = JSON.parse(evt.content);
-                    } catch { /* D5 缝：投影层接管前的防御空转 */ }
+                    } catch { /* 防御：坏编码不炸投影 */ }
                     break;
                 case "user/message":
-                    messages.push({ role: "user", content: clone(evt.content) } as Anthropic.MessageParam);
+                case "assistant/message": {
+                    // 连续 user 的合并在投影层做：注记事件（turn/* 等）隔开的
+                    // user/message 也算相邻——老工作集里没有注记，合并语义以
+                    // 消息视图为准（防 roles-must-alternate 400）。节点身份
+                    // （seq）保持创建事件的序号，replace 定位不受影响。
+                    if (evt.type === "user/message") {
+                        const lastNode = nodes[nodes.length - 1];
+                        if (lastNode && lastNode.message.role === "user") {
+                            lastNode.message = {
+                                ...lastNode.message,
+                                content: mergeUserContent(lastNode.message.content, clone(evt.content)),
+                            } as Anthropic.MessageParam;
+                            break;
+                        }
+                    }
+                    const node: FoldedNode = {
+                        seq,
+                        message: { role: evt.type === "user/message" ? "user" : "assistant", content: clone(evt.content) } as Anthropic.MessageParam,
+                    };
+                    nodes.push(node);
+                    bySeq.set(seq, node);
                     break;
-                case "assistant/message":
-                    messages.push({ role: "assistant", content: clone(evt.content) } as Anthropic.MessageParam);
+                }
+                case "message/replace": {
+                    // 未知 target（truncate 之后指向旧世界）防御性跳过
+                    const node = bySeq.get(evt.target);
+                    if (node) {
+                        node.message = { ...node.message, content: clone(evt.content) } as Anthropic.MessageParam;
+                    }
+                    break;
+                }
+                case "history/truncate":
+                    nodes.length = 0;
+                    bySeq.clear();
                     break;
                 default:
                     break; // tool/call | tool/result | turn/* | meta/note：注记
             }
-        }
-        return { system, messages };
+        });
+        return { system, nodes };
     }
 
     /** 回放：消息数组 → 事件流（session 恢复路径）。usage 不可考，不带。 */

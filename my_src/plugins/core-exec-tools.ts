@@ -73,6 +73,7 @@ export const coreExecTools = {
             name: "run_shell",
             ...schemaOf("run_shell"),
             permissionHint: "exec",
+            snippable: true,
             execute: (input) => runShell(input as { command: string }),
         });
         tools.register({

@@ -18,6 +18,7 @@ import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plug
 import { skillsPlugin, SkillRegistry } from "./plugins/skills-registry.js";
 import { subagentPlugin, buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
 import { memoryPlugin } from "./plugins/memory.js";
+import { compactionPlugin, CompactionService } from "./plugins/compaction.js";
 import { AgentRegistry } from "./services/agents.js";
 import { resolveSkillPrompt } from "./skills.js";
 import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
@@ -41,25 +42,9 @@ import { homedir } from "os";
 import { join } from "path";
 import { printToolCall, printAssistantText, printInfo, printError, printConfirmation, printCost, printSubAgentStart, printSubAgentEnd, startSpinner, stopSpinner } from "./ui.js";
 
-// T1 budget → T2 snip → T3 microcompact → T4 auto-compact。
-// T1–T3 零 API 成本（原地改 this.messages），T4 是唯一花一次摘要请求的层。
-const SNIPPABLE_TOOLS = new Set(["read_file", "grep_search", "list_files", "run_shell"]);
-const SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]";
-const SNIP_THRESHOLD = 0.60;
-// 热缓存覆盖线：utilization 超过它，就算缓存还热也允许改写老结果——
-// 溢出风险比重建一次缓存更贵（0.60 < 0.75 < 0.85 三线各管一层）
-const SNIP_HOT_OVERRIDE = 0.75;
-const MICROCOMPACT_IDLE_MS = 5 * 60 * 1000; // 缓存 5 分钟没用就算冷
-const KEEP_RECENT_RESULTS = 3;
-
-const MODEL_CONTEXT: Record<string, number> = {
-    "glm-4.7-flash": 128000,
-    "glm-5.3-flash": 128000,
-    "claude-sonnet-4-6": 200000,
-};
-function getContextWindow(model: string): number {
-    return MODEL_CONTEXT[model] || 200000;
-}
+// D5：四层压缩（T1 budget → T2 snip → T3 microcompact → T4 compact）整体迁
+// plugins/compaction.ts——事件化（message/replace + history/truncate），
+// this.messages 工作集与压缩仪表字段在此消亡，请求组装走 derive()。
 
 function isAbortLike(e: unknown): boolean {
     const err = e as { name?: string; message?: string };
@@ -78,14 +63,13 @@ export interface AgentOptions {
 export class Agent implements AgentHandle {
     // C6：LLM 路由——换后端 = 换环境变量（MINI_CLAUDE_LLM_ROUTE=echo 跑假后端）
     private readonly llmRoute: string = process.env.MINI_CLAUDE_LLM_ROUTE || "anthropic";
-    private messages: Anthropic.MessageParam[] = [];
+    // （D5：this.messages 工作集消亡——请求组装与一切读取走 sessionLog.derive()）
     private mode: PermissionMode = "default";
     private tools: ToolDef[];
     // C1：每个 Agent 一棵 mini-cordis 树，工具注册表长在上面；
     // 后续 C 阶段服务（session-log/llm/approval）逐章挂进同一棵树
     private cordis: Context;
-    // C3：会话事件日志——追加镜像 + 纯投影。线上工作集 this.messages 仍是请求
-    // 体来源（压缩 T1–T4 原地改写它），日志与工作集的发散点即 D5 投影 replace 的缝
+    // 会话事件日志——唯一存储（D5：请求组装走 derive，C3 的双写/发散点闭合）
     private sessionLog: SessionLog;
     // C4：handle 面与 inbox 驱动——输入是数据，认领发生在循环边界
     readonly inbox: Inbox = new Inbox();
@@ -120,13 +104,11 @@ export class Agent implements AgentHandle {
     private totalOutputTokens = 0;
     private totalCacheReadTokens = 0;
     private totalCacheCreationTokens = 0;
-    // 下一次请求的上下文体量预估（本次 prompt 全量 + 本次输出），压缩仪表的原料
-    private lastInputTokenCount = 0;
     private currentTurns = 0;
     private maxCostUsd: number | null = null;
     private maxTurns: number | null = null;
-    // 压缩仪表：最近一次 API 调用时刻——T2/T3 用它判断缓存冷热
-    private lastApiCallTime = 0;
+    // （D5：lastInputTokenCount / lastApiCallTime / effectiveWindow 迁
+    // CompactionService——压缩仪表跟层走）
 
     // transcript 分类器的 DENIAL_LIMITS 追踪：连拦 3 次或累计 20 次 → 分类器
     // 可能卡死在拒绝循环，降级回人工确认（或无人值守拒绝）
@@ -134,8 +116,6 @@ export class Agent implements AgentHandle {
     private autoTotalDenials = 0;
     // 中断支持：SIGINT 处理器经 cancel() 收口（busy 判忙），abort 在途 API 请求
     private abortController: AbortController | null = null;
-    // 有效窗口 = 上下文窗口 - 20000 安全边际（给摘要请求本身和系统块留余量）
-    private effectiveWindow: number;
 
     // /loop dynamic——模型调 schedule_wakeup 时写入，loop 驱动在 turn 收敛后读取并清空
     // （C5 第三段：状态迁 ctx.loop 服务，字段消亡）
@@ -189,6 +169,9 @@ export class Agent implements AgentHandle {
             bridge: { inject: (text: string) => this.inject(text) },
             enabled: !this.isSubAgent,
         });
+        // D5：四层压缩事件化（T1–T3 replace 投影 / T4 truncate 重建），
+        // 压缩仪表（lastInputTokenCount 等）随之迁服务
+        this.cordis.plugin(compactionPlugin);
         this.cordis.plugin(coreFsTools);
         this.cordis.plugin(coreExecTools);
         this.cordis.plugin(coreMetaTools);
@@ -209,7 +192,6 @@ export class Agent implements AgentHandle {
         });
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
-        this.effectiveWindow = getContextWindow(MODEL) - 20000;
         // --plan 启动即规划：plan 文件路径在此生成，提示注入走请求时的
         // buildAnthropicSystem() planSuffix（本类没有常驻 systemPrompt 字段）
         if (this.mode === "plan") {
@@ -217,48 +199,30 @@ export class Agent implements AgentHandle {
         }
     }
 
+    /** D5：消息视图 = 日志投影（工作集消亡；每次现 derive，深拷贝安全）。 */
     history(): Anthropic.MessageParam[] {
-        return this.messages;
+        return this.sessionLog.derive().messages;
     }
 
     loadHistory(messages: Anthropic.MessageParam[]): void {
-        this.messages = messages;
-        this.sessionLog.load(messages); // 回放：消息数组 → 事件流
+        this.sessionLog.load(messages); // 回放：消息数组 → 事件流（唯一存储是日志）
     }
 
     clearHistory(): void {
-        this.messages = [];
         this.sessionLog.clear();
     }
 
-    // ---------- C3：消息操作统一入口（工作集 + 日志双写） ----------
+    // ---------- 消息操作统一入口（D5：日志单侧——合并语义在 SessionLog.append） ----------
 
-    /**
-     * user 消息入栈。连续 user 合并的双侧镜像：日志侧在 SessionLog.append 入口，
-     * 工作集侧在这里——两边用同一套合并语义（字符串拼接 / tool_result 批次追加
-     * text 块），与迁移前 chat() 的行为逐字节一致。
-     */
     private pushUser(content: string | Anthropic.ToolResultBlockParam[]): void {
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === "user") {
-            if (typeof last.content === "string" || last.content == null) {
-                last.content = last.content ? `${last.content}\n\n${content}` : content;
-            } else {
-                (last.content as any[]).push({ type: "text", text: content });
-            }
-            this.sessionLog.append({ type: "user/message", content });
-        } else {
-            this.messages.push({ role: "user", content } as Anthropic.MessageParam);
-            this.sessionLog.append({ type: "user/message", content });
-        }
+        this.sessionLog.append({ type: "user/message", content });
     }
 
     private pushAssistant(content: Anthropic.ContentBlockParam[], usage?: TokenUsage): void {
-        this.messages.push({ role: "assistant", content });
         this.sessionLog.append({ type: "assistant/message", content, usage });
     }
 
-    /** 日志投影（C5+ 与测试消费；D5 压缩投影 replace 接管请求组装的入口）。 */
+    /** 日志投影（测试与 C8 resume 消费；D5 起也是请求组装的来源）。 */
     deriveSession(): { system: Anthropic.TextBlockParam[]; messages: Anthropic.MessageParam[] } {
         return this.sessionLog.derive();
     }
@@ -368,168 +332,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return { exceeded: false, reason: "" };
     }
 
-    // 仪表：utilization = lastInputTokenCount / effectiveWindow
-    // 调用点已接好：T1–T3 走 runCompressionPipeline()（每次发请求前），
-    // T4 走 checkAndCompact()（turn 边界：用户消息刚 push、循环未开始）。
+    // ---------- D5：压缩整体迁 plugins/compaction.ts（事件化） ----------
 
-    // 组装层：顺序即语义。
-    runCompressionPipeline(): void {
-        this.budgetToolResults();
-        this.snipStaleResults();
-        this.microcompact();
-    }
-
-    // ── T1 budget：把超大 tool_result 掐头去尾缩进预算。零 API 成本，无缓存门控
-    //    （它只处理大块头——那种结果留着必溢出，缩了顶多重建一次缓存）。
-    private budgetToolResults(): void {
-        const utilization = this.lastInputTokenCount / this.effectiveWindow;
-        if (utilization < 0.5) return; // 上下文过半才开始管
-        const budget = utilization > 0.7 ? 15000 : 30000; // 越满预算越紧
-
-        for (const msg of this.messages) {
-            if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
-            for (let i = 0; i < msg.content.length; i++) {
-                const block = msg.content[i] as any;
-                if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > budget) {
-                    const keepEach = Math.floor((budget - 80) / 2); // 减 80：给中间的截断提示文案留位
-                    block.content = block.content.slice(0, keepEach) +
-                        `\n\n[... budgeted: ${block.content.length - keepEach * 2} chars truncated ...]\n\n` +
-                        block.content.slice(-keepEach);
-                }
-            }
-        }
-    }
-
-    // ── T2 snip：同文件旧读去重 + 只保最近 N 条，被剪的整个 tool_result 换成
-    //    SNIP_PLACEHOLDER。双门控是本层灵魂：缓存热且 utilization 未越覆盖线 → 忍住。
-    private snipStaleResults(): void {
-        const utilization = this.lastInputTokenCount / this.effectiveWindow;
-        const cacheHot = this.lastApiCallTime > 0 && (Date.now() - this.lastApiCallTime) < MICROCOMPACT_IDLE_MS;
-        if (cacheHot && utilization < SNIP_HOT_OVERRIDE) return;
-        if (utilization < SNIP_THRESHOLD) return;
-
-        // 收集所有可剪结果（已剪过的 placeholder 不再收），带定位与反查元数据
-        const results: { msgIdx: number; blockIdx: number; toolName: string; filePath?: string }[] = [];
-        for (let mi = 0; mi < this.messages.length; mi++) {
-            const msg = this.messages[mi];
-            if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
-            for (let bi = 0; bi < msg.content.length; bi++) {
-                const block = msg.content[bi] as any;
-                if (block.type === "tool_result" && typeof block.content === "string" && block.content !== SNIP_PLACEHOLDER) {
-                    const toolInfo = this.findToolUseById(block.tool_use_id);
-                    if (toolInfo && SNIPPABLE_TOOLS.has(toolInfo.name)) {
-                        results.push({ msgIdx: mi, blockIdx: bi, toolName: toolInfo.name, filePath: toolInfo.input?.file_path });
-                    }
-                }
-            }
-        }
-
-        if (results.length <= KEEP_RECENT_RESULTS) return;
-
-        // 两个剪枝下标集合，最后统一替换（别边遍历边改）
-        const toSnip = new Set<number>();
-        const seenFiles = new Map<string, number[]>(); // file_path → 出现下标
-
-        for (let i = 0; i < results.length; i++) {
-            const r = results[i];
-            if (r.toolName === "read_file" && r.filePath) {
-                const existing = seenFiles.get(r.filePath) || [];
-                existing.push(i);
-                seenFiles.set(r.filePath, existing);
-            }
-        }
-        // ① 同文件旧读：同一 file_path 只留最后一次
-        for (const indices of seenFiles.values()) {
-            if (indices.length > 1) {
-                for (let j = 0; j < indices.length - 1; j++) toSnip.add(indices[j]);
-            }
-        }
-        // ② 保最近：最老的 results.length - KEEP_RECENT_RESULTS 条剪掉
-        const snipBefore = results.length - KEEP_RECENT_RESULTS;
-        for (let i = 0; i < snipBefore; i++) toSnip.add(i);
-
-        for (const idx of toSnip) {
-            const r = results[idx];
-            const block = (this.messages[r.msgIdx].content as any[])[r.blockIdx];
-            block.content = SNIP_PLACEHOLDER;
-        }
-    }
-
-    // ── T3 microcompact：缓存已冷才允许的"大扫除"——所有 tool_result 只保最近
-    //    KEEP_RECENT_RESULTS 条，其余换成 "[Old result cleared]"。
-    private microcompact(): void {
-        if (!this.lastApiCallTime || (Date.now() - this.lastApiCallTime) < MICROCOMPACT_IDLE_MS) return;
-
-        const allResults: { msgIdx: number; blockIdx: number }[] = [];
-        for (let mi = 0; mi < this.messages.length; mi++) {
-            const msg = this.messages[mi];
-            if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
-            for (let bi = 0; bi < msg.content.length; bi++) {
-                const block = msg.content[bi] as any;
-                if (block.type === "tool_result" && typeof block.content === "string" &&
-                    block.content !== SNIP_PLACEHOLDER && block.content !== "[Old result cleared]") {
-                    allResults.push({ msgIdx: mi, blockIdx: bi });
-                }
-            }
-        }
-
-        const clearCount = allResults.length - KEEP_RECENT_RESULTS;
-        for (let i = 0; i < clearCount && i < allResults.length; i++) {
-            const r = allResults[i];
-            (this.messages[r.msgIdx].content as any[])[r.blockIdx].content = "[Old result cleared]";
-        }
-    }
-
-    // ── T4 门：唯一要花 API 的一层。0.85 线，turn 边界才检查（见调用点注释）。
-    async checkAndCompact(): Promise<void> {
-        if (this.lastInputTokenCount > this.effectiveWindow * 0.85) {
-            printInfo("Context window filling up, compacting conversation...");
-            const compacted = await this.compactAnthropic();
-            if (compacted) printInfo("Conversation compacted.");
-        }
-    }
-
-    // user/assistant 交替 + tool_use/tool_result 配对，摘要请求的形状随末条消息的形态分三种边界：
-    // ① 纯文本 user（T4 turn 边界的正常形态）→ 摘出末条，摘要指令顶替它，重建时塞回；
-    // ② 无 tool_use 的 assistant（REPL /compact 的正常形态——turn 收敛时末条 assistant
-    //    必无 tool_use）→ 摘要指令直接追加，合法且配对完整；
-    // ③ 带 tool_result 的 user（budget 超限截停态）→ 非法边界：slice 会孤儿化前面的
-    //    tool_use（400），追加又造出连续 user（400）——跳过，宁少压一次再等下轮
+    /** /compact 与 T4 门共用的入口：委托压缩服务（truncate + 重建事件）。 */
     async compactAnthropic(): Promise<boolean> {
-        if (this.messages.length < 4) return false; // 太短的对话不值得摘要
-        const tail = this.messages[this.messages.length - 1];
-        const tailHasToolUse = Array.isArray(tail.content) &&
-            (tail.content as any[]).some((b: any) => b.type === "tool_use");
-        const SUMMARIZE_INSTRUCTION = "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.";
-        let requestMessages: Anthropic.MessageParam[];
-        let carryTail: boolean;
-        if (tail.role === "user" && typeof tail.content === "string") {
-            requestMessages = [...this.messages.slice(0, -1), { role: "user", content: SUMMARIZE_INSTRUCTION }];
-            carryTail = true;
-        } else if (tail.role === "assistant" && !tailHasToolUse) {
-            requestMessages = [...this.messages, { role: "user", content: SUMMARIZE_INSTRUCTION }];
-            carryTail = false;
-        } else {
-            // ③ 或未知形态——fail-closed：不发注定非法的摘要请求
-            printInfo("Cannot compact here: history ends mid-tool-batch. Try again after the next exchange.");
-            return false;
-        }
-        // C6：旁路调用走 llm seam（非流式线格式保留——mock 断言锚 stream:false）
-        const { text: rawSummary } = await this.cordis.require<LlmRuntime>("llm").sideCall({
-            route: this.llmRoute,
-            model: MODEL,
-            maxTokens: 2048,
-            system: "You are a conversation summarizer. Be concise but preserve important details.",
-            messages: requestMessages,
-        });
-        const summaryText = rawSummary || "No summary available.";
-        this.messages = [
-            { role: "user", content: `[Previous conversation summary]\n${summaryText}` },
-            { role: "assistant", content: "Understood. I have the context from our previous conversation. How can I continue helping?" },
-        ];
-        if (carryTail) this.messages.push(tail);
-        this.lastInputTokenCount = 0;
-        return true;
+        return this.cordis.require<CompactionService>("compaction").compact();
     }
 
     // ── 大结果持久化：>30KB 的工具结果落盘 ~/.mini-claude/tool-results/，
@@ -551,19 +358,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         // 截断在落盘之后：全量已安全在磁盘上，这里只是防病态预览（单行几百 KB 的文件）
         return truncateResult(`[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. You can use read_file to see the full result.]\n\nPreview (first 200 lines):\n${preview}`);
-    }
-
-    // 机械反查：tool_use_id → { name, input }。给 T2 判定"这条结果出自哪个工具"用。
-    private findToolUseById(toolUseId: string): { name: string; input: any } | null {
-        for (const msg of this.messages) {
-            if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-            for (const block of msg.content as any[]) {
-                if (block.type === "tool_use" && block.id === toolUseId) {
-                    return { name: block.name, input: block.input };
-                }
-            }
-        }
-        return null;
     }
 
     // REPL 注入复用已有 readline 的确认回调。双写：confirmFn 留在本类供
@@ -596,7 +390,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
         }
         repairUnclosedTurn(this.sessionLog);
-        this.messages = this.sessionLog.derive().messages;
         this.sessionId = sessionId;
 
         let activated: string[] | null = null;
@@ -621,7 +414,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if (evt.content.some((b) => (b as { type?: string }).type === "tool_use")) this.currentTurns++;
             lastUsage = evt.usage;
         }
-        this.lastInputTokenCount = lastUsage
+        this.cordis.require<CompactionService>("compaction").lastInputTokenCount = lastUsage
             ? lastUsage.input + lastUsage.cacheRead + lastUsage.cacheCreation + lastUsage.output
             : 0;
         if (activated) activateTools(activated);
@@ -630,7 +423,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if (goalCondition) goal.set(goalCondition);
             else goal.clear();
         }
-        printInfo(`Session restored (${this.messages.length} messages).`);
+        printInfo(`Session restored (${this.sessionLog.derive().messages.length} messages).`);
         return true;
     }
 
@@ -759,8 +552,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     /** 最近一条 assistant turn 的文本，供评审。 */
     private extractLastAssistantText(): string {
-        for (let i = this.messages.length - 1; i >= 0; i--) {
-            const m: any = this.messages[i];
+        const view = this.history();
+        for (let i = view.length - 1; i >= 0; i--) {
+            const m: any = view[i];
             if (m.role !== "assistant") continue;
             if (typeof m.content === "string") return m.content;
             if (Array.isArray(m.content)) {
@@ -953,7 +747,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // 模型调用直接收敛（dsh：blocked；输入已 claim，不回队列不进消息）
         const decision = await this.cordis.waterfall(
             "agent/pre-step",
-            { input: batch, historyEmpty: this.messages.length === 0, boundary: "turn" },
+            { input: batch, historyEmpty: this.history().length === 0, boundary: "turn" },
             (): PreStepDecision => ({ input: batch }),
         );
         if (decision.reject !== undefined) {
@@ -963,7 +757,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         for (const text of decision.input ?? batch) {
             // 环境 reminder 只进主对话首条消息——子 agent 有自己的 system，不掺和。
             // 连续 user 的合并在 pushUser（工作集）与 SessionLog.append（日志）双侧镜像
-            const content = this.messages.length === 0 && !this.hasCustomPrompt
+            const content = this.history().length === 0 && !this.hasCustomPrompt
                 ? `${text}\n\n${buildUserContextReminder()}`
                 : text;
             this.pushUser(content);
@@ -972,7 +766,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         // T4 在 turn 边界检查：此刻最后一条消息是纯 user 文本，compactAnthropic 的
         // slice 不变式才成立。放进 step 循环顶的话，工具轮的末尾是 tool_result——
         // 既会切坏配对，也会在任何 2+ 工具轮的对话里反复触发
-        await this.checkAndCompact();
+        await this.cordis.require<CompactionService>("compaction").checkAndCompact();
         // D4：语义召回在 memory 插件（pre-step 的 turn 边界发起，落定经 inject()
         // 排队——不再有循环内轮询与就地改写）
         // D2：MCP 走桥接服务（ensure 保持惰性时机：turn 开场才连接+同步注册表）
@@ -1012,8 +806,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
             firstStep = false;
             this.sessionLog.append({ type: "turn/start" });
-            // T1–T3 零成本层：每次发请求前过一遍（原地改写 this.messages）
-            this.runCompressionPipeline();
+            // T1–T3 零成本层：每次发请求前过一遍（D5：事件化——追加 replace 投影）
+            this.cordis.require<CompactionService>("compaction").runPipeline();
             if (!this.isSubAgent) startSpinner();
             let firstText = true;
             let settlement: Settlement;
@@ -1034,7 +828,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         maxTokens: 4096,
                         system: systemBlocks,
                         tools: [...getActiveToolDefinitions(this.tools), ...mcpTools],
-                        messages: this.withCacheBreakpoints(this.messages),
+                        messages: this.withCacheBreakpoints(this.sessionLog.derive().messages),
                     }, this.abortController?.signal),
                     (t) => {
                         // src 同款协调：首个 text 先停 spinner 再打印，避免 \r 重画
@@ -1054,8 +848,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             this.totalCacheReadTokens += usage.cacheRead;
             this.totalCacheCreationTokens += usage.cacheCreation;
             this.totalOutputTokens += usage.output;
-            this.lastInputTokenCount = usage.input + usage.cacheRead + usage.cacheCreation + usage.output;
-            this.lastApiCallTime = Date.now();
+            this.cordis.require<CompactionService>("compaction").recordUsage(usage);
             this.pushAssistant(settlement.content, usage);
 
             const toolUses: Anthropic.ToolUseBlock[] = settlement.content.filter((b) => b.type === "tool_use") as Anthropic.ToolUseBlock[];
@@ -1266,9 +1059,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     /** 审批选项 1 的清历史：system 在请求时现算，无需保留；token 仪表归零。 */
     private clearHistoryKeepSystem() {
-        this.messages = [];
         this.sessionLog.clear();
-        this.lastInputTokenCount = 0;
+        this.cordis.require<CompactionService>("compaction").lastInputTokenCount = 0;
     }
 
     // auto 模式下分类器取代人工确认框：deny 规则照旧硬拦，只读工具走
@@ -1296,7 +1088,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         let verdict: { block: boolean; reason: string };
         try {
             const rules = loadAutoModeRules();
-            const transcript = buildClassifierTranscript(this.messages as any, { toolName, input });
+            const transcript = buildClassifierTranscript(this.history() as any, { toolName, input });
             const system = buildClassifierSystem(rules);
             // CLAUDE.md 走 user 消息，不进 system——它是不可信的仓库内容
             const claudeMd = loadClaudeMd();

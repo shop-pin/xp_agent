@@ -205,6 +205,7 @@ export const coreFsTools = {
             name: "read_file",
             ...schemaOf("read_file"),
             permissionHint: "read",
+            snippable: true, // D5：T2 可剪（旧 SNIPPABLE_TOOLS 集合变元数据）
             execute: (input, exec: ToolExec) => readFile(input as { file_path: string }, exec.readFileState),
         });
         tools.register({
@@ -223,12 +224,14 @@ export const coreFsTools = {
             name: "list_files",
             ...schemaOf("list_files"),
             permissionHint: "read",
+            snippable: true,
             execute: (input) => listFiles(input as { pattern: string; path?: string }),
         });
         tools.register({
             name: "grep_search",
             ...schemaOf("grep_search"),
             permissionHint: "read",
+            snippable: true,
             execute: (input) => grepSearch(input as { pattern: string; path?: string }),
         });
     },
