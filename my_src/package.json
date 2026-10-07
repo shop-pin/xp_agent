@@ -7,7 +7,9 @@
     "build": "tsc",
     "mock": "tsc && node run-mock.mjs",
     "live": "tsc && node run-live.mjs",
-    "cordis": "tsc && node --test \"dist/cordis-tests/*.test.js\""
+    "cordis": "tsc && node --test \"dist/cordis-tests/*.test.js\"",
+    "snapshot": "tsc && node run-snapshot.mjs",
+    "snapshot:record": "tsc && node run-snapshot.mjs --record"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",

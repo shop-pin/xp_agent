@@ -72,7 +72,7 @@ async function writeStreaming(res, msg) {
 // aux call like compaction can be told apart from the main loop); "main" is the
 // fallback. Each track has its own request counter, so aux calls don't disturb
 // the main loop's turn index.
-export function startMock({ scenario, logPath } = {}) {
+export function startMock({ scenario, logPath, capturePath } = {}) {
   const tracks = scenario?.tracks || { main: { turns: scenario?.turns || [] } };
   const counters = {};
   let reqIndex = 0;
@@ -89,6 +89,10 @@ export function startMock({ scenario, logPath } = {}) {
     req.on("end", async () => {
       let body;
       try { body = JSON.parse(raw); } catch { res.writeHead(400); res.end("bad json"); return; }
+
+      // E3 snapshot：完整请求体逐字节捕获（快照录制用；与 logPath 的摘要
+      // 事件互不影响——录制是追加通道，replay 断言吃的是规范化后的产物）
+      if (capturePath) appendFileSync(capturePath, JSON.stringify({ body }) + "\n");
 
       const system = typeof body.system === "string" ? body.system : (Array.isArray(body.system) ? body.system.map((b) => b.text).join("") : "");
       // ch20 起 withCacheBreakpoints 会把最后一条消息的字符串 content 规范化为

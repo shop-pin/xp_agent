@@ -9,9 +9,16 @@ import { createHash } from "crypto";
 import { tmpdir, homedir } from "os";
 import { join, dirname } from "path";
 import { pathToFileURL, fileURLToPath } from "url";
+import { buildSnapshotPayload, writeSnapshot, readSnapshot, diffSnapshot } from "./snapshot-lib.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const chapter = process.argv[2] || "1";
+// E3 snapshot：--snapshot-record 录制完整请求体+事件流 → snapshots/ch<n>/；
+// --snapshot-replay 重跑场景后逐字节 diff 已存快照（无 key；手写 verify 照跑，
+// 双保险）。两个旗标互斥，都不带 = 既有单章驱动行为不变。
+const snapshotMode = process.argv.includes("--snapshot-record") ? "record"
+  : process.argv.includes("--snapshot-replay") ? "replay" : undefined;
+const snapshotDir = join(HERE, "snapshots", `ch${chapter}`);
 
 const scenarios = {
   "1": {
@@ -1446,13 +1453,14 @@ const workdir = mkdtempSync(join(tmpdir(), `my-ch${chapter}-`));
 s.setup(workdir);
 
 const logPath = s.needsLog ? join(tmpdir(), `my-ch${chapter}-log-${process.pid}.jsonl`) : undefined;
+const capturePath = snapshotMode ? join(tmpdir(), `my-ch${chapter}-capture-${process.pid}.jsonl`) : undefined;
 // tracks 支持函数形式 (dir) => tracks——ch22 记忆目录含 sha256(cwd) 动态段，
 // 脚本化的 write_file 路径必须等 workdir 生成后才能算出来
 const tracks = typeof s.tracks === "function" ? s.tracks(workdir) : s.tracks;
 const scenario = tracks
   ? { id: `ch${chapter}`, tracks }
   : { id: `ch${chapter}`, turns: s.turns };
-const mock = await startMock({ scenario, logPath });
+const mock = await startMock({ scenario, logPath, capturePath });
 process.env.ANTHROPIC_BASE_URL = mock.url;
 process.env.ANTHROPIC_API_KEY = "test";
 // ch17 HOME 沙箱：~/.mini-claude/... 必须落进临时目录。
@@ -1702,6 +1710,7 @@ if (s.runs) {
   }
   await mock.close();
   if (s.verify) s.verify(workdir, logPath);
+  await snapshotStep();
   if (crashed) process.exit(process.exitCode ?? 0);
 } else {
   console.log(`  you: ${s.prompt}\n`);
@@ -1712,4 +1721,31 @@ if (s.runs) {
   if (agent.close) await agent.close(); // kill the MCP children so the event loop can drain
   await mock.close();
   if (s.verify) s.verify(workdir, logPath);
+  await snapshotStep();
+}
+
+/** E3：录制/回放收尾步骤。HOME 沙箱在 workdir（home ≙ workdir），本 run 的
+ *  易变值在 normalize 时替换成占位符——两次 run 的规范化产物因此可比。 */
+async function snapshotStep() {
+  if (!snapshotMode) return;
+  const payload = buildSnapshotPayload({ capturePath, workdir, home: workdir });
+  if (snapshotMode === "record") {
+    writeSnapshot(snapshotDir, payload, { chapter, recordedAt: new Date().toISOString() });
+    console.log(`  ⚑ snapshot recorded → snapshots/ch${chapter} (${payload.requests.length} requests, ${payload.events.length} session file(s))`);
+    return;
+  }
+  if (!existsSync(join(snapshotDir, "meta.json"))) {
+    console.log(`  ✗ snapshot replay: no snapshot for ch${chapter} (record first)`);
+    process.exitCode = 1;
+    return;
+  }
+  const expected = readSnapshot(snapshotDir);
+  const { ok, report } = diffSnapshot(expected, payload);
+  if (ok) {
+    console.log(`  ✓ snapshot replay: ${payload.requests.length} requests + ${payload.events.length} session file(s) byte-identical`);
+  } else {
+    console.log(`  ✗ snapshot replay diff (snapshots/ch${chapter}):`);
+    for (const line of report) console.log(`    ${line}`);
+    process.exitCode = 1;
+  }
 }
