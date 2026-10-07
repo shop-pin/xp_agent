@@ -6,27 +6,20 @@ import { SessionLog, type TokenUsage, type SessionEvent } from "./services/sessi
 import { LlmRuntime, assembleStream, MODEL, type Settlement } from "./services/llm.js";
 import { Inbox, type AgentHandle, type AgentStatus, type PreStepDecision } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
-import { coreFsTools } from "./plugins/core-fs-tools.js";
-import { coreExecTools } from "./plugins/core-exec-tools.js";
-import { coreMetaTools } from "./plugins/core-meta-tools.js";
-import { approvalPlugin } from "./plugins/approval.js";
-import { autoApprovalPlugin } from "./plugins/auto-approval.js";
-import { autonomyPlugin, GoalService, LoopService } from "./plugins/autonomy.js";
-import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
-import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
+import { loadRows, dumpTree } from "./cordis/loader.js";
 import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
-import { skillsPlugin, SkillRegistry } from "./plugins/skills-registry.js";
-import { subagentPlugin, buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
-import { memoryPlugin } from "./plugins/memory.js";
-import { compactionPlugin, CompactionService } from "./plugins/compaction.js";
-import { AgentRegistry } from "./services/agents.js";
+import { SkillRegistry } from "./plugins/skills-registry.js";
+import { buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
+import { CompactionService } from "./plugins/compaction.js";
+import type { GoalService, LoopService } from "./plugins/autonomy.js";
 import { resolveSkillPrompt } from "./skills.js";
-import { buildStaticSystemPrompt, buildUserContextReminder, loadClaudeMd } from "./prompt.js";
+import { buildUserContextReminder, loadClaudeMd } from "./prompt.js";
 import { SystemPromptService } from "./services/system-prompt.js";
-import { promptSectionsPlugin, SECTION_ORDERS } from "./plugins/prompt-sections.js";
+import { SECTION_ORDERS } from "./plugins/prompt-sections.js";
 import { type PermissionMode } from "./permissions.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
-import { mcpBridgePlugin, McpBridge } from "./plugins/mcp-bridge.js";
+import { McpBridge } from "./plugins/mcp-bridge.js";
+import type { AgentRegistry } from "./services/agents.js";
 import { withRetry } from "./retry.js";
 import {
     goalDirective,
@@ -39,7 +32,11 @@ import { homedir } from "os";
 import { join } from "path";
 import { UiService } from "./services/ui-service.js";
 import { CommandService } from "./services/commands.js";
-import { commandsPlugin, type CommandsBridge } from "./plugins/commands.js";
+import { type CommandsBridge } from "./plugins/commands.js";
+import {
+    buildRows, formatRows, resolvePlugin,
+    type Row, type AppHost,
+} from "./cordis.config.js";
 
 // D5：四层压缩（T1 budget → T2 snip → T3 microcompact → T4 compact）整体迁
 // plugins/compaction.ts——事件化（message/replace + history/truncate），
@@ -57,6 +54,9 @@ export interface AgentOptions {
     customSystemPrompt?: string;
     customTools?: ToolDef[];
     isSubAgent?: boolean;
+    // E2：装配入口——命名补丁（'full' | 'no-auto'）与调用方追加层（--patch/测试）
+    profile?: string;
+    extraRows?: Row[];
 }
 
 export class Agent implements AgentHandle {
@@ -68,10 +68,17 @@ export class Agent implements AgentHandle {
     // C1：每个 Agent 一棵 mini-cordis 树，工具注册表长在上面；
     // 后续 C 阶段服务（session-log/llm/approval）逐章挂进同一棵树
     private cordis: Context;
-    // 会话事件日志——唯一存储（D5：请求组装走 derive，C3 的双写/发散点闭合）
-    private sessionLog: SessionLog;
+    // E2：最终装配行表（base+app+profile+extra 铺平结果；dumpConfig 的数据源）
+    private readonly assembledRows: Row[];
+    // 会话事件日志——唯一存储（D5：请求组装走 derive，C3 的双写/发散点闭合）。
+    // E2 起由清单上的服务行提供，getter 现取（构造函数不再 new 基础设施）
+    private get sessionLog(): SessionLog {
+        return this.cordis.require<SessionLog>("session-log");
+    }
     // E1：REPL 命令注册表（cli 只消费 dispatch；注册在 commands 插件）
-    readonly commands: CommandService;
+    get commands(): CommandService {
+        return this.cordis.require<CommandService>("commands");
+    }
     // C4：handle 面与 inbox 驱动——输入是数据，认领发生在循环边界
     readonly inbox: Inbox = new Inbox();
     private statusValue: AgentStatus = "idle";
@@ -80,6 +87,8 @@ export class Agent implements AgentHandle {
     // C8：JSONL 持久化惰性挂载标记（见 ensurePersistence）
     private persistenceAttached = false;
     private hasCustomPrompt: boolean;
+    // E2：子 agent 三件套之一，app 装配层经 host.customSystemPrompt 读取
+    private readonly customSystemPrompt?: string;
     private isSubAgent: boolean;
     // 子 agent 的最终文本收进 buffer 而非打印，runOnce 拼出来回传父级
     private outputBuffer: string[] | null = null;
@@ -119,79 +128,25 @@ export class Agent implements AgentHandle {
     constructor(options: AgentOptions = {}) {
         this.mode = options.permissionMode || "default";
         this.isSubAgent = options.isSubAgent || false;
-        // C1：起容器树 → ToolsService 先行（三插件依赖它）→ 按序加载工具插件
-        //（注册序 = 旧 toolDefinitions 数组序，请求体 tools 数组顺序的生命线）
+        this.customSystemPrompt = options.customSystemPrompt;
+        // E2：装配走清单——base（全能力）+ app（宿主桥/选项）+ profile + extra
+        // 四层铺平后经 loader 挂载。行序 = 激活序（工具广告序/审批瀑布序的生命线，
+        // 钉在 baseRows 注释里）。本构造函数从"装载者"收缩为"宿主能力提供者"：
+        // 装什么、什么配置，答案都在 cordis.config.ts。
         this.cordis = new Context();
-        new ToolsService(this.cordis, "tools");
-        this.sessionLog = new SessionLog(this.cordis, "session-log");
-        // E1：UI 消费者化——消息面（tool/call）由本服务订阅日志渲染，引擎不直印；
-        // 叙事面经 ctx.ui.* 出（渲染器可替换）。命令注册表同批落地（cli 只消费）。
-        const uiService = new UiService(this.cordis, "ui");
-        uiService.attachSessionLog();
-        this.commands = new CommandService(this.cordis, "commands");
-        // C6：LLM seam 先立服务，适配器插件经 inject 等它（首个业务级 inject 依赖）
-        new LlmRuntime(this.cordis, "llm");
-        this.cordis.plugin(llmAnthropicPlugin);
-        this.cordis.plugin(adapterEchoPlugin);
-        // C7：system prompt 服务 + 分节插件（子 agent 关动态节——env/memory/...
-        // 是主对话的环境噪音）。plan 节读本类 mode/planFilePath 私有状态，自注册
-        new SystemPromptService(this.cordis, "system-prompt");
-        this.cordis.plugin(promptSectionsPlugin, {
-            staticPrompt: options.customSystemPrompt || buildStaticSystemPrompt(),
-            dynamicEnabled: !options.customSystemPrompt,
+        this.assembledRows = buildRows({
+            host: this.host(),
+            profile: options.profile,
+            extraRows: options.extraRows,
         });
+        loadRows(this.cordis, this.assembledRows, resolvePlugin);
+        // C7：plan 节由 Agent 自注册——读本类 mode/planFilePath 私有状态，
+        // 随请求现算（不进清单：它是本类的私有视角，不是可装配能力）
         this.cordis.require<SystemPromptService>("system-prompt").registerSection({
             id: "plan",
             order: SECTION_ORDERS.plan,
             group: "dynamic",
             render: () => (this.mode === "plan" ? this.buildPlanModePrompt() : null),
-        });
-        // D1：skills provider registry。目录注入走 pre-step 监听器（子 agent 不注
-        // ——system/白名单已定界），工具与 slash 直调都查这个 registry
-        this.cordis.plugin(skillsPlugin, { catalogInjection: !this.isSubAgent });
-        // E1：REPL slash 命令 = 插件注册（cli 只剩 dispatch 消费）。依赖 skills
-        // 注册表（技能回退），故随其后
-        this.cordis.plugin(commandsPlugin, this.commandsBridge());
-        // D2：MCP 桥接（子 agent 不连接；ensure 保持 turn 开场的惰性时机）
-        this.cordis.plugin(mcpBridgePlugin, { enabled: !this.isSubAgent });
-        // D3：子 agent 走 registry + preset（agent 工具的 execute 在插件里；
-        // 子 agent 不加载本插件——工具隔离的第一层，第二层是 preset 排除表）
-        new AgentRegistry(this.cordis, "agents");
-        this.cordis.plugin(subagentPlugin, {
-            bridge: {
-                parentMode: () => this.mode,
-                addTokens: (input: number, output: number) => {
-                    this.totalInputTokens += input;
-                    this.totalOutputTokens += output;
-                },
-            },
-            enabled: !this.isSubAgent,
-        });
-        // D4：memory 召回——turn 边界发 prefetch，落定经 inject() 排队，
-        // 由最近 claim 点进消息与日志（循环内轮询与日志盲区一并消亡）
-        this.cordis.plugin(memoryPlugin, {
-            bridge: { inject: (text: string) => this.inject(text) },
-            enabled: !this.isSubAgent,
-        });
-        // D5：四层压缩事件化（T1–T3 replace 投影 / T4 truncate 重建），
-        // 压缩仪表（lastInputTokenCount 等）随之迁服务
-        this.cordis.plugin(compactionPlugin);
-        this.cordis.plugin(coreFsTools);
-        this.cordis.plugin(coreExecTools);
-        this.cordis.plugin(coreMetaTools);
-        // C2：权限策略插件化。注册序 = waterfall 优先级：approval 在外层
-        // （deny 规则硬底线 + 九段静态流水线），auto 在内层（veto 链表达"auto 优先"）
-        this.cordis.plugin(approvalPlugin);
-        this.cordis.plugin(autoApprovalPlugin);
-        // C5：autonomy 插件（goal 的 turn-stopping 挽留 + loop 的 turn-end 调度）。
-        // 桥 = 预算/tick 上限/wake（D6 起评估器随监听器住插件，llm 走注册表）
-        this.cordis.plugin(autonomyPlugin, {
-            getBudget: () => this.checkBudget(),
-            getMaxTurns: () => this.maxTurns,
-            wake: (text: string) => {
-                this.inbox.append("next-turn", text);
-                return this.ensureDriver();
-            },
         });
         this.tools = options.customTools || toolDefinitions;
         this.hasCustomPrompt = !!options.customSystemPrompt;
@@ -200,6 +155,37 @@ export class Agent implements AgentHandle {
         if (this.mode === "plan") {
             this.planFilePath = this.generatePlanFilePath();
         }
+    }
+
+    /** E2：宿主能力面——app 装配层经它把桥/选项接进清单（接线知识在 config 侧）。 */
+    private host(): AppHost {
+        return {
+            parentMode: () => this.mode,
+            isSubAgent: this.isSubAgent,
+            customSystemPrompt: this.customSystemPrompt,
+            commands: this.commandsBridge(),
+            inject: (text: string) => this.inject(text),
+            wake: (text: string) => {
+                this.inbox.append("next-turn", text);
+                return this.ensureDriver();
+            },
+            getBudget: () => this.checkBudget(),
+            getMaxTurns: () => this.maxTurns,
+            addTokens: (input: number, output: number) => {
+                this.totalInputTokens += input;
+                this.totalOutputTokens += output;
+            },
+        };
+    }
+
+    /** E2：装配视图——合并后的最终行表（--dump-config 的输出）。 */
+    dumpConfig(): string {
+        return formatRows(this.assembledRows);
+    }
+
+    /** E2：运行态视图——挂载后的 fiber 树（cordis/loader 的 dumpTree）。 */
+    dumpTree(): string {
+        return dumpTree(this.cordis);
     }
 
     /** E1：叙事面出口（渲染器可替换；输出与旧 print* 逐字节一致）。 */

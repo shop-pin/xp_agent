@@ -9,7 +9,52 @@ import assert from 'node:assert/strict'
 import { Context } from '../cordis/context.js'
 import { loadRows, dumpTree } from '../cordis/loader.js'
 import type { Row } from '../cordis/loader.js'
-import { baseRows, resolvePlugin } from '../cordis.config.js'
+import type { Context as Ctx } from '../cordis/context.js'
+import type { Plugin } from '../cordis/fiber.js'
+
+// E2 起真实清单（baseRows/appRows/profiles）搬进 cordis.config.ts 服务产品装配，
+// 这份玩具清单（core/greeter/clock）是 loader 的教学夹具，原样内联回本章测试。
+// 玩具故事：core 提供全局 config 服务；greeter 依赖 config 拼问候语；clock 独立计时。
+
+interface AppConfig { title: string; suffix?: string }
+
+const core: Plugin = {
+  name: 'core',
+  apply(ctx: Ctx, rawConfig: unknown) {
+    const config = rawConfig as AppConfig
+    ctx.provide('config', Object.freeze({ ...config }))
+  },
+}
+
+const greeter: Plugin = {
+  name: 'greeter',
+  inject: ['config'],
+  apply(ctx: Ctx) {
+    const config = ctx.require<{ title: string; suffix?: string }>('config')
+    const greet = (who: string) => `${config.title} says hi to ${who}${config.suffix ?? ''}`
+    ctx.provide('greet', greet)
+  },
+}
+
+const clock: Plugin = {
+  name: 'clock',
+  apply(ctx: Ctx) {
+    ctx.provide('clock', { startedAt: Date.now() })
+  },
+}
+
+const toyPlugins: Record<string, Plugin> = { core, greeter, clock }
+
+const resolvePlugin = (name: string): Plugin => {
+  const plugin = toyPlugins[name]
+  if (!plugin) throw new Error(`[mini-cordis] no plugin named "${name}"`)
+  return plugin
+}
+
+const baseRows: Row[] = [
+  { id: 'core', name: 'core', config: { title: 'mini-harness' } },
+  { id: 'greeter', name: 'greeter' },
+]
 
 test('基本加载：行清单挂载、依赖注入、greet 能力可用', () => {
   const ctx = new Context()

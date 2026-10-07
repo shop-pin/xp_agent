@@ -1,11 +1,13 @@
 import * as readline from "readline";
 import { pathToFileURL } from "url";
+import { resolve } from "path";
 import chalk from "chalk";
 import { Agent } from "./agent.js";
 import { getLatestSessionId } from "./plugins/session-jsonl.js";
 import type { PermissionMode } from "./permissions.js";
 import { printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
 import type { CommandService } from "./services/commands.js";
+import type { Row } from "./cordis.config.js";
 
 /** E1：欢迎横幅消费命令注册表——命令清单不再是 cli 的硬编码知识。 */
 function printWelcome(commands: CommandService) {
@@ -36,6 +38,9 @@ Options:
   --goal <condition>  Pursue a goal across turns until an evaluator judges it met
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --profile <name>    Plugin manifest profile: full (default) | no-auto (auto-mode classifier removed)
+  --patch <file>      Append plugin rows from a .mjs exporting "rows" (same-id rows override)
+  --dump-config       Print the final merged plugin manifest and exit
   --help, -h          Show this help
   (model via env: ANTHROPIC_MODEL_ID, base URL via ANTHROPIC_BASE_URL)
 
@@ -96,7 +101,39 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         console.log(`(dontAsk: anything needing confirmation is auto-denied)`);
     }
 
-    const agent = new Agent({ permissionMode });
+    // E2：装配旗标——profile 选命名补丁（full/no-auto），--patch 追加用户行
+    // （最后落笔、赢过一切层；同 id 整行替换是 B6 定死的语义）
+    let profile: string | undefined;
+    const profIdx = argv.indexOf("--profile");
+    if (profIdx >= 0) {
+        profile = argv[profIdx + 1];
+        if (!profile) throw new Error("--profile requires a name (full | no-auto)");
+        argv.splice(profIdx, 2);
+        console.log(`(profile: ${profile})`);
+    }
+    let extraRows: Row[] | undefined;
+    const patchIdx = argv.indexOf("--patch");
+    if (patchIdx >= 0) {
+        const file = argv[patchIdx + 1];
+        if (!file) throw new Error("--patch requires a .mjs file exporting rows");
+        argv.splice(patchIdx, 2);
+        const mod = await import(pathToFileURL(resolve(file)).href);
+        const rows = (mod.rows ?? mod.default) as Row[];
+        if (!Array.isArray(rows)) throw new Error(`--patch file must export rows: Row[] (got ${file})`);
+        extraRows = rows;
+        console.log(`(patch: +${rows.length} row(s) from ${file})`);
+    }
+
+    if (argv.includes("--dump-config")) {
+        // 装配预览：挂完整清单再打行表（app 层的桥/选项只有宿主在才拿得到），
+        // 不进 REPL。危险点：这是最终行表视图，运行态 fiber 树看 agent.dumpTree()
+        const agent = new Agent({ permissionMode, profile, extraRows });
+        console.log(agent.dumpConfig());
+        await agent.close();
+        return;
+    }
+
+    const agent = new Agent({ permissionMode, profile, extraRows });
     if (resume) {
         const sessionId = getLatestSessionId();
         if (sessionId) {

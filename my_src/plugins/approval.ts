@@ -38,15 +38,18 @@ const makeReplFallbackProvider = (ui: UiService): ApprovalProvider => async (_ca
 /** 九段判定序列。call.def.permissionHint 取代旧 READ_TOOLS/EDIT_TOOLS 集合。
  *  allow 段一律 return next()（弃权式放行）：guard 负责对内层结果做单调收紧，
  *  内层策略监听器因此有机会加严；deny/ask/bypass-allow 是否决式终局。 */
-async function staticPipeline(call: PreExecCall, next: () => PreExecDecision | Promise<PreExecDecision>): Promise<PreExecDecision> {
+async function staticPipeline(ctx: Context, call: PreExecCall, next: () => PreExecDecision | Promise<PreExecDecision>): Promise<PreExecDecision> {
     // 只扫一次规则表，①④ 共用同一个结果
     const ruleResult = checkPermissionRules(call.name, call.input);
     if (ruleResult === "deny") {
         return { type: "deny", reason: `Denied by permission rule for ${call.name}` };
     }
     // auto 模式：硬底线只到 deny 规则——其余裁决权让给内层的 auto 监听器
-    //（对齐旧路径：auto 走 classifyToolCall，其 base 只以 default 模式扫 deny）
-    if (call.mode === "auto") return next();
+    //（对齐旧路径：auto 走 classifyToolCall，其 base 只以 default 模式扫 deny）。
+    // E2：弃权前确认内层有人接手——no-auto profile 把 auto-approval 行注释掉
+    // 后，外层盲弃权会让非 deny 动作全部直通放行；此时按 default 流程走完
+    //（落到 ⑧ 的 confirm 候选段），"无 auto 版"的 auto 请求 ≙ 有人就问。
+    if (call.mode === "auto" && ctx.get("auto-adjudicator")) return next();
     // plan 只读契约压在 allow 规则和 bypass 之上："只读"是代码强制，不是提示词恳求
     if (call.mode === "plan") {
         if (call.def?.permissionHint === "edit") {
@@ -91,6 +94,6 @@ export const approvalPlugin = {
     apply(ctx: Context) {
         const approval = new ApprovalService(ctx, "approval");
         approval.setFallbackProvider(makeReplFallbackProvider(ctx.require<UiService>("ui")));
-        ctx.on("tools/pre-execute", monotonic(staticPipeline));
+        ctx.on("tools/pre-execute", monotonic((call, next) => staticPipeline(ctx, call, next)));
     },
 };

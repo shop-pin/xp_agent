@@ -1390,6 +1390,50 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "33": {
+    // E2：bundle/profile——同一份 my_src，两条清单组装出两个 agent。
+    //   full（默认清单）：auto 模式写文件走 LLM 分类器（stage1 放行后落盘）
+    //   no-auto（profile 补丁）：auto-approval 行被"注释掉"，同一个动作直落
+    //   人工确认（脚本自动否 → 拒绝），分类器零调用——auto-mode 能力整体下线。
+    // dump 双视图断言：运行态树（dumpTree）一含一不含该行；装配行表
+    // （dumpConfig）里 no-auto 显示 disabled 占位。
+    needsLog: true,
+    setup: (dir) => writeFileSync(join(dir, "greeting.txt"), "hello"),
+    runs: [{ profileProbe: true }],
+    tracks: {
+      main: {
+        turns: [
+          { tools: [{ name: "write_file", input: { file_path: "full.txt", content: "x" } }] },
+          { text: "full profile: the classifier cleared the write, file created." },
+          { tools: [{ name: "write_file", input: { file_path: "bare.txt", content: "x" } }] },
+          { text: "no-auto profile: the write was denied without any classifier." },
+        ],
+      },
+      auto: {
+        match: "security monitor",
+        turns: [{ text: "<block>no</block>" }],
+      },
+    },
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const samples = Object.fromEntries(events.filter((e) => e.type === "sample").map((e) => [e.key, e.value]));
+      const reqs = events.filter((e) => e.type === "request");
+      const mainReqs = reqs.filter((e) => e.track === "main");
+      const autoReqs = reqs.filter((e) => e.track === "auto");
+      check("full tree mounts auto-approval", samples["full-tree-has-auto"] === "true");
+      check("no-auto tree lacks the row (disabled rows never mount)", samples["bare-tree-has-auto"] === "false");
+      check("no-auto row table keeps the placeholder marked (disabled)", samples["bare-config-disabled"] === "true");
+      check("full: classifier consulted once (stage1)", autoReqs.length === 1);
+      check("full: file written after the classifier cleared it", samples["full-wrote"] === "true");
+      check("no-auto: zero classifier calls (capability removed, not bypassed)", samples["bare-auto-reqs"] === "0" && autoReqs.length === 1);
+      check("no-auto: write never landed", samples["bare-never-wrote"] === "true");
+      check("no-auto: write went to the interactive provider and was denied",
+        (mainReqs[3]?.toolResults || []).some((t) => t.content.includes("User denied this action.")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1620,6 +1664,32 @@ if (s.runs) {
         sample("crash-last-end", ends[ends.length - 1]);
         sample("crash-msgs", c.history().length);
         if (c.close) await c.close();
+      } else if (r.profileProbe !== undefined) {
+        // E2：双 profile 组装探针。同一份代码、两条清单各组装一个 agent，
+        // 全部直调（不走 runCli——探针要拿 dumpTree/dumpConfig 视图）。
+        // 两个都注"自动否"confirmFn：full 靠分类器放行（不到 confirm），
+        // bare 没有 auto-approval，写动作直落 confirm 被否——同一输入、
+        // 两条裁决路径，零竞速。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
+        const full = new agentMod.Agent({ permissionMode: "auto" });
+        const bare = new agentMod.Agent({ permissionMode: "auto", profile: "no-auto" });
+        for (const a of [full, bare]) a.setConfirmFn(async () => false);
+        sample("full-tree-has-auto", full.dumpTree().includes("[auto-approval]"));
+        sample("bare-tree-has-auto", bare.dumpTree().includes("[auto-approval]"));
+        sample("bare-config-disabled", bare.dumpConfig().includes("[auto-approval] auto-approval (disabled)"));
+        await full.chat("create full.txt containing x");
+        sample("full-wrote", existsSync("full.txt"));
+        // 分类器调用计数取 chat 前后差值——full 的那次 stage1 已在日志里
+        const countAutoReqs = () => readFileSync(logPath, "utf-8").split("\n").filter(Boolean)
+          .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+          .filter((e) => e?.type === "request" && e.track === "auto").length;
+        const autoBefore = countAutoReqs();
+        await bare.chat("create bare.txt containing x");
+        sample("bare-never-wrote", !existsSync("bare.txt"));
+        sample("bare-auto-reqs", countAutoReqs() - autoBefore);
+        if (full.close) await full.close();
+        if (bare.close) await bare.close();
       } else {
         await mod.runCli(r.argv);
       }

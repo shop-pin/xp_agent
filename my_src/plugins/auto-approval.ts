@@ -112,6 +112,10 @@ export const autoApprovalPlugin = {
     name: "auto-approval",
     apply(ctx: Context) {
         const denials = { consecutive: 0, total: 0 };
+        // E2：在场标记。approval 外层在 auto 模式弃权前查它——no-auto profile
+        // 把本行注释掉后，外层必须自己走完 default 九段（否则非 deny 动作
+        // 全部直通放行）。服务在场 ≙ "auto 裁决有人接手"。
+        ctx.provide("auto-adjudicator", { ownedBy: "auto-approval" });
         ctx.on(
             "tools/pre-execute",
             monotonic(async (call, next) => {
