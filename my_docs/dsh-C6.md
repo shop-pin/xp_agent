@@ -98,3 +98,118 @@ input 与 cache_read/cache_creation 在 `message_start` 事件里，output 在 `
 ## 9. 下章预告（C7 system prompt 服务）
 
 `prompt.ts` 的 `buildDynamicSystemContext` 消亡：section 注册表（identity/env/claude-md/memory/skills 各成一节）+ 中央 order + `{{var}}` 严格插值；工具 schema 由 ToolsService 注册成 order 靠后的 section；C3 的 system/message append 改由 assemble 驱动，cache_control 断点策略收进 assemble（末块打断点，行为不变）。验收：22 场景 system 字段逐字节等价。
+
+## 10. 代码执行流程图
+
+> 对应提交 `753286f`。三条主线：适配器注册（服务先立 + inject 依赖）→ 主循环 chunk 流（llm/stream 瀑布 + assembleStream 聚合）→ sideCall 四路收拢（可选覆写 + 聚合兜底）。
+
+### 10.1 挂树与路由注册：agent 不再认识 SDK
+
+```
+Agent 构造（C1 树）追加：
+  new LlmRuntime(ctx, "llm")            服务先立——适配器插件 inject ["llm"] 等它
+  ctx.plugin(llmAnthropicPlugin)        apply: registerAdapter("anthropic", new AnthropicAdapter())
+  ctx.plugin(adapterEchoPlugin)         apply: registerAdapter(config.route ?? "echo", {stream})
+      ★ SDK client 构造（含 MINI_CLAUDE_SDK_MAX_RETRIES 封装）整体迁进适配器——
+        this.client 字段消亡，agent 只剩 llmRoute 路由字符串（env 读入）
+
+LlmRuntime（ctx.llm）三出口：
+  stream(req, signal)   adapters.get(req.route ?? 'anthropic')（无 → throw）
+                        → ctx.waterfall('llm/stream', {req}, () => adapter.stream(req, signal))
+  sideCall(req, signal) adapter.sideCall？覆写（非流式线格式）：流聚合兜底（10.3）
+  hasRoute(r)           auto 分类器的"无评估器"守卫改查这里（fail-closed 同款）
+```
+
+### 10.2 主循环：chunk 流 → Settlement
+
+```
+runStepLoop 请求段：
+  settlement = await withRetry(async () => assembleStream(
+      ctx.require<LlmRuntime>('llm').stream(
+        { route: llmRoute, model: MODEL, maxTokens: 4096, system: systemBlocks,
+          tools: [...active, ...mcpTools], messages: withCacheBreakpoints(messages) },
+        abortController?.signal),
+      (t) => { firstText → stopSpinner; emitText(t) }        ← 流式打印口 onText
+  ))
+  ★ withRetry 包住"建流+聚合"：重试 = generator 重新进入 = 适配器重新
+    messages.stream——已打印的半截文本不缝合、重打（旧语义；打印状态在消费侧）
+
+assembleStream chunk 状态机（dsh assembler 的 mini 版）：
+  block-start(text)            → current = {kind:'text', text:''}
+  block-start(tool, id, name)  → current = {kind:'tool', id, name, json:''}
+  text-delta                   → current.text += text；onText(text)（边收边打印）
+  tool-call-delta              → current.json += partialJson
+  block-end                    → text：content.push({type:'text', text})
+                                 tool：json.trim() 空串视作 {}（无参工具合法形态）
+                                      content.push({type:'tool_use', id, name, input})
+  usage                        → usage = chunk.usage
+  finish                       → finishReason = chunk.reason
+  → Settlement { content, usage, finishReason }
+
+结算消费（与旧 finalMessage 同构，数字不动 = 行为等价）：
+  usage 四计数 → total* 仪表 + lastInputTokenCount（压缩仪表读它）
+  pushAssistant(settlement.content, usage)      C3 双写入口原样
+  content.filter(tool_use) → 工具批次循环（C2 管线 / C5 结论原样）
+```
+
+### 10.3 sideCall：四路旁调收拢
+
+```
+旧 client.messages.create 的四个调用点 → llm.sideCall：
+  compactAnthropic（T4 摘要）        maxTokens 2048
+  buildSideQuery（memory selector）  maxTokens 256, temperature 0
+  evaluateGoal（goal 评估器）        maxTokens 512, temperature 0
+  runClassifierQuery（auto 分类器）  maxTokens 两段各自给定, temperature 0
+  → SideResult { text, usage }——消费方都只要 text
+
+sideCall 分发：
+  adapter.sideCall 存在？
+    ├─ 是（anthropic）→ messages.create 非流式——stream:false 线格式被
+    │                    mock 断言锚定（场景 7/15），必须原样
+    └─ 否（echo）      → assembleStream(this.stream(req)) → 取 text 块拼接
+                         ★ 聚合兜底：旁路语义可从 stream 推导——接缝存在的证明，
+                           覆写只是线格式优化
+
+适配器内（anthropic）：
+  toParams(req)：undefined 字段全部省略（键不出现在请求体——字节等价细节）
+  stream()：SSE 事件 → chunk（message_start 拿 input/cache 计数，
+            message_delta 拿 output + stop_reason，message_stop 合成 usage+finish）
+```
+
+### 10.4 换后端 = 换一行路由（echo）
+
+```
+MINI_CLAUDE_LLM_ROUTE=echo（env）→ Agent 构造读入 llmRoute
+  → 主循环 stream()、四个 sideCall()、hasRoute() 全按 route 查表
+  → anthropic mock 收不到任何请求
+
+echo 适配器（二十行）：
+  yield block-start(text)
+  yield text-delta('[echo] ' + lastUserText(req))     复读最后一条 user 消息
+  yield block-end → usage{input:1, output:1, cacheRead:0, cacheCreation:0}
+  yield finish('end_turn')
+  sideCall 不覆写 → 兜底聚合路径（goal/compact 在 echo 下正确但空转，教学够用）
+```
+
+### 10.5 完整时序走查：场景 31 echo 后端整循环
+
+```
+env: MINI_CLAUDE_LLM_ROUTE=echo，Agent 起来后 chat('...')：
+
+  runOneTurn → runStepLoop
+  请求段：ctx.llm.stream({route:'echo', ...})
+    → adapters.get('echo') ✓ → waterfall('llm/stream')（无监听器 → inner 透传）
+    → echo generator 逐段 yield：
+        block-start(text) → text-delta('[echo] 复读…') → block-end
+        → usage{1,1,0,0} → finish('end_turn')
+    onText：'[echo] …' 每段停 spinner（首次）后 emitText 流式打印
+    → Settlement { content:[{type:'text', text:'[echo] …'}],
+                   usage:{1,1,0,0}, finishReason:'end_turn' }
+  结算：total* 仪表累计 → pushAssistant(content, usage)——C3 双写：工作集+日志
+  → toolUses = 0 → serial turn-stopping（无 goal，沉默）→ endTurn('end-turn')
+  → 排空 → idle → 打印 cost / autoSave
+
+  断言锚：anthropic mock 零请求 ✓ / 结算文本复读 ✓ / usage 经 Settlement 流转 ✓
+  若此刻 goal/compact 触发（echo 路由下）：sideCall 无覆写 → 流聚合兜底——
+  stream:false 断言只锚 anthropic 路由，路由隔离让两条线格式互不污染
+```

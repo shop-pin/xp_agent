@@ -138,3 +138,106 @@ request(call, message):
 ## 9. 下章预告（C3 会话事件日志 ★ 本轮最核心）
 
 `services/session-log.ts`：SessionEvent 事件类型（system/user/assistant 消息、tool 调用与结果、turn 边界、meta/note）、`append/derive`——**model-visible ⟺ logged**，agent.ts 全部消息操作改走日志；derive 的实现位置为 D5 的压缩投影 replace 留缝。这是 dsh"会话即事件日志"世界观的地基，也是本轮最核心的一章。
+
+## 10. 代码执行流程图
+
+> 对应提交 `cc07cc9`。三条主线：注册序定优先级 → executeCall 管线 → monotonic 单调裁决。
+
+### 10.1 注册：监听器顺序 = 裁决优先级
+
+```
+Agent 构造（沿用 C1 7.1 的树）追加：
+  ctx.plugin(approvalPlugin)        ① 先注册 = waterfall 外层 = 最先裁决、final say
+      apply 内：
+        new ApprovalService(ctx, "approval") + setFallbackProvider(REPL 问答)
+        ctx.on("tools/pre-execute", monotonic(staticPipeline))
+                                          ↑ 九段判定序列包上单调守卫
+  ctx.plugin(autoApprovalPlugin)    ② 后注册 = waterfall 内层 = 被外层委托/收紧
+      apply 内：
+        ctx.on("tools/pre-execute", monotonic((call, next) =>
+            call.mode !== "auto" ? next() : autoPipeline(call, call.autoAdjudicate)))
+```
+
+### 10.2 管线：`tools.executeCall(call, exec)`
+
+```
+agent 循环收到 tool_use
+ └─ tools.executeCall({name, input, mode, planFilePath},
+                      { readFileState, dispatch, autoAdjudicate })
+      │                          ↑ 三个 agent 句柄借给管线：
+      │                            dispatch=魔法名链执行器 / autoAdjudicate=分类器
+      ├─ ① snapshot = structuredClone(input)    监听器/审批看快照，执行用原件
+      ├─ ② decision = await ctx.waterfall("tools/pre-execute", preCall, () => ({type:'allow'}))
+      │        inner 兜底 = allow（裸树无监听器 → 直接放行）
+      ├─ ③ decision.type 分流：
+      │     deny → return { kind:'denied', content:'Denied: '+reason, announce }
+      │     ask  → approval = ctx.get("approval")
+      │              ├─ 无服务 → verdict = 'deny'        fail-closed
+      │              └─ 有 → approval.request(preCall, message) → 10.4
+      │              verdict='deny' → return { kind:'denied', 'User denied…' }
+      ├─ ④ 执行：
+      │     exec.dispatch？ → dispatch(name, input)      魔法名链（agent 侧拦截器）
+      │     否则 preCall.def？ → def.execute(input, exec)  C1 注册表工具
+      │     否则 → "Unknown tool"
+      ├─ ⑤ output = truncateResult(output)
+      └─ ⑥ output = await ctx.waterfall("tools/post-execute", {name, output}, () => output)
+            监听器可改写（返回值生效）→ return { kind:'result', output }
+```
+
+### 10.3 单调守卫：`monotonic(listener)` 与裁决收敛
+
+```
+waterfall 链（外 → 内）：guard(approval) → guard(auto) → inner=allow
+
+guard 包裹的每次调用：
+  guardedNext = () => { inner = next(); return inner }
+  own = await listener(call, guardedNext)
+    ├─ listener 没调 next（否决/终局）→ inner=undefined → return own
+    │     ★ 短路保持：外层 deny 时内层根本不执行
+    └─ listener 调了 next → inner 有值
+          return tightenDecisions(await inner, own)
+            DECISION_RANK：deny > ask > allow
+            own 比 inner 严 → own；否则 → inner
+            ★ 外层只能加严不能放松：allow 之后无人能翻案
+              内层返回 allow、外层是 ask → 收敛为 ask（先问再说）
+
+裁决回传方向：内层先算完 → 逐层向外 tighten → 最严者胜
+```
+
+### 10.4 审批：`ApprovalService.request(call, message)`
+
+```
+request(preCall, message)
+ ├─ cacheable = (mode !== 'auto')
+ │     ★ auto 的 confirm 是动作摘要不是路径，一次批准不能白名单同类 → 不缓存
+ ├─ cacheable && confirmed.has(message)？ ──是──→ return 'allow-always'（同 message 免问）
+ ├─ provider = interactive ?? fallback
+ │     都没有 → return 'deny'                    fail-closed：无人可问=拒绝
+ ├─ verdict = await provider(preCall, message)
+ │     interactive：cli 注入（REPL 复用回调 / mock 脚本）
+ │     fallback：一次性 readline 问答（printConfirmation → y/n）
+ └─ verdict='allow-once' && cacheable？
+       └─ 是 → confirmed.add(message)，return 'allow-always'（升级 + 入缓存）
+       否则原样返回
+```
+
+### 10.5 完整时序走查：危险 shell 在 default 模式下连跑两次
+
+```
+第一次 run_shell('rm -rf tmp')，mode='default'：
+  waterfall 外层 staticPipeline：
+    ① checkPermissionRules → 'default'（无规则命中）
+    非 auto → 继续；非 plan；非 bypass
+    ④⑤⑥⑦ 都不中（hint='exec'，非 acceptEdits）
+    ⑧ isDangerous('rm -rf tmp') ✓ → return { type:'ask', message:'rm -rf tmp' }
+  内层 auto 监听器：mode ≠ 'auto' → next()（透传，无裁决）
+  → 收敛：ask
+  → approval.request：cacheable ✓、缓存无 → interactive provider（REPL 回调）
+      → 用户 y → 'allow-once' → 升级 'allow-always' + confirmed.add('rm -rf tmp')
+  → 执行 exec.dispatch('run_shell') → 结果截断 → post-execute 原样 → result
+
+第二次同命令：
+  waterfall → staticPipeline ⑧ 仍返回 ask
+  → approval.request：confirmed.has('rm -rf tmp') ✓ → 'allow-always'（不再问人）
+  ★ ask 段每次都触发，免问发生在审批服务的缓存层——管线与缓存各管一段
+```

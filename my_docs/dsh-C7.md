@@ -73,3 +73,90 @@ render(vars) 直取参数（`vars.cwd`）与 `{{cwd}}` 模板插值并存。env 
 ## 8. 下章预告（C8 会话持久化 JSONL）
 
 `plugins/session-jsonl.ts`：SessionLog 加 onAppend 订阅逐事件落盘 `~/.mini-claude/sessions/<id>.jsonl`；loadSession 变重放（derive 恢复请求历史 + meta/note 恢复 mode/cost/激活工具——超越旧版 resume）；崩溃修复（半行丢弃、turn/start 无配对补合成 turn/end）；autoSave 快照路径消亡。新场景：save→load→continue 请求体一致 + 崩溃 tail 修复断言。
+
+## 9. 代码执行流程图
+
+> 对应提交 `c57dad3`。三条主线：注册（服务先立 + 七节插件 + plan 自注册）→ assemble 拼装数据流 → 与 C3 system 去重的衔接。
+
+### 9.1 注册：节自描述，状态持有者自注册
+
+```
+Agent 构造（C1 树）追加：
+  new SystemPromptService(ctx, "system-prompt")
+  ctx.plugin(promptSectionsPlugin, { staticPrompt: custom || buildStaticSystemPrompt(),
+                                     dynamicEnabled: !custom })
+      inject: ["system-prompt"]        apply 内注册：
+    identity(100, static)  render: staticPrompt            子 agent = 自定义 system
+    dynamicEnabled === false → return（子 agent 到此为止——单块结构）
+    变量：cwd / platform / arch / shell（{{}} 模板通道）
+    env(200)        '# Environment\nWorking directory: {{cwd}}…'   模板节
+    git(300)        render: getGitContext() || null                非仓库 → null
+    memory(400)     render: buildMemoryPromptSection() || null
+    skills(500)     agents(600)     同款 null 短路
+    deferred-tools(700)  render: getDeferredToolNames() 有货才出目录页（逐请求现算）
+  Agent 自注册：
+    plan(800, dynamic)  render: () => this.mode === 'plan' ? this.buildPlanModePrompt() : null
+      ★ 闭包读 this.mode 活状态——配置是构造期快照，进出 plan 的瞬间快照就旧了
+
+SECTION_ORDERS 中央表：节间相对位置的唯一权威（同序按注册序稳定排序）
+```
+
+### 9.2 assemble：排序 → 分组渲染 → 严格插值 → 两块结构
+
+```
+assemble(): { system: TextBlockParam[] }
+  vars = {} ← variables 逐个求值（assemble 时的已知值）
+  sorted = sections.sort(order 升序，稳定)
+  renderGroup(group):
+    sorted.filter(group).map(render({...vars})).filter(≠ null).join("")
+      ★ null = 条件渲染（空白节整块消失）；连接串是空 join——各节自带前导
+        分隔符（memory 以 '\n\n# Memory System' 开头…），逐字节复刻旧拼接
+  块 1：interpolate(static 组)  + cache_control: ephemeral     前缀缓存吃这
+  块 2：interpolate(dynamic 组).trim()——非空才 push（纯空白不出块；trim 在
+        组级不在节级——节级 trim 会剥掉节间分隔符，翻车记档 #1）
+
+interpolate 严格插值：
+  replace(/\{\{(\w+)\}\}/g) → variables 有 key？求值 ： throw unknown prompt variable
+      ★ 未知占位符拦在 assemble——静默上线路（原文随请求上线）比炸掉贵
+```
+
+### 9.3 与循环的衔接：buildAnthropicSystem 收缩为委托
+
+```
+buildAnthropicSystem()          旧手拼字符串的最后一站
+  → ctx.require<SystemPromptService>('system-prompt').assemble().system
+      staticSystemPrompt 字段 / buildDynamicSystemContext / getGitContext 消亡
+
+runStepLoop 请求段（C3 逻辑原样，数据源换了）：
+  systemBlocks = buildAnthropicSystem()
+  JSON.stringify(systemBlocks) !== peekLastSystem()？
+    ├─ 是 → append(system/message, 编码块数组)
+    └─ 否 → 跳过
+  ★ assemble 每请求现算：git status 变了 / 模型写了记忆（索引变）/ 进出 plan——
+    编码就变，去重放行 append；日志多条 system 事件，derive 只取最新
+```
+
+### 9.4 完整时序走查：plan 进出的一次拼装（场景 10/25 的 system 锚）
+
+```
+注册期：identity(static) + 六个动态节 + plan(800)（闭包读 this.mode）——9.1
+
+/plan 进入规划模式（mode = 'plan'）后发消息：
+  runStepLoop → systemBlocks = buildAnthropicSystem()
+    assemble：
+      块 1 = [{STATIC_CORE, cache_control: ephemeral}]
+      dynamic：env({{cwd}} 等现值) + git(非空) + memory/skills/agents(无→null)
+               + deferred(视激活态) + plan(✓ → buildPlanModePrompt())
+      → join('') → trim → 非空 → 块 2
+    peekLastSystem = undefined（首轮）≠ 编码 → append system/message ✓
+  请求 system 字段 = 两块：静态断点块 + 含 plan 后缀的动态块（断言锚 ✓）
+  下一请求（mode/环境/索引全未变）：编码 === peekLastSystem → 跳过（C3 去重）
+
+exit_plan_mode 通过（mode 切走）后：
+  assemble：plan 节 render → null → filter 掉 → 动态块缩回
+  编码 ≠ peekLastSystem → 再 append——日志里两条 system 事件
+  derive()：逐条覆盖 → 只剩最新 → 请求体始终一份（第 3 节规则 2 的落点）
+
+子 agent 对照（ch23 锚）：customSystemPrompt → dynamicEnabled=false →
+  插件只注册 identity → assemble 单块（无动态节，无第二块）✓
+```

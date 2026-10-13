@@ -98,3 +98,73 @@ C 阶段从下一章起动真业务代码：agent.ts 的 12 个工具从 import 
 ## 8. 下章预告（C1 工具注册表）
 
 `services/tools.ts` 的 ToolsService（`register(def) → disposer`、`get(name)`），12 个工具的 execute 逻辑从 tools.ts 迁出，agent.ts 的 `executeToolCall` switch 改查注册表——第一个"业务代码长在 B 阶段地基上"的样板：ToolDefinition 挂 permissionHint/deferred，register 的 disposer 走 B3 effect（卸载自动摘工具），mcp__ 动态名的占位逻辑保持不变。
+
+## 9. 代码执行流程图
+
+> 对应提交 `9f617c5`。两条主线：loadRows 装配（行模型 → 插件挂载）→ dumpTree 观察（活状态）。
+> 激活本身不新增机制——走的全是 B2 的老路（plugin → pending → provide 唤醒）。
+
+### 9.1 装配：`loadRows(ctx, rows, resolve)`
+
+```
+loadRows(ctx, [...base, ...app, ...cliPatch], resolvePlugin)
+ │
+ ├─ ① byId = new Map()
+ │      for row of rows: byId.set(row.id, row)
+ │      ★ 后写覆盖 = 整行替换（不是字段合并！危险点）
+ │        base {id:'greeter', name:'greeter', config:{title:'默认'}}
+ │        patch {id:'greeter', name:'greeter', config:{title:'覆盖'}}
+ │        → 只剩 patch 那行
+ ├─ ② root = rootOf(ctx)                    沿 parent 走到根
+ │      records = loadedRows.get(root) ?? 新建挂上
+ │      （清单挂 WeakMap<root>：树内任意 ctx 进来都看到同一份）
+ └─ ③ for row of byId.values()：
+        ├─ row.disabled？ ──是──→ continue（同 id 被后层换成 disabled = "注释掉"）
+        ├─ plugin = resolve(row.name)       名字 → 实现（查无此名 → fail-loud）
+        ├─ fiber = ctx.plugin(plugin, row.config)   ★ 激活走 B2 11.1 全流程
+        │     依赖齐 → 当场 apply；未齐 → 扣 pendingFibers 等 11.3 唤醒
+        └─ records.push({ id, name, fiber })        持 fiber 引用，不是状态快照
+```
+
+### 9.2 观察：`dumpTree(ctx)`
+
+```
+dumpTree(ctx)
+ ├─ root = rootOf(ctx) → loadedRows.get(root) ?? []
+ └─ 逐行输出：<mini-cordis>
+      ├─ [core] core → active
+      └─ [greeter] greeter → pending (inject: config)
+           ★ 读的是 record.fiber.state —— fiber 的活引用
+             dump 两次状态可以不同（pending 在某次 provide 后转 active）
+```
+
+### 9.3 完整时序走查：乱序清单 + 分层补丁
+
+```
+rows = [
+  { id:'greeter', name:'greeter' },                         ← 故意写在 core 前面
+  { id:'core',    name:'core', config:{ title:'mini-harness' } },
+  { id:'clock',   name:'clock' },
+  { id:'clock',   name:'clock', disabled:true },            ← 后层注释掉 clock
+]
+
+loadRows：
+  byId 合并 → clock 行被 disabled 行整行替换 → 跳过
+  ① greeter 行：ctx.plugin(greeter) → refresh 时 inject ['config'] 未齐
+       → 扣 pendingFibers，state='pending'
+  ② core 行：ctx.plugin(core) → apply → ctx.provide('config', frozen)
+       → 落共享表 → notifyProvided('config') → 重查 pendingFibers
+       → greeter.refresh：has('config') ✓ → loading → apply
+           ctx.require('config') → 拿到 frozen 视图 → ctx.provide('greet', fn)
+       → active                                     ★ 书写顺序无关，依赖推送激活
+  ③ clock 行：已禁用，什么都没发生
+
+dumpTree(root)：
+  <mini-cordis>
+  ├─ [greeter] greeter → active (inject: config)
+  └─ [core] core → active
+  （clock 不在清单里——disabled 行不产生记录）
+
+对照 B 阶段总结的链：服务表(B1) → 生命周期(B2) → 回滚(B3) → 事件(B4)
+  → 作用域(B5) → 本章把"装什么/什么配置"从代码里抽出来变成数据行。
+  C1 起的每个业务能力都长在这条链上：加一行 = 加一个能力。

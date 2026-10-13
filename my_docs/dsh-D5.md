@@ -90,3 +90,145 @@ replace/truncate 都是**追加**的事件，不是对旧事件的修改。验�
 ## 8. 下章预告（D6 goal/loop/auto 收尾）
 
 C5 已把 goal（turn-stopping 挽留）和 loop（turn-end 定时调度）迁成监听器，D6 清尾：`schedule_wakeup` 的字段回传协议换成 `ctx.schedule` 服务（loop 驱动读字段的缝消失）；三态 goal 评估器、两段 auto 分类器、动态 loop 以监听器身份收口——agent 循环里不再有 `if(mode===...)`/`if(goal)`/`if(loop)` 的分支残留。验收：对应场景（7/15/26/29 等）全绿。
+
+## 9. 代码执行流程图
+
+> 对应提交 `5d360f7`。四条主线：两个投影事件与 fold 折叠规则 → append 纯追加化（合并迁投影层）→ CompactionService 四层与仪表 → agent 循环的 derive 驱动接线。
+
+### 9.1 投影层：两个事件 + 一条折叠规则
+
+```
+新事件（SessionEvent 联合扩展）：
+  { type:"message/replace", target: seq, content }   按 seq 定位，整条 content 换血
+  { type:"history/truncate", reason }                投影清空，其后消息事件从零累积
+
+fold()（derive()/nodes() 的共同底座）：
+  system ← 最新一条 system/message
+  nodes: FoldedNode[]、bySeq: Map<seq, node>
+  for (evt, seq) of log:
+    user/message | assistant/message:
+      user 且 nodes 末节点也是 user？ → mergeUserContent 并入末节点   ★ 注记隔断也算相邻
+      否则 → nodes.push({ seq, message })；bySeq.set(seq, node)
+    message/replace:
+      node = bySeq.get(target)；落空（truncate 后指向旧世界）→ 防御性跳过
+      命中 → node.message = { ...node.message, content: clone(evt.content) }
+             ★ 链式：后续 replace 看到前一 replace 之后的投影（T1 截断后
+               T2 在截断结果上判剪——与旧原地顺序语义一致）
+    history/truncate:
+      nodes.length = 0；bySeq.clear()
+    其余（tool/turn/meta）→ 注记，不进投影
+  ★ seq = 事件下标，append-only 下永不重排——replace 的定位锚；
+    消息序号会随 truncate/合并漂移，不能当身份用
+```
+
+### 9.2 append 纯追加化：合并迁投影层
+
+```
+旧 append()：
+  onAppend（落盘）→ 连续 user 合并（判据：紧邻的上一条【事件】是 user/message）
+  ★ 事件流里 user 之间常隔着注记（turn/start、turn/end）——
+    事件视图 ≠ 消息视图，跨注记的两条 user 被判"不相邻" → 不合 → 400 隐患
+    （ch27 探针：abort 后紧跟新 turn，投影 8 条 vs 期望 7）
+
+新 append()：
+  for fn of appendListeners: fn(evt)   落盘钩子照旧（原始流）
+  this.log.push(evt)                    一行——纯追加，零合并
+
+合并语义在 fold()：
+  判据 = nodes 末节点是 user（【消息】视图），注记事件对合并透明
+  mergeUserContent 逐字节旧语义：字符串拼字符串（\n\n）；批次宿主追加 text 块
+  ★ 为什么不能改 append 救：append 侧合并要回改已落盘事件；JSONL 重放时
+    注记照旧隔在中间、判不出相邻——在线视图 ≠ 重放视图，重放即发散。
+    放 fold 则在线与重放执行同一条折叠规则，一致性是构造出来的
+```
+
+### 9.3 CompactionService：四层与仪表
+
+```
+仪表（自 agent 迁入）：
+  lastInputTokenCount = usage.input + cacheRead + cacheCreation + output
+  lastApiCallTime = Date.now()          recordUsage(usage)——每个 assistant 结算后
+  effectiveWindow = getContextWindow(MODEL) - 20000（128k 模型 → 108000）
+
+runPipeline()（每请求前，零 API 成本）：
+  T1 budgetToolResults：util < 0.5 忍住；预算 = util > 0.7 ? 15000 : 30000
+    tool_result 字符串超预算 → 掐头去尾（keepEach 各留一半 + 80 字节提示位）
+    → appendReplace(node, next)
+  T2 snipStaleResults：双门控——缓存热（<5min）且 util < 0.75 → return；
+    util < 0.60 → return
+    剪谁：tools.get(name)?.snippable（工具元数据自报——硬编码集合消亡）
+    results.length <= KEEP_RECENT_RESULTS(3) → return（前 3 条期间同文件去重也不跑）
+    ① 同 file_path 只留最后一次  ② 最老的 length-3 条
+    → 按节点分组换 SNIP_PLACEHOLDER（别边遍历边改）
+  T3 microcompact：缓存未冷（<5min）→ return
+    所有 tool_result 只保最近 3 条，其余换 "[Old result cleared]"
+
+checkAndCompact()（turn 边界，唯一花 API 的层）：
+  lastInputTokenCount > effectiveWindow × 0.85？
+    compact()：nodes < 4 → false
+    尾部三分：纯文本 user → 摘要请求 = 历史去尾 + 指令，carryTail=true
+             无工具 assistant → 历史全量 + 指令，carryTail=false
+             tool 批次尾/未知 → fail-closed 不发（"ends mid-tool-batch"）
+    sideCall 摘要（2048 tok）→ append 四连：
+      history/truncate("compact") + user/message([Previous conversation summary]...)
+      + assistant/message(text 确认) + [carryTail] user/message(tail 深拷贝)
+    lastInputTokenCount = 0
+```
+
+### 9.4 agent 循环接线：derive 驱动，工作集消亡
+
+```
+消亡清单：this.messages、SNIPPABLE_TOOLS、四层实现体、压缩仪表字段、
+          findToolUseById、pushUser/pushAssistant 的合并逻辑（缩成一行 append）
+
+接线点（runOneTurn）：
+  turn 开场：await compaction.checkAndCompact()        T4 门（与旧时机一致）
+  pre-step payload：historyEmpty = messages.length === 0
+    → 改为 derive().messages.length === 0               消息视图现算
+  每请求前：compaction.runPipeline()                    T1–T3（时机照旧）
+  组装：withCacheBreakpoints(sessionLog.derive().messages)   ★ 请求走投影
+  结算：compaction.recordUsage(usage)                   仪表一行记账
+
+其它读取点同源：
+  get messages（分类器 transcript 等）→ derive().messages
+  resume：repairUnclosedTurn 后不回填任何工作集——usage 扫描直写
+          compaction.lastInputTokenCount；printInfo 计数走 derive
+  /clear：this.messages = [] → compaction.lastInputTokenCount = 0
+```
+
+### 9.5 完整时序走查：场景 7（T4 truncate + 重建）与场景 21（T1→T2 链式）
+
+```
+场景 7——T4 主线（--goal 读三文件，turn1 末 usage input=100000）：
+  turn1（t0–t3）：逐个 read a/b/c.txt，每次结算 recordUsage
+    （100000+500 = 100500 > 91800 = 108000×0.85——仪表越线）
+    T2 静默的根据：恰好 3 条结果 ≤ KEEP_RECENT，三文件不同也不触发去重
+  turn1 收敛 → 评估器判 NOT_MET（goal track 第 1 轮）→ pursueGoal 二次 chat()
+  turn2 开场 → checkAndCompact：0.85 门过 → compact()
+    尾部三分：末条是 goal feedback（纯文本 user）→ 摘要请求 = 历史去尾 + 指令，
+    carryTail=true
+  req(compact track, 非流式)：
+    ✓ 恰一次、messageCount 9（8 条 turn1 历史 + 摘要指令）
+    ✓ 携带真工具结果（alpha..gamma——投影层出来的就是消息视图）
+  回来后 append 四连：truncate + summary + ack + tail(feedback)
+  req(t4, main)：
+    ✓ messageCount 3（summary/ack/feedback——truncate 清了旧投影，
+      三条新事件从零累积）
+    ✓ firstUserText 含 "[Previous conversation summary]" 与 "a.txt=alpha"
+  → 评估器判 MET → 停机
+
+场景 21——T1/T2 的链式 replace（run1 五读）：
+  t1 请求前 runPipeline：util ≈ 0.93 > 0.5 → T1 预算 15000
+    r0（bigfile 首读 ~20K）超预算 → message/replace(target=r0.seq)
+    T2：仅 1 条结果 ≤ 3 → 静默
+  t2：r1（bigfile 再读）同款 budget 化——★ replace 链式：T2 若此际启动，
+    看到的 r0 已是 budgeted 投影（与旧原地顺序语义一致）
+  t3：r2/r3 小结果不超预算；T2 仍 ≤ 3 条静默 ✓（断言 tr(2) 无 SNIP）
+  t4 前：4 条结果 > 3 → T2 启动（缓存恒热但 util 0.93 > 0.75 覆盖线）
+    同文件去重：bigfile 两次读，旧读 r0 剪 → SNIP_PLACEHOLDER
+    保最近 3：剪最老 1 条（也是 r0——两个剪枝指向同一目标）
+    r1（同文件最新读）存活仍 budgeted ✓；小结果原样 ✓
+    → 全部经 message/replace 落事件，日志本体未动一字
+（run2 验 persistLargeResult：45KB 全文落 HOME 沙箱 tool-results/，
+  上下文只剩 200 行预览——"结果进上下文之前"的事，跟压缩层无关）
+```

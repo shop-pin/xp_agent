@@ -66,3 +66,130 @@ claim 的输入（含注入）会过 pre-step waterfall——改写者（skills 
 ## 7. 下章预告（D5 compaction 插件化）
 
 C3 立的规矩兑现：`SessionLog.derive` 支持 replace 投影（事件带 generation，derive 只取每节点最新代）；T1–T4 四层压缩从"原地改 this.messages"改为"追加 replace 事件"；SNIPPABLE_TOOLS 变工具元数据；/compact 直调压缩插件。验收：压缩场景请求体等价 + **原始事件未被修改**断言（"日志即真相"的终极验收）。
+
+## 8. 代码执行流程图
+
+> 对应提交 `863120e`。四条主线：memoryPlugin 的 turn 边界发起 → sideQuery 旁调与三道门 → inject 缝（排队不唤醒 → claim → pushUser → 日志）→ 与既有监听器的共存礼仪。
+
+### 8.1 旧机制 → 新机制：拉改推
+
+```
+旧（agent.ts 字段 + 循环内轮询 + 就地改写）：
+  chat() 开头 startMemoryPrefetchForTurn
+    → 先 consume 上一轮遗留（晚归不排就永久丢）→ 再发新 prefetch
+  每个 step 顶 consumeMemoryPrefetchIfReady(messages)   ★ 轮询：落定与请求时机耦合
+    settled 且未消费 → 直接改 messages 末条（append 文本/块）★ 绕过 pushUser
+    → SessionLog 看不见 → C3 "model-visible ⟺ logged" 破裂 → resume 丢注入
+
+新（plugins/memory.ts + inject 缝）：
+  pre-step(boundary:"turn") 观察者发 prefetch          发起时机 = turn 边界
+  settle → bridge.inject(text) → inbox.append("next-step")   ★ 落定是推，不是拉
+  最近 claim 点（claimStep / claimTurn）认领
+    → pushUser（合并器往批次追加 text 块）→ 消息 + user/message 日志事件
+    → 盲区闭合；晚归也有效——队列不怕晚，"排掉"逻辑消亡
+```
+
+### 8.2 memoryPlugin：turn 边界发起与三道门
+
+```
+Agent 构造：
+  this.cordis.plugin(memoryPlugin, {
+    bridge: { inject: (text) → this.inject(text) },
+    enabled: !this.isSubAgent })        ★ 子 agent 不装（召回是主对话机制）
+
+memoryPlugin.apply（inject ["llm"]）：
+  闭包簿记：surfaced = Set<路径>、surfacedBytes        （旧 Agent 字段迁入）
+  sideQuery = (system, userMessage) → llm.sideCall({ model: MODEL,
+      maxTokens: 256, temperature: 0, 非流式, 单条 user })
+                                       ★ MODEL 常量迁 services/llm.ts——插件同源
+  ctx.on("agent/pre-step", (payload, next) → {
+    const decision = next()            观察者礼仪（D1 教训）：先委托、原样返回
+    if (payload.boundary === "turn" && payload.input.length > 0) {
+      pf = startMemoryPrefetch(input.join("\n\n"), sideQuery, surfaced, surfacedBytes)
+      三道门（全过才有 pf，否则 null 零成本跳过）：
+        ① 查询够重（isQuerySubstantial：寒暄/单词直接否）
+        ② 会话记忆预算未超（surfacedBytes < 60KB）
+        ③ 记忆目录里有 .md（MEMORY.md 不算）
+      pf.promise.then(memories →
+        空则 return；逐条 surfaced.add + 字节记账
+        bridge.inject(formatMemoriesForInjection(memories)))
+      .catch(静默)                      ★ 召回尽力而为——fail-silent（测试要锚"调用发生"）
+    }
+    return decision
+  })
+```
+
+### 8.3 inject 缝：排队不唤醒 → claim → pushUser → 日志
+
+```
+AgentHandle.inject(text)：        D4 落地的缝
+  inbox.append("next-step", text)  只排队——不拉 idle 驱动、不开 turn
+                                   与 steer 的唯一差别是唤醒：
+                                     steer → idle 时开 turn（idle driver）
+                                     inject → idle 时挂起，等 followup/steer 唤醒
+                                   ★ 不唤醒 = inject 对"开模型请求"不负责——纯供给
+
+消费端（claim 点）：
+  step 边界 claimStep / turn 开场 claimTurn 认领 next-step 队列
+    → pushUser(text)：
+        批次数组（tool_result 批）→ merger 追加 { type:"text" } 块
+        独立文本 → 新 user 消息
+    → sessionLog.append(user/message)    model-visible ⟺ logged 恢复
+
+services/agents.ts：pre-step payload 增 boundary: "turn" | "step"
+  turn 开场首认领 → "turn"；steer 插话认领 → "step"（memory 只在 "turn" 发起）
+```
+
+### 8.4 共存：观察者、目录注入、身份混流
+
+```
+pre-step 链上的两个监听器（注册序 = 追加顺序）：
+  memory：纯观察者——next() 的裁决原样返回，不改写输入
+  skills（D1）：以 inner 为基线追加 catalog——historyEmpty 锚"批内是否已有内容"
+  ★ 两者不冲突：skills 只在首批（historyEmpty），memory 注入晚于首批到达时
+    已在 claim 后进消息，不进 pre-step 链
+
+身份混流（记差距清单）：
+  memory 注入与 mid-turn steer 插话走同一条 next-step → claim → pushUser 管线
+  → 日志里的 user/message 事件不可区分（都是文本块）
+  → E1 若要区分渲染，需在此补事件元数据（dsh 有 additionalContexts 专用身份）
+```
+
+### 8.5 完整时序走查：场景 8（selector 一次、注入落批次）
+
+```
+setup：memory 目录预置 project_deploy.md（Deploy target: staging.example.com）
+  与 user_color.md（favorite color is blue）；dummy.txt 备读
+prompt："Where should I deploy my changes to test them?"
+
+t0 turn 开场：
+  runOneTurn → pre-step waterfall（boundary:"turn"）
+  memory 监听器：next() 原样 → 三道门全过（查询够重/预算未超/目录有 2 条）
+  → startMemoryPrefetch 挂起（promise 在飞）
+  skills 监听器：historyEmpty=true → catalog 追加首条 user 消息
+  req(t0, main)：
+    ✓ system 含 "# Memory System" + "No memories saved yet"（索引未生）
+    ✓ 注入未达（prefetch in flight）：lastUserText 无 "Memory (saved today)"
+    → tool_use write_file(user_editor.md) + read_file(dummy.txt)
+
+selector 旁调（memory track，与工具执行并行）：
+  sideCall 单条非流式请求 → 收到 {"selected_memories": ["project_deploy.md"]}
+  ✓ memReqs.length === 1、stream === false、messageCount === 1
+  ✓ manifest 含查询 + 两条候选（project_deploy.md / user_color.md）
+
+落定 → 推：
+  pf.promise.then → surfaced.add(project_deploy.md) → bridge.inject(
+    "<system-reminder>\nDeploy target: staging.example.com...\n</system-reminder>")
+  → inbox.append("next-step", ...)——不唤醒（此际 running，无所谓；idle 同样挂着）
+
+t0 工具执行完 → step 边界 claimStep 认领 → pushUser 往 tool_result 批次追加
+  text 块 → user/message 日志事件（盲区闭合——C8 resume 从此不丢注入）
+  顺手：write_file 落盘 user_editor.md → MEMORY.md 写时重建
+
+req(t1, main)：
+  ✓ 选中记忆落 lastUserText："<system-reminder>" + "staging.example.com" +
+    "Memory (saved today)"；system 不含 staging（不在 prompt-section 的索引正文里）
+  ✓ 反面锚：未选中的 "favorite color is blue" 不进 lastUserText 也不进 system
+  ✓ 索引重建生效：system 含 "My favorite editor" + "Deploy target"
+  → 文本 "Deploy to staging.example.com for testing." → end-turn
+```

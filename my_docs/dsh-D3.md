@@ -35,7 +35,7 @@ C1 立过一条规矩："注册序必须与旧 toolDefinitions 数组序一致�
 
 **文件**：`plugins/subagent.ts`（新增）；`services/agents.ts`（AgentHandle 增 runOnce/close；AgentRegistry 增 disposeAll）；`agent.ts`（registry+插件挂载、executeAgentTool/拦截删除、skill fork 走 registry、close 先收子）；`subagent.ts`（getSubAgentConfig 只解析白名单，agent 剥除迁 preset）；`plugins/core-meta-tools.ts`（agent 占位删除）；`cordis-tests/d3-subagent.test.ts`（新增 5 条）；`cordis-tests/c1-tools.test.ts`（断言变更，见 §3）。
 
-**验证**：cordis **128/128**（D3 新增 5 条：childModeOf 映射、preset 排除（与旧硬过滤逐项一致 = 广告字节等价的锚）、skill preset 白名单、插件注册/enabled=false、registry 生命周期 + 双层隔离）；mock **28 场景全绿**——12（子 agent 全链路）、23（自定义 agent）、23b（skill fork）零断言变更。
+**验证**：cordis **128/128**（D3 新增 5 条：childModeOf 映射、preset 排除（与旧硬过滤逐项一致 = 广告字节等价的锚）、skill preset 白名单、插件注册/enabled=false、registry 生命周期 + 双层隔离）；mock **28 场景全绿**——11（子 agent 全链路）、23（自定义 agent）、23b（skill fork）零断言变更。
 
 **翻车记档**：
 1. **C1 断言的连锁破产**（§3 正文）——改 agent 工具位置炸出三条 C1 断言，其中"注册序镜像广告序"是锚在错误前提上的测试。修法不是把新代码塞回旧形状（在 rig 里精心排序插件加载假装序还在），而是承认前提死亡、改比真实不变式。**给旧测试改断言时的第一问：它当年锚的前提今天还成立吗？**
@@ -55,3 +55,135 @@ C1 立过一条规矩："注册序必须与旧 toolDefinitions 数组序一致�
 ## 6. 下章预告（D4 memory 与上下文注入）
 
 `AgentHandle.inject()`（下一请求注入，走 inbox 的 next-step 特殊项或专用队列——对齐 dsh agent.inject()）；memory prefetch 的循环内轮询改 turn 边界监听器注入；CLAUDE.md 专槽保持。验收：memory 场景绿 + "注入是否入日志"的设计决策讨论定夺（对齐 dsh 走 user/message 或专用事件）。
+
+## 7. 代码执行流程图
+
+> 对应提交 `871f3e4`。四条主线：preset 数据化（排除表 + 防洗白）→ agent 工具真身入注册表 → registry 生命周期收口 → 双层隔离与消亡清单。
+
+### 7.1 preset 数据化：排除表与防洗白
+
+```
+DEFAULT_EXCLUDES = { agent, schedule_wakeup }        一张表替代三处散落的 !== "agent"
+  agent           防递归失控（子 agent 不许再派子 agent）
+  schedule_wakeup 防驱动内部工具外流（它是 dynamic loop 的内脏）
+
+childModeOf(parentMode)：                             防洗白裁决迁到纯函数
+  plan → plan / auto → auto / 其余 → bypassPermissions
+  ★ 裁决点在 preset 构造期——身份的唯一入口，绕不过；
+    运行期自查则每条派生路径都要记得检查，漏一处就是洗白洞
+
+buildPresetFromType(type, parentMode)：               内建 explore/plan/general + 自定义
+  config = getSubAgentConfig(type)                    （custom 优先，白名单在此解析）
+  → { systemPrompt: config.systemPrompt,
+      tools: applyExcludes(config.tools, DEFAULT_EXCLUDES),
+      permissionMode: childModeOf(parentMode), excludes: [...] }
+
+buildPresetFromSkill(skill, parentMode, base = toolDefinitions)：   skill fork 共用
+  tools = skill.allowedTools ? base.filter(白名单) : base
+                                       ★ 白名单在父工具集上解析（fork 继承的是父的活工具）
+  → 同一张排除表 + 同一个 childModeOf
+```
+
+### 7.2 agent 工具真身：subagentPlugin
+
+```
+Agent 构造（父）：
+  new AgentRegistry(this.cordis, "agents")            registry 先落位
+  this.cordis.plugin(subagentPlugin, {
+    bridge: { parentMode: () => this.mode,             父模式实时读（防洗白输入）
+              addTokens: (i, o) → total* += }          子消耗记回父级费用统计
+    enabled: !this.isSubAgent })                       ★ 子 agent 不加载本插件（第一层隔离）
+  executeToolCall 的 "agent" 魔法分支 / executeAgentTool 私有方法 → 消亡
+
+subagentPlugin.apply（inject ["tools","agents"]）：
+  tools.register({ name: "agent", permissionHint: "meta",
+    execute: async (input) →
+      ui.subAgentStart(type, description)
+      preset = buildPresetFromType(type, bridge.parentMode())
+      child = agents.create({ customSystemPrompt, customTools: preset.tools,
+                              isSubAgent: true, permissionMode: preset.permissionMode })
+      try result = child.runOnce(prompt)
+          bridge.addTokens(result.tokens.input, result.tokens.output)   ★ token 回滚
+          ui.subAgentEnd → return result.text
+      catch → ui.subAgentEnd → return `Sub-agent error: ...`            错误兜成 tool_result
+  })
+```
+
+### 7.3 registry 生命周期：谁创建，谁收口
+
+```
+AgentRegistry（services/agents.ts，B5 期已有 create/get/list）：
+  create(opts) → new Agent(...) + this.agents.set(id, handle)   登记在册
+  disposeAll():                                                 D3 新增
+    await Promise.all(list().map(a → a.close()))                并发收口
+    this.agents.clear()
+
+父 Agent.close()：
+  await agents.disposeAll()      ★ 先收孩子——registry 是所有权人，
+  await mcp.disconnectAll()        "孩子谁带"从各调用方收进一个收口点
+                                   （子 agent 无 MCP，close 是 no-op 级；
+                                     但不收就是悬挂句柄——吊住事件循环）
+
+对照旧世界：裸 new Agent(...) 无登记——close 时没人知道它存在
+```
+
+### 7.4 双层隔离：子树里没有 agent 工具
+
+```
+第一层（插件层，dispatch 面）：
+  子 Agent 构造 → plugin(subagentPlugin, { enabled: false }) → apply 直接 return
+  → 子树注册表里根本没有 "agent" 这个 def
+  cordis 断言：子树 ctx.tools.get("agent") === undefined
+
+第二层（数据层，可见性面）：
+  preset.tools = applyExcludes(...) → 广告集与 fork 继承集都不含 agent/schedule_wakeup
+  cordis 断言：preset 排除结果与旧硬过滤逐项一致（广告字节等价的锚）
+
+只留一层的下场：
+  只留插件层 → 广告集仍含 agent，模型会调它然后吃 Unknown tool
+  只留排除表 → dispatch 可达（构造期缺陷就是逃逸面——手工调 registry 即穿透）
+
+边界：mini 的 B2 全树共享服务表挡住了 isolate per-agent scope——
+子 agent 是独立 Context 树，事件隔离靠"子树独立"这个更粗但有效的边界
+```
+
+### 7.5 完整时序走查：场景 23（自定义 agent）+ 23b（skill fork）
+
+```
+场景 23——自定义类型走 preset 主线：
+  setup：.claude/agents/researcher.md（allowed-tools: read_file, grep_search；
+  body = "You are a research specialist..."）
+  req1（main）：
+    → tool_use agent{ type:"researcher", description:"Read docs", prompt:"..." }
+    注册表 def.execute（subagentPlugin）：
+      preset = buildPresetFromType("researcher", parentMode)
+        getSubAgentConfig：custom 命中 researcher → 白名单过滤 toolDefinitions
+        → applyExcludes 摘 agent/schedule_wakeup（白名单里本来也没有——逐项等价）
+        → childModeOf(default) = bypassPermissions
+      child = agents.create({...}) → 登记 → 子 Agent 构造
+        ★ 子树 enabled=false → 无 agent 工具；catalogInjection=false（D1）；mcp disabled（D2）
+      child.runOnce("Read docs.txt and report.")
+  req_sub（fork track，match "research specialist"）：
+    ✓ system 含 "research specialist"（custom body 即 system prompt）
+    ✓ tools 恰为 read_file + grep_search（length === 2）
+    ✓ messageCount === 1（context 全新，不带主对话历史）
+    → 文本 "docs.txt says hello."
+  回主对话：bridge.addTokens 记账 → tool_result "docs.txt says hello."
+  req2（main）：✓ 报告回灌 → 文本收尾（2 main 调 + 1 sub 调）
+
+场景 23b——skill fork 走同一 registry：
+  setup：.claude/skills/heavytask/SKILL.md（context: fork，allowed-tools 同上）
+  req1（main）：
+    → tool_use skill{ skill_name:"heavytask", args:"audit the repo" }
+    executeSkillTool：registry.getByName 命中 → resolveSkillPrompt 展开 $ARGUMENTS
+      → context === "fork" → preset = buildPresetFromSkill(skill, mode, this.tools)
+        白名单在父工具集上解析 + DEFAULT_EXCLUDES 摘除
+      → agents.create（登记）→ runOnce("Execute this skill task.")
+  req_fork（fork track，match "Audit task"）：
+    ✓ system = "Audit task: audit the repo. ..."（$ARGUMENTS 已替换）
+    ✓ tools 恰为白名单两项
+    → "Findings: everything looks fine." → tool_result 回主对话
+  req2（main）：✓ fork 结果回灌收尾
+  ★ 与场景 23 同一条 create/runOnce/记账管线——差别只在 preset 来源
+    （getSubAgentConfig vs buildPresetFromSkill）
+```

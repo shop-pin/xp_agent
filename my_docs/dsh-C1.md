@@ -92,3 +92,83 @@ read_file → write_file → edit_file → list_files → grep_search
 ## 6. 下章预告（C2 工具执行管线 + 权限瀑布）
 
 ToolsService 增加 `executeCall()` 管线：snapshotArgs → `waterfall('tools/pre-execute', call, next)`（B4 的 waterfall 第一次派上真用场）→ guard 单调校验（listener 只能收紧 allow→ask/deny，不可反向）；`plugins/approval.ts` 把 permissions.ts 的检查监听器化，agent 循环内的权限代码删除——权限从"循环里的一段逻辑"变成"事件域里的一组监听器"。
+
+## 7. 代码执行流程图
+
+> 对应提交 `7ba2c7d`。三条主线：树与注册表组装 → 插件注册 → 循环内执行。
+
+### 7.1 组装：Agent 构造函数起树
+
+```
+new Agent(...)                                  agent.ts
+ │
+ ├─ this.cordis = new Context()                 一棵树 per Agent 实例
+ ├─ new ToolsService(this.cordis, "tools")      B1 10.2 流程：super → provide('tools')
+ │     ★ 注册表服务先行——后面三个工具插件都 require 它
+ └─ this.cordis.plugin(coreFsTools)             三个插件按固定顺序挂载
+        this.cordis.plugin(coreExecTools)         B2 11.1：resolvePlugin → fiber → refresh
+        this.cordis.plugin(coreMetaTools)         （无 inject → 全部当场 active）
+```
+
+### 7.2 注册：工具插件 apply 内落表
+
+```
+coreExecTools.apply(ctx)                        plugins/core-exec-tools.ts
+ │
+ ├─ tools = ctx.require("tools")                严格读取 → ToolsService 实例
+ └─ tools.register({ name:'run_shell', ...schemaOf('run_shell'),
+                     permissionHint:'exec',
+                     execute: (input) => runShell(input) })      ← 函数体自旧 switch 剪切
+      │
+      ├─ 同名已注册？ ──是──→ throw "has been registered already"   （B2 冲突语义同款）
+      ├─ defs.push(def)                          注册序！与旧 toolDefinitions 数组序对齐
+      └─ return disposer
+           └─ apply 内调用 → ctx.fiber ∈ {loading,active}
+                → fiber.collect(disposer, 'provide-式收集')      B3：插件卸载 → 工具消失
+```
+
+三个插件（fs/exec/meta）同样式，注册序 = 旧数组序 = 请求体 tools 数组序（生命线）。
+
+### 7.3 运行：agent 循环两处消费
+
+```
+① 广告 schema（发请求前）
+   getActiveToolDefinitions(toolDefinitions)
+     ├─ filter: !deferred || activatedTools.has(name)
+     │     activatedTools = 模块级 Set（tool_search 的"一次搜索终身有效"）
+     └─ map: 剥掉 deferred 标记 → Anthropic.Tool[]
+   （C1 时点 schema 广告仍走静态 toolDefinitions 保序；执行才走注册表）
+
+② 执行（收到 tool_use 块）
+   魔法名链（plan/agent/skill/schedule_wakeup/mcp__…）在上方拦截
+     │ 走到这里的都是注册表工具
+     ▼
+   tools = cordis.require<ToolsService>("tools")
+   def = tools.get(name)
+     ├─ 无 → return `Unknown tool: ${name}`       与旧 switch default 同话术
+     └─ 有 → await def.execute(input, { readFileState })
+           → 结果经 truncateResult 截断（>50000 字符保头尾砍中间）
+           → 进 messages，下一轮请求发回模型
+```
+
+### 7.4 完整时序走查：一次 run_shell 调用
+
+```
+启动：new Agent()
+  → 树：root{ services: { tools } }
+  → fiber<core-fs-tools>.apply → register(Read/Edit/…)      defs = [Read, Edit, …]
+  → fiber<core-exec-tools>.apply → register(run_shell)      defs = […, run_shell, …]
+  → fiber<core-meta-tools>.apply → register(tool_search)    defs = […, tool_search]
+
+请求：模型回 tool_use { name:'run_shell', input:{ command:'ls' } }
+  → 魔法名拦截链：'run_shell' 不匹配 → 落到注册表
+  → tools.get('run_shell') → def.execute({command:'ls'}, {readFileState})
+      → execSync('ls') → stdout 字符串
+  → truncateResult → assistant 消息追加 tool_result
+  → 下一轮请求：getActiveToolDefinitions 广告的 tools 数组序与迁移前逐字节一致
+
+卸载视角（C1 还没人调，但机制已在）：
+  fiber<core-exec-tools>.dispose()
+  → B3 10.2 逆序执行 _effects → run_shell/web_fetch 的 disposer
+  → defs 里这两项消失 → 下一次 tools.get('run_shell') 返回 undefined → "Unknown tool"
+```

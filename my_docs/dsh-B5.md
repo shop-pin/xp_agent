@@ -98,3 +98,93 @@ mini 不实现，这里把真框架的行为记档：
 ## 8. 下章预告（B6，B 阶段收官）
 
 框架件齐了（容器/fiber/effect/事件/scope），但"这个 app 装哪些插件"还写死在代码里。B6 落**配置组装 loader**：行模型（id/name/config/disabled）、分层叠加（base + app + cliPatch，同 id 后写胜 = 整行替换）、name→Plugin 静态解析表、`dumpTree` 树状输出；总验收是一道玩具 harness——**配置里注释掉某插件 → 能力消失；加一行 → 能力出现；书写顺序打乱 → 依赖驱动照常激活**。这正是 dsh "换 provider 即换产品"的最后一环。
+
+## 9. 代码执行流程图
+
+> 对应提交 `6fcc7b3`。两条主线：createScope 铸造（fiber + 标签）→ ScopeLayers 注册/解析（分层遮蔽）。
+
+### 9.1 铸造：`createScope(parent, key, { parent: parentKey })`
+
+```
+createScope(parent, key, options)
+ │
+ ├─ options.parent 传了？ → bindScopeParent(key, parentKey)
+ │      ├─ key 已绑过父？ ──是──→ throw "already bound"        一次性
+ │      └─ 沿 parentKey 向根走，撞见 key 自己？ ──是──→ throw "cycle"
+ │             （环会让 scopeChainOf/scopeOf 的 while 全部死循环，必须建链时就拦）
+ ├─ fiber = parent.plugin(scopeFiber)          匿名空箭头插件 = scope 的骨架
+ │      └─ 走 B2 11.1：child ctx + fiber + trackPending + refresh（apply 空转，秒 active）
+ ├─ ctx = fiber.ctx
+ ├─ scopeTags.set(ctx, key)                    ★ 标签打在 scope 的 ctx 上
+ └─ return { ctx, key, dispose: () => fiber.dispose() }    dispose 透传幂等结算
+```
+
+### 9.2 标签继承：`scopeOf(ctx)`——子插件自动跟 scope 走
+
+```
+scopeOf(ctx)：沿 Context.parent 链向上找第一个打标签的
+  scope.ctx 上再 plugin(子插件) → 子的 ctx.parent === scope.ctx
+    → 子的 scopeOf 也命中同一个 key
+    → 子在 ScopeLayers 里的注册落进 scope 层，随 scope.dispose 回滚
+  （对应 dsh 的 kScope 属性沿 extend 继承；root 及其直挂插件 → undefined → global 层）
+```
+
+### 9.3 写入：`ScopeLayers.register(ctx, name, value)`
+
+```
+register(ctx, name, value)
+ │
+ ├─ scope = scopeOf(ctx)
+ ├─ target = scope === undefined ? global 层 : scoped.get(scope)
+ │      └─ scope 有但层还没建？ → 新建 Map 挂进 scoped
+ ├─ layer.has(name)？ ──是──→ throw "has been registered already"
+ │        ★ 冲突只在本层判定：跨层同名不报错——那就是遮蔽，功能本身
+ ├─ layer.set(name, value)
+ └─ 归属检查：
+      ├─ ctx.fiber 存在 → ctx.effect(() => () => {
+      │     layer.delete(name)
+      │     layer.size === 0 → scoped.delete(scope)     ★ 空层回收，不留壳
+      │   })
+      │   （undo 挂 effect → scope.dispose 逆序执行 → 条目随 fiber 消失）
+      └─ 无 fiber 但 scope 非 undefined（手工 new Context(scope.ctx) 这类）
+            → 先删刚插的条目再 throw        fail-loud：拒绝无法回滚的注册
+      （global + 无 fiber = root：条目随注册表生存，与真 cordis 挂 root fiber 同语义）
+```
+
+### 9.4 读取：`resolve(scope)`——global 铺底 + 远到近覆盖
+
+```
+resolve(scope?)
+ │
+ ├─ merged = new Map(global)                        ① 铺底
+ └─ scopeChainOf(scope).reverse()                   ② [key, 父, 祖父…] 反转成
+       for key of [祖父, …, 父, key]                    [祖父, 父, key] 远→近
+          layer = scoped.get(key)；有 → for of layer: merged.set(name, value)
+                                                    ③ 逐层覆盖 → nearest wins
+       scope = undefined（root 视图）→ 链为空 → 只有 global
+ get(scope, name) = resolve(scope).get(name)        每次现算快照，不缓存
+```
+
+### 9.5 完整时序走查：两个 agent 各自一套工具
+
+```
+准备：tools = new ScopeLayers<string>()
+      root.plugin(全局插件) 内 tools.register(ctx, 'shell', 'global-shell')   → global 层
+      createScope(root, agentA) ；createScope(root, agentB)
+      bindScopeParent(agentB, agentA)   （B 继承 A 的层）
+
+      scopeA.ctx 内插件：tools.register(ctx, 'shell', 'a-shell')   → agentA 层
+      scopeB.ctx 内插件：tools.register(ctx, 'edit',  'b-edit')    → agentB 层
+
+读取：
+  tools.resolve(undefined)        → { shell: 'global-shell' }                    纯 root
+  tools.resolve(agentA)           → { shell: 'a-shell' }      A 层覆盖 global
+  tools.resolve(agentB)           → { shell: 'a-shell', edit: 'b-edit' }
+       链 = [agentB, agentA] → 反转 [agentA, agentB] → 先 A 覆盖 shell，再 B 补 edit
+       ★ 同名 'shell' 在 global/A 两层共存且不报错——服务表做不到的事在分层表完成
+
+卸载：
+  scopeA.dispose() → fiber.beginDispose 逆序 → a-shell 条目删除 → agentA 层空 → 回收
+  → resolve(agentB) 回落为 { shell: 'global-shell', edit: 'b-edit' }
+    （B 的链里 agentA 层已不存在，覆盖自然穿透到 global——"删除即回落"的分层版）
+```

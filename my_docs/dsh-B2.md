@@ -135,3 +135,86 @@ Error: [mini-cordis] plugin <boom> apply failed: kaboom
 ## 10. 下章预告（B3）
 
 Fiber 只能出生不能死亡——B3 落 **effect 模型**：`ctx.effect()` 收集注册产生的 disposer、`fiber.dispose()` 逆序并发执行、子 fiber 的 dispose 挂在父 fiber 的 effect 上（级联卸载）、apply 中途抛错回滚已注册的 effect。参照 `vendor/cordis/src/fiber.ts` 的 effect/unload 段。这是"注册即可撤销"的地基，也是 HMR/per-agent 作用域的前提。
+
+## 11. 代码执行流程图
+
+> 对应提交 `5c6c847`。三条主线：挂载（plugin）→ 激活（refresh 状态机）→ 唤醒（provide 通知链）。
+
+### 11.1 挂载：`ctx.plugin(def, config)`
+
+```
+ctx.plugin(pluginDef, config)
+ │
+ ├─ ① child = new Context(this)
+ │      └─ bag₂.services = parentBag.services   ★ 引用同一张 Map，不是拷贝
+ │         （生命周期树 ≠ 服务表树：child 只是边界，表全树共享）
+ ├─ ② fiber = new Fiber(this, child, resolvePlugin(pluginDef), config)
+ │      └─ resolvePlugin 三形态归一化：
+ │           对象 {name,inject,apply} → 原样返回
+ │           箭头函数 → { name: fn.name, apply: fn }   （箭头函数无 prototype）
+ │           类 → { name: Cls.name, apply: (ctx,cfg) => void new Cls(ctx,cfg) }
+ │              （Service 子类插件：注册发生在构造器 super→provide，见 B1 10.2）
+ ├─ ③ trackPending(fiber)      先挂进全局 pendingFibers（state='pending'）
+ └─ ④ refreshPendingFibers()   立即重查一次 → 11.2
+        依赖齐 → 当场激活；未齐 → 扣在集合里，返回 fiber 供检查状态
+```
+
+### 11.2 激活：`fiber.refresh()` 状态机
+
+```
+fiber.refresh()
+ │
+ ├─ state ≠ 'pending'？ ──是──→ return          幂等：apply 恰好执行一次
+ ├─ 遍历 inject：任一 parentCtx.has(name) 为 false？
+ │        └─ 是 → 静默 return（留在 pending，等 11.3 的通知再来）
+ ├─ state = 'loading'
+ ├─ pluginDef.apply(fiber.ctx, config)          注意传的是 child ctx
+ │      ├─ 正常返回 → state = 'active'
+ │      │     （apply 里的 ctx.provide 已落共享表，全树可读）
+ │      └─ 抛错     → state = 'disposed'，原样上抛（fail-loud，不吞）
+ └─ （B3 起：apply 期间的注册被 effect 收集，出错可回滚——见 B3 11.2）
+```
+
+### 11.3 唤醒链：provide 落表 → 重查等待队列
+
+```
+任意位置：ctx.provide('llm', adapter)
+ │
+ ├─ bag.services.has('llm')？ ──是──→ throw "has been registered already"
+ │                                    （共享表全树同名同槽，冲突即抛，B1 的覆盖语义废弃）
+ ├─ bag.services.set('llm', adapter)
+ ├─ notifyProvided('llm')                        ← hooks.ts（防 import 环：
+ │      │                                          context → hooks ← registry）
+ │      └─ 遍历 provideHooks 快照 → registry 模块加载时订阅的 refreshPendingFibers
+ │             for fiber of [...pendingFibers]    （快照迭代：钩子里可再 provide）
+ │                  ├─ state ≠ 'pending' → 出队
+ │                  ├─ fiber.refresh()   → 11.2
+ │                  │    ├─ 激活 → 出队；apply 里若又 provide → 递归唤醒
+ │                  │    │                  （递归深度 = 插件激活链长）
+ │                  │    └─ 仍缺依赖 → 留在集合，下次再说
+ │                  └─ apply 抛错 → 出队 + throw "plugin <name> apply failed"
+ └─ return disposer（B3 起被 effect 接管）
+```
+
+等待是**推送**不是轮询：没有定时器，全靠"每次落表推一把"。
+
+### 11.4 完整时序走查：依赖晚到的插件
+
+```
+时刻 1：ctx.plugin({ name:'todo', inject:['llm'], apply(ctx){ ctx.provide('todo', …) } })
+  ① child = new Context(ctx)      bag₂.services === bag₁.services
+  ② resolvePlugin → 对象形态原样
+  ③ pendingFibers = { fiber }
+  ④ refresh：has('llm') = false → 静默回 pending
+  返回 fiber。此刻：ctx.todo 不存在，apply 一次都没跑
+
+时刻 2：ctx.provide('llm', adapter)
+  落共享表 → notifyProvided → refreshPendingFibers
+  → fiber.refresh：has('llm') ✓ → loading
+  → apply(child) → ctx.provide('todo', svc) → 落共享表
+                 → 又一次 notifyProvided（pending 已空，空转一圈）
+  → state = 'active' → 出队
+  → ctx.todo 立即在全树可读（共享表，不分层）
+```
+
+对照测试 `b2-fiber.test.ts` 的"依赖齐备才 apply / 晚到唤醒"两条：时刻 1 断言 `fiber.state === 'pending'` 且 todo 不可读，时刻 2 之后全部翻转。

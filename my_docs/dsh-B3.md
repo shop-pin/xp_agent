@@ -144,3 +144,107 @@ catch (error) {
 ## 9. 下章预告（B4）
 
 注册可以撤销了，但插件之间还没有"说话"的通道。B4 落**事件系统**：`cordis/events.ts` 提供 `ctx.on/emit/parallel/serial/bail/waterfall` 五种派发，`interface Events {}` 走 declaration merging 让用户声明事件表；`on` 的 disposer 走 B3 的 effect——**插件卸载自动摘监听器**，级联卸载顺带把整个插件树上的监听器一并清干净。参照 `vendor/cordis/src/events.ts` 的派发段与 waterfall 的 `next = () => cb(listeners.shift() ?? inner)` 闭包链。
+
+## 10. 代码执行流程图
+
+> 对应提交 `1f4f41c`。四条主线：effect 注册 → provide 自动收集 → dispose 结算 → 级联/回滚。
+
+### 10.1 注册：`ctx.effect(execute)` 与 provide 自动收集
+
+```
+插件 apply 内：ctx.effect(() => { 启动 setInterval; return () => clearInterval(id) })
+ │
+ ├─ ctx.effect → this.fiber？
+ │      ├─ 无（root context）→ throw "requires a plugin fiber"     fail-loud
+ │      └─ 有 → fiber.effect(execute, label)
+ │             ├─ state === 'disposed'？ ──是──→ throw "cannot create effect on disposed fiber"
+ │             ├─ disposer = execute()          ★ 立即执行，注册动作当场生效
+ │             └─ 返回值是函数？ → _effects.push({ run: disposer, label })
+ │                                  （返回 void 的 effect 只执行、无撤销）
+ │
+ 插件 apply 内：ctx.provide('todo', svc)   （B1 的 provide 多了收集一步）
+ │
+ ├─ 落共享表 + notifyProvided（同 B2 11.3）
+ └─ this.fiber 存在且 state ∈ {loading, active}？
+        └─ 是 → fiber.collect(disposer, 'provide("todo")')   ★ 不执行动作，只收集
+               （fiber 外的手动 provide 维持 B1 语义：disposer 由调用者自理）
+```
+
+### 10.2 卸载：`fiber.dispose()` 结算
+
+```
+fiber.dispose()
+ │
+ ├─ disposeTask 已存在？ ──是──→ 返回同一个 promise     幂等闸（含清理进行中的并发调用）
+ └─ 首次 → beginDispose()：
+      ① state = 'disposed'            先置状态：清理期间读状态者看到"已卸载"
+      ② untrackPending(this)          pending 中的 fiber 也立即出队（不会复活）
+      ③ effects = _effects.splice(0).reverse()   ★ 逆序：后注册的先清理
+      ④ effects.map(run) 并发启动：
+           每个 run 包成 Promise：
+             同步抛错 → onError 记 console.error，该任务照常 resolve
+             异步拒绝 → 同上 catch
+           （单个失败只记日志，不阻断其他清理）
+      ⑤ return Promise.all(tasks)     全部结算后才 resolve → disposeTask
+```
+
+### 10.3 级联：子 fiber 的 dispose 挂在父 fiber 的 effect 上
+
+```
+父 apply 内：ctx.plugin(childDef)          （plugin() 的 B3 增量）
+ │
+ ├─ child = new Context(this)
+ ├─ fiber = new Fiber(...)；child.fiber = fiber    ★ ctx.fiber 指认归属
+ └─ parentFiber = this.fiber 存在？
+      └─ 是 → parentFiber.effect(() => () => fiber.dispose(), `child <名>`)
+             （外层箭头立即执行=无动作；返回值=子 dispose，进父的 _effects）
+             root 上挂载的插件没有父 fiber → 不参与级联（root 不可卸载）
+
+父.dispose() → 10.2 流程
+  → 逆序栈（…先挂的子在后…）→ 子的 () => fiber.dispose() 被调用
+  → 子走自己的 10.2：撤销子的 provide（共享表删键）、执行子的 effect
+  → 孙随子，深度不限
+  → 父的 Promise.all 等到子 disposeTask 结算才 resolve        ★ 异步清理被等待
+```
+
+### 10.4 apply 中途抛错：先回滚、再上抛
+
+```
+fiber.refresh()
+ ├─ state = 'loading'
+ ├─ apply(ctx, config)
+ │      ├─ 第 1 个注册成功 → _effects = [d1]
+ │      ├─ 第 2 个注册成功 → _effects = [d1, d2]
+ │      └─ 第 3 个注册抛错！
+ └─ catch：
+      ├─ this.disposeTask = this.beginDispose()   ★ 复用 10.2：
+      │     置 disposed → 出队 → 逆序 [d2, d1] 并发执行
+      │     （同步 disposer 当场跑完 → 回滚顺序确定；异步的进 promise 等结算）
+      └─ throw error    挂载点拿到错误时，清理已启动
+```
+
+### 10.5 完整时序走查：级联卸载测试（b3-effect 第 5 条）
+
+```
+准备：root.plugin(父) → 父 apply 内：
+   ctx.effect(() => () => log.push('父cleanup'))        父._effects = [父cleanup]
+   ctx.plugin(子) → 子.fiber 指认 + 父._effects 追加 [父cleanup, 子dispose闭包]
+   子 apply 内：
+   ctx.provide('svc', o)          → 共享表落键 + 子._effects 收集 [del("svc")]
+   ctx.effect(() => () => log.push('子cleanup'))        子._effects = [del("svc"), 子cleanup]
+
+parentFiber.dispose()
+  父：state=disposed → 出队 → 逆序执行：
+    ① 子dispose闭包 → 子.dispose()
+         子：state=disposed → 出队 → 逆序执行：
+              a. 子cleanup → log += '子cleanup'
+              b. del("svc") → 共享表删 'svc'
+         子 disposeTask resolve
+    ② 父cleanup → log += '父cleanup'
+  父 Promise.all([子task, 父cleanup]) 结算 → resolve
+
+断言：log 顺序 ['子cleanup','父cleanup']（子先清完才轮到父的下一项）
+      root.has('svc') = false；再 provide 同名不冲突（键已删，不会复活旧值）
+```
+
+对照第 6 条测试（pending 中的子被级联卸载）：子尚在 pendingFibers 里时父卸载 → beginDispose 的 ② untrackPending 出队 → 之后任何 provide 的唤醒循环都扫不到它——**死亡不可逆，没有复活路径**。

@@ -166,3 +166,107 @@ return () => {
 ## 9. 下章预告（B2）
 
 Context 现在有了"格子"（服务表），但还没有"住户管理"：插件三形态、生命周期状态机（PENDING→LOADING→ACTIVE→DISPOSED）、`inject` 依赖声明与等待、`ctx.plugin()`。B2 写 `cordis/fiber.ts` + `cordis/registry.ts`，参照 `vendor/cordis/src/fiber.ts` 的状态机段和 `registry.ts` 的插件归一化段。
+
+## 10. 代码执行流程图
+
+> 对应提交 `d0799b7`。四条主线：初始化 → 注册 → 读取 → 卸载，全部由 `b1-context.test.ts` 驱动。
+
+### 10.1 初始化：`new Context(parent?)`
+
+```
+new Context(parent?)
+ │
+ ├─ ① bag = { services: new Map(), parent }   本层服务表 + 指向父层的指针
+ ├─ ② bags.set(raw实例, bag)                  WeakMap 挂第一个身份
+ ├─ ③ proxy = new Proxy(raw实例, handler)     包代理
+ ├─ ④ bags.set(proxy, bag)                    同一份 bag 挂第二个身份 ★
+ └─ ⑤ return proxy                            构造器返回 proxy，
+                                              使用者手里永远只有 proxy
+```
+
+④ 是全部 this 陷阱的解法：之后无论方法以 raw 还是以 proxy 身份当 `this`，`bags.get(this)` 都命中同一份 bag。父链查找也依赖它——bag.parent 存的是父层的 **proxy**，lookup 走到父层时靠 proxy 身份的 key 取回父 bag。
+
+### 10.2 注册：`new GreeterService(ctx)`（Service 基类两步走）
+
+```
+new GreeterService(ctx)
+ │
+ ├─ super(ctx, 'greeter')                进入 Service 构造器
+ │    ├─ this.ctx = ctx                  留给子类以后跨服务访问（this.ctx.tools…）
+ │    └─ ctx.provide('greeter', this)
+ │         ├─ 读 ctx.provide → 触发 get 陷阱
+ │         │    └─ 'provide' 是自有方法 → 10.3 的分支③ 直接返回，不做服务查找
+ │         ├─ bag = bags.get(this)       raw/proxy 双身份，哪个进来都命中
+ │         ├─ bag.services.set('greeter', 实例)   ★ 实例自己就是服务值
+ │         └─ return disposer            闭包捕获 { bag, name, 实例, disposed }
+ └─ 子类构造继续（greeting 等自己的字段）
+```
+
+类型面此刻并行发生：测试文件里的 `declare module '../cordis/context.js'` 把 `greeter: GreeterService` merge 进 `Context` 接口——这步在 **tsc 编译期**完成，运行时 Map 里只有字符串名和实例。
+
+### 10.3 读取：`ctx.greeter`（get 陷阱决策树）
+
+```
+读属性 'greeter' → contextProxyHandler.get(target=raw, prop='greeter')
+ │
+ ├─ ① typeof prop ≠ 'string'？（symbol：node:test / util.inspect 内部读）
+ │        └─ 是 → Reflect.get(target, prop, target)，结束
+ ├─ ② prop === 'then'？
+ │        └─ 是 → return undefined（thenable 安全，await ctx 不炸）
+ ├─ ③ Reflect.has(target, prop)？（自有字段 + 原型方法）
+ │        └─ 是 → 返回方法本身（get/provide/require/has…）
+ │              ★ 因此服务名不许撞这些名字（测试：provide('get') 被遮蔽）
+ │              receiver 显式传 target（raw），getter 型属性内的 this 才是挂过 key 的身份
+ ├─ ④ lookup(target, 'greeter') 沿父链找：
+ │        current = 当前 ctx
+ │        ┌─────────────── while 循环 ───────────────┐
+ │        │ bag = bags.get(current)                  │
+ │        │ bag.services.has(name)? ──是──→ 返回实例  │
+ │        │ current = bag.parent（proxy 身份）        │
+ │        └────── parent 为 undefined 则出循环 ──────┘
+ │        都没有 → MISSING
+ ├─ ⑤ found === MISSING？
+ │        └─ 是 → throw `service "greeter" is not provided`（严格读取）
+ └─ ⑥ 返回服务实例 → ctx.greeter.greet('x') 的 this 就是它，方法正常工作
+```
+
+`ctx.get` / `ctx.require` / `ctx.has` 走同一个陷阱的分支③拿到方法，然后**方法内部直接调 `lookup`**——不再触发陷阱，返回值由方法自己决定是 `undefined` 还是抛错。所以"严格/可空"两种语义只在方法内分流，陷阱永远严格。
+
+### 10.4 卸载：`disposer()`
+
+```
+dispose()                          （provide 的返回值，闭包持有 bag/name/实例/disposed）
+ │
+ ├─ disposed === true？ ──是──→ return            幂等：二次调用安全
+ ├─ disposed = true
+ └─ bag.services.get(name) === 当初的实例？
+      ├─ 是 → bag.services.delete(name)           只删仍然是自己的注册
+      └─ 否（已被后来者覆盖）→ 不动                 不误删新提供者
+```
+
+没有"恢复旧值"分支——子层删掉后，10.3 分支④ 的 lookup 下次自然穿透到父层同名服务。**删除即回落。**
+
+### 10.5 完整时序走查：`子上下文继承父服务` 这条测试
+
+```
+parent = new Context()
+  └─ bag₁{ services:{}, parent:undefined }，返回 proxy₁
+
+counter = new CounterService(parent)
+  └─ super → provide → bag₁.services = { counter: counter实例 }
+
+child = new Context(parent)
+  └─ bag₂{ services:{}, parent:proxy₁ }，返回 proxy₂
+
+child.counter          ← 触发 proxy₂ 的 get 陷阱
+  ├─ 分支③：'counter' 不是 Context 自有方法 → 放行
+  ├─ 分支④ lookup：bag₂ 没有 'counter'
+  │     → current = bag₂.parent = proxy₁
+  │     → bags.get(proxy₁) = bag₁（★ 双身份 key 在这里被用上）
+  │     → bag₁.services.has('counter') ✓ → 返回 counter实例
+  └─ child.counter.next() → 1（this = counter实例，状态挂在实例上）
+
+parent.counter.next()  → 2   同一实例：继承是"共享"，不是拷贝
+```
+
+遮蔽测试的差异只在一步：child 层 `provide` 后 `bag₂.services` 也有 'counter'，lookup 在第一圈就命中，**根本走不到父层**——这就是"本层覆盖、父层不受影响"的全部机制。

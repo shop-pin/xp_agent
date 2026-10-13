@@ -72,3 +72,119 @@ buildRows({ host, profile, extraRows }) = mergeRows([
 1. 同 id 后写胜是**整行替换**不是字段合并（B6 定死的语义，防"半新半旧行"这种说不清的状态）：只写 config 的行会把 name 顶成 undefined，resolve 以 `no plugin named "undefined"` fail-loud——炸在挂载点，不静默丢能力。
 2. profile 赢过 app：app 层用同 id 行给 base 的 config-less 行补桥/选项，若 profile 排在 app 之前，no-auto 的 disabled 行会被 app 的 config 行整行替换回去——"注释掉"被装配层无意复活。extraRows 最后落笔，用户 patch 赢过一切。
 3. 不会——老装配下 `next()` 后面恒有内层 auto 监听器接手，弃权即转交。洞的暴露条件是"auto 模式 + 无内层监听器"这个新组合，而能造出这个组合的第一个机制就是 no-auto profile。所以不是洞潜伏了 4 章，是**让洞可达的配置今天才存在**——验收双 profile 时用真实裁决路径断言，抓的正是这类"清单对了、协作断了"。
+
+## 8. 代码执行流程图
+
+> 对应提交 `0536314`。四条主线：四层行表与 mergeRows（整行替换）→ 服务行化（行序 = 依赖就绪序）→ AppHost/appRows（接线知识归 config）→ 协作对补位与 profileProbe 验收。
+
+### 8.1 四层行表：同 id 后写胜，整行替换
+
+```
+buildRows({ host?, profile?, extraRows? }):
+  mergeRows([ baseRows, host? appRows(host) : [], profiles[name], extraRows ?? [] ])
+    未知 profile → throw（fail-loud，known: full, no-auto）
+
+mergeRows(layers)：
+  byId: Map<id, Row>，逐层逐行 byId.set(row.id, row)
+  return [...byId.values()]           ★ 同 id 后写胜 = 整行替换，无字段合并
+    想改 config 必须连 name 一起写全——只写 config 会把 name 顶成 undefined，
+    resolve 以 `no plugin named "undefined"` 炸在挂载点（防"半新半旧行"）
+
+四层语义：
+  baseRows     全能力（22 行，行序 = 激活序；三组生命线钉在注释里）
+  appRows      CLI 装配——桥/选项以同 id 行的 config 覆盖补上
+  profiles     'full' = 空（原样）；'no-auto' = { id:"auto-approval", disabled:true }
+  extraRows    --patch / 测试——最后落笔，赢过一切
+```
+
+### 8.2 服务行化：行序 = 服务可用序 = 依赖就绪序
+
+```
+plugins/services.ts（新增）——7 个 Service 各包成零依赖插件行：
+  service-tools / session-log / ui / commands / llm / system-prompt / agents
+    apply(ctx) { new XxxService(ctx, "xxx") }      Service 基类构造即同步 provide
+  例外 svc-ui：inject ["session-log"]（消费日志面）
+    → 就算被 patch 挪到 session-log 之前也能等就绪再激活（B2 provide 通知红利）
+
+baseRows 三组生命线（分层/patch 都不许打乱）：
+  ① 服务行在前        —— 后续能力行的依赖就绪序
+  ② core-fs → core-exec → core-meta —— 工具广告序（请求体 tools 数组顺序）
+  ③ approval → auto-approval —— 审批瀑布从外到内（外层硬底线先注册）
+  ★ E1 之前"装什么"散在 Agent 构造函数 22 个语句里——本章它们变成可
+    dump/patch/分层的行数据，Agent 构造函数收缩为"宿主能力提供者"
+```
+
+### 8.3 AppHost/appRows：接线归 config，能力归 agent
+
+```
+AppHost（config 侧声明，Agent 实现）：
+  parentMode()        ★ 活取 () => this.mode——plan 切换后子 agent 要看到新模式
+  isSubAgent / customSystemPrompt
+  commands / inject / wake / getBudget / getMaxTurns / addTokens
+
+appRows(host)——同 id 整行覆盖：
+  prompt-sections ← { staticPrompt: custom || 默认, dynamicEnabled: !custom }
+  skills          ← { catalogInjection: !isSubAgent }        （D1 的开关入清单）
+  commands        ← host.commands（CommandsBridge 整个当 config）
+  mcp             ← { enabled: !isSubAgent }                 （D2）
+  subagent        ← { bridge: { parentMode, addTokens }, enabled: !isSubAgent }  （D3）
+  memory          ← { bridge: { inject }, enabled: !isSubAgent }                 （D4）
+  autonomy        ← { getBudget, getMaxTurns, wake }         （D6 的桥瘦身后形态）
+
+装配管线：
+  Agent 构造 → buildRows({ host: this, profile, extraRows })
+    → loadRows（loader：逐行 resolvePlugin(name) → ctx.plugin(plugin, config)，
+      disabled 行跳过挂载；内部再同 id 去重一次）
+  双视图出口：--dump-config → formatRows（纯数据，函数折叠 <fn>）
+             agent.dumpTree() → loader 运行态树（"活了没有"）
+```
+
+### 8.4 协作对补位：disabled 不是删代码，是换产品
+
+```
+翻出的洞（no-auto 首次可达）：
+  approval 外层旧逻辑：if (call.mode === "auto") return next()   对内层盲弃权
+  no-auto 把 auto-approval 行注释掉 → next() 直通兜底放行 → 非 deny 动作裸奔
+
+修法（瀑布分工不变：外层硬底线、内层策略）：
+  auto-approval 插件挂监听器前：
+    ctx.provide("auto-adjudicator", { ownedBy: "auto-approval" })   在场标记
+  approval 外层：
+    if (call.mode === "auto" && ctx.get("auto-adjudicator")) return next()
+    没人接手 → 不弃权，走 default 九段流水线（⑧ confirm 候选：有人就问，
+    headless 由 fallback 拒）
+  代价核对：auto-adjudicator 恒在的老装配下逐字节不变；新分支只在
+    "auto 模式且无内层监听器"组合生效
+```
+
+### 8.5 完整时序走查：场景 33（full vs no-auto 双 agent）
+
+```
+setup：greeting.txt；注入 confirmFn 自动否（脚本收尾 confirm 路径）
+
+agent①——full（默认清单）：
+  buildRows({ host, profile:"full" }) → merge 四层（profile 空补丁 = base 原样）
+    → loadRows → auto-approval 行挂载 → provide("auto-adjudicator")
+  dumpTree 采样：✓ 树含 auto-approval 行
+  auto 模式写 full.txt → pre-execute 瀑布：
+    approval 外层：mode==="auto" 且 auto-adjudicator 在场 → 弃权 next()
+    auto-approval 内层：fast-path 不含 write_file → classify
+      stage1 旁调（auto track）：<block>no</block> → 放行
+    ✓ 分类器恰 1 次调用；文件落盘
+  对照：两个 agent 的裁决路径差异 = 一行清单的差别
+
+agent②——no-auto（profile 补丁）：
+  buildRows({ host, profile:"no-auto" }) → merge：
+    base 的 auto-approval 行被 profile 层的 disabled 行整行替换
+    → loadRows 跳过挂载 → 内层监听器不存在，"auto-adjudicator" 无 provider
+  dumpConfig 采样：✓ 行表保留占位且标 (disabled)；dumpTree：✓ 树不含该行
+  同一个动作（auto 模式写 bare.txt）→ 瀑布：
+    approval 外层：mode==="auto" 但 get("auto-adjudicator") 落空
+      → 不弃权，走 default 九段 → ⑧ confirm 候选 → 交互 provider（注入的
+        自动否回调）→ "User denied this action."
+    ✓ 分类器零调用（能力移除，不是绕过——绕过会留分类器在链上被白嫖）
+    ✓ 文件不落盘
+  断言面：装配视图（行表 disabled 占位）+ 运行态视图（树无此行）+
+    行为视图（裁决路径真走了一遍）三面钉死——"清单对了、协作断了"这类洞
+    只有行为断言能抓
+```

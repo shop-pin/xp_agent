@@ -119,3 +119,5 @@ A0 无代码。验证=文档中所有论断均直接核对过实物：
 - `docs/architecture.md` Turn flow 节已读（事件草图与之一致）
 
 **未做**：未在本机跑 `pnpm run test:snapshot`（全量 monorepo build 代价大，快照实物已直接检视；想亲眼看回放可择日在 dsh 仓库跑 `pnpm install && pnpm run build && pnpm run test:snapshot -- -t cancel`）。
+
+**流程图豁免**：本章不写代码，无「代码执行流程图」节——§4 的 Turn flow 事件草图即本章的流程图（画的不是 mini 代码，是 dsh 的目标形态）。

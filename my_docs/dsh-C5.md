@@ -225,3 +225,167 @@ goal + loop 合并为单一 `autonomyPlugin`（本文件第三段起 plugins/aut
 | `contextCleared` 布尔、mode 状态机分支消亡 | 布尔已删；mode 的循环内分支清零（plan 只读契约在 C2、退出在 conclusion） |
 
 **C5 留给后章的债**：goal/loop 评估器与分类器的 SDK 直调（C6 收进 llm 服务）；schedule_wakeup 字段协议与裸 setTimeout（D6 换 ctx.schedule）；turn 注记的 per-request 粒度 vs dsh 的 turn/step 分层（D5/C8 重放时再对齐）。
+
+## 10. 代码执行流程图
+
+> 对应三段提交：`1690fee`（①事件埋点 + TurnConclusion）、`c1cf7af`（②goal 迁移）、`ed4a98c`（③loop 迁移 + 失败补全 + autonomy 收口）。三条主线：循环上开三个口（pre-step / turn-stopping / turn-end）→ 工具自结 turn → goal/loop 的"while 化进事件"。
+
+### 10.1 三个扩展点的埋点位置
+
+```
+runOneTurn(batch)                          pre-step · turn 首步形态
+  waterfall('agent/pre-step', {input: batch}, () => ({input: batch}))
+    ├─ decision.reject ≠ undefined → endTurn('blocked') → return
+    │     ★ 输入已 claim：不回队列、不进消息——消失在边界上，零模型调用
+    └─ for text of (decision.input ?? batch): pushUser(text)   改写文本进消息
+
+runStepLoop 非 firstStep（step 边界）       pre-step · step 边界形态
+  steers = inbox.claimStep()
+  有货 → waterfall('agent/pre-step', {input: steers}, () => ({input: steers}))
+    ├─ reject → 丢插话、step 照常（mini 简化，偏差记档 §2）
+    └─ 否则 → pushUser(改写后插话)——C3 合并器并进 tool_result 批次
+
+末响应无 tool_use（收敛点）                 turn-stopping
+  stopReason = 'end-turn'
+  serial('agent/turn-stopping', {steer: t => this.steer(t),
+                                  block: () => stopReason = 'blocked'})
+    ├─ 监听器 steer(text) → 排 next-step → 排空循环开新 turn 消费
+    └─ 监听器 block() → 收敛注记变 blocked（mini 扩展，goal impossible 专用）
+  endTurn(stopReason)
+
+endTurn(reason)  统一收敛出口：
+  sessionLog.append(turn/end, reason)      持久注记（C3 日志）
+  + cordis.emit('agent/turn-end', {reason})  进程内事件（插件消费）
+  ★ tool-use 是 step 级标记——只进注记，不走 endTurn（不发事件）
+```
+
+### 10.2 TurnConclusion：工具自结 turn（contextCleared 之死）
+
+```
+签发（executePlanModeTool 的 clear-and-execute 分支）：
+  clearHistoryKeepSystem()                  工作集+日志双清
+  return { concludeTurn: true, dropBatch: true,
+           nextTurnInput: 'User approved the plan. ...' }
+      ★ 返回类型 string | TurnConclusion——循环不认识任何工具的私有布尔
+
+上浮（tools.executeCall）：
+  exec.dispatch(...) → isTurnConclusion(dispatched)？
+    └─ 是 → return { kind:'result', output: nextTurnInput ?? '', conclusion }
+          结论文本不进 truncateResult（它就是注入文本，不是工具输出）
+
+收束（runStepLoop 工具批次循环）：
+  outcome.conclusion 非空 → conclusion = c → break（本批后续工具不再执行）
+  批次循环后：
+    !dropBatch && toolResult.length > 0 → pushUser(toolResult)   保留合法结果
+    nextTurnInput ≠ undefined → inbox.append('next-turn', 注入文本)
+    endTurn('concluded') → break
+  → runDriver 排空循环顶：hasPending → claimTurn=[注入文本] → runOneTurn 开新 turn
+      reminder 待遇由 runOneTurn 统一给（判定条件同旧 contextCleared 改道）
+
+等价论证：旧路径 = 同一 while 的下一轮迭代；新路径 = 新 turn——消息流同构同内容，
+差异只有注记多一条 turn/end(concluded) + 一条 cordis 事件（都不进请求体）。
+contextCleared / contextBreak 两个循环内分支消亡。
+```
+
+### 10.3 goal 迁移：所有权三分（②）
+
+```
+构造：ctx.plugin(autonomyPlugin, bridge)
+  bridge = { evaluate: evaluateGoal（SDK 直调，C6 收窄）, getBudget, getMaxTurns, wake }
+
+状态（GoalService → ctx.goal）：
+  active { condition, iterations, startedAt, lastReason } + stopped 标志
+
+决策（turn-stopping 监听器，每个 turn 收敛点）：
+  g = goal.active；!g || goal.stopped → return（沉默，不干预）
+  verdict = await bridge.evaluate(g.condition)     评估器错误按未达处理（fail-closed）
+    ├─ ok        → printInfo('✓ Goal achieved ...') → goal.clear() → 沉默
+    ├─ impossible → printInfo(...) → goal.clear() → state.block()
+    │              turn/end 注记 = blocked（场景 29 锚）
+    └─ 未达       → iterations++ / lastReason = reason
+          预算超限 / iterations ≥ GOAL_MAX_ITERATIONS → printInfo + clear + 沉默
+          否则 → state.steer('Hooks: ...not met: <reason>\n\nKeep working toward the goal.')
+                文本排 next-step → 排空循环 claimTurn 开新 turn → 新收敛点再评估
+                ★ while 循环没消失——化进 C4 drain 循环 + 本监听器的组合
+
+生命周期（pursueGoal）：
+  goal.active？→ try { await chat(directive)      首 turn（设定即开启）
+                       if (goal.stopped) printInfo('Goal pursuit interrupted.')
+                   } finally { goal.clear() }
+      ★ abort 绕过 turn-stopping——发起方 finally 是唯一覆盖所有出口的清法
+```
+
+### 10.4 loop 迁移 + 失败补全（③）
+
+```
+runLoop(rawInput)
+  parseLoopInput → 非法直接返回
+  done = loop.start(spec)                   ctx.loop 的 await 锚（done = resolve）
+  dynamic → setScheduleWakeupToolVisible(true)   广告 schedule_wakeup（幂等）
+  try
+    await chat(dynamic ? dynamicLoopDirective(prompt) : prompt)    tick 1
+    await done                             后续 tick 由监听器定时 wake 注入
+  finally
+    dynamic → setScheduleWakeupToolVisible(false)
+    loop.finish()                          任何出口清状态（abort 绕过监听器）
+  ★ runLoopInterval / runLoopDynamic / interruptibleSleep（200ms 轮询）消亡
+
+决策（turn-end 监听器，每个 tick 收敛点 endTurn 之后）：
+  !loop.state → return
+  stopFlag → 'Loop stopped.' → finish()        turn 期中断；定时器期 stop() 自己收
+  dynamic && !takeWakeup() → 'converged' → finish()   模型没排唤醒
+  budget 超限 / iterations ≥ maxTurns / ≥ LOOP_MAX_ITERATIONS → finish()
+  否则 → dynamic：prompt = wakeup.prompt || prompt；scheduleTick(delay×1000)
+         interval：scheduleTick(interval×1000)
+
+scheduleTick：setTimeout fire（state 还在且未 stop）：
+  iterations++；directive = dynamic ? dynamicLoopDirective(prompt) : prompt
+  void bridge.wake(directive).catch(e → 非 abort 打印；loop.finish())
+      ★ wake 返回 settle promise——tick 驱动失败在插件侧闭环，done 不悬挂
+  wake 桥（Agent 侧）：inbox.append('next-turn', text) + ensureDriver()
+
+schedule_wakeup 执行守卫（executeToolCall 内）：
+  !loop.wakeupEnabled（dynamic 未活跃）→ 'only available during /loop dynamic mode.'
+  否则 clampWakeupDelay → loop.recordWakeup({delaySeconds, reason, prompt})
+
+失败补全（runStepLoop 批次外层护栏，dsh ToolCallRecovery 简化版）：
+  批后代码抛非工具错误 → catch：
+    为每个无果 tool_use 补 'Tool call not executed: step failed (...)' isError
+    → pushUser(toolResult) → 原样上抛——错误照报，历史不留孤儿（否则全 400）
+```
+
+### 10.5 完整时序走查：场景 28 循环事件探针（三阶段全串行）
+
+```
+探针挂三个 toy 监听器（phase 状态机 rewrite → reject → steer）：
+  pre-step：rewrite → next() 取 inner 再返回 {input: 加 'REWRITTEN: ' 前缀}
+            reject  → {reject: 'not allowed in this phase'}
+            steer   → next() 透传
+  turn-stopping：phase=steer 且首次 → state.steer('KEEP-GOING: do phase two now.')
+  turn-end：reason 收进 turnEnds[]
+
+Phase 1 改写：chat('hello there') → claimTurn → runOneTurn
+  pre-step（首步）：next() 取回 {input:['hello there']}
+    → 返回 {input:['REWRITTEN: hello there']} → pushUser(改写后)
+  req1：firstUserText 含 'REWRITTEN: hello there' ✓
+  模型回 'ok one'（无 tool_use）→ turn-stopping（phase=rewrite，沉默）
+  → endTurn('end-turn')[#1] → 排空 → idle
+
+Phase 2 拒绝：phase=reject；chat('should never run')
+  → claimTurn=[文本] → runOneTurn → pre-step 返回 {reject:...}
+  → endTurn('blocked')[#2] → return——请求数不增 ✓ / 驱动回 idle ✓
+  ★ 文本已 claim：不回队列不进消息——zero 模型调用，'should never run' 真没跑
+
+Phase 3 挽留：phase=steer；chat('first turn')
+  → pre-step：next() 透传 → pushUser(M1) → req2 → 模型回 'ok two'
+  → 无 tool_use → serial turn-stopping：首次 steer ✓ 'KEEP-GOING...' 排 next-step
+  → endTurn('end-turn')[#3] → runStepLoop break
+  → runDriver 排空循环顶：hasPending → claimTurn=['KEEP-GOING...']
+      → 同一 settle 内开新 turn → pushUser(M3) → req3
+      → lastUserText 含 'KEEP-GOING' ✓ → 模型回 'ok three'
+      → turn-stopping（steered=true，沉默）→ endTurn('end-turn')[#4]
+  → 排空 → idle → chat resolve → whenIdle resolve
+  采样：turn-end-reasons = 'end-turn,blocked,end-turn,end-turn' ✓
+      注记层两个 end-turn（挽留续的是新 turn）——与 dsh 同 turn 续 step 的
+      粒度不同，消息流同形（偏差记档 §2）
+```

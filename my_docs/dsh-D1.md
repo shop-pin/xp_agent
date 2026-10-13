@@ -73,3 +73,131 @@ const input = [...(inner.input ?? payload.input)];  // 在 inner 改写的基础
 ## 6. 下章预告（D2 MCP 插件化）
 
 `plugins/mcp-bridge.ts`：McpManager 迁入插件；`mcp__<server>__<tool>` 命名抽成纯函数（64 字符规范化 + 碰撞加 SHA 后缀，照 `mcp-client/src/tools.ts`）；syncTools 两代切换（先建新代再撤旧代）；execute 走 callTool。验收：mcp 场景绿 + 名字规范化单测（超长/非法字符/碰撞）。
+
+## 7. 代码执行流程图
+
+> 对应提交 `fb05f72`。四条主线：provider registry（rank 竞争）→ 插件挂载与目录发现 → pre-step catalog 注入（waterfall 礼仪）→ skill 双入口分流（fork / inline / slash 同源）。
+
+### 7.1 provider registry：rank 竞争的解析视图
+
+```
+SkillRegistry extends Service：
+  providers: SkillProvider[]              source 唯一——重复注册直接 throw
+  registerProvider(p) → () => void        返回退订函数（active 旗标防二次退订）
+  list():
+    byName = new Map
+    for p of providers.sort(rank 升序):   ★ user=10 先写、project=20 后写
+      for s of p.list(): byName.set(s.name, s)   同名高 rank 后写胜
+    return [...byName.values()]           ——每次现算，没有"已合并的缓存"可被污染
+  getByName(name) → list().find(...)       单点查询与注入目录同一份视图
+
+skills.ts 收缩后的纯函数层（被 registry 与 agent 两头调用）：
+  parseSkillFile   SKILL.md → SkillDefinition（frontmatter 解析）
+  resolveSkillPrompt(skill, args)  正文 $ARGUMENTS 展开
+  buildSkillDescriptions(skills)   参数化了！目录文本从"自扫目录"改"吃入参"
+```
+
+### 7.2 插件挂载：两个 provider + 子 agent 分岔
+
+```
+Agent 构造：
+  this.cordis.plugin(skillsPlugin, { catalogInjection: !this.isSubAgent })
+                                          ★ 子 agent 关目录注入——system/白名单已定界
+  get skills() → cordis.require("skills")  CLI 侧句柄（/skills 与 /<name> 都走它）
+
+skillsPlugin.apply(ctx, config)：
+  reg = new SkillRegistry(ctx, "skills")
+  registerProvider({ source:"user",    rank:10, list: () → scanSkillDir(~/.claude/skills) })
+  registerProvider({ source:"project", rank:20, list: () → scanSkillDir(cwd/.claude/skills) })
+  config.catalogInjection === false？ → return     ★ 子 agent 到此为止：只有 registry，无注入
+
+scanSkillDir（自 skills.ts 原样迁入）：
+  existsSync？否 → []    readdirSync 失败 → []    statSync 抛（坏符号链接）→ 跳过该 entry
+  只处理目录（散文件跳过）→ 有 SKILL.md？→ parseSkillFile → 收集
+  ★ 每次调用现扫——旧模块级缓存消亡，换 registry 视图永远新鲜
+```
+
+### 7.3 pre-step 注入：catalog 挂首条 user 消息
+
+```
+services/agents.ts：pre-step payload 增 historyEmpty = (this.messages.length === 0)
+  ——首批输入的锚点；steer 路径硬编码 historyEmpty: false（中途不重注）
+
+ctx.on("agent/pre-step", (payload, next) → {
+  const inner = next()                     ① 先放行，取链上最终裁决
+  if (!payload.historyEmpty
+      || inner.reject !== undefined) return inner
+                                           ② 非首批 / 上游否决 → 原样尊重（礼仪！）
+  const catalog = buildSkillDescriptions(reg.list())
+  if (!catalog) return inner               ③ 无 skills → 输入原样
+  input = [...(inner.input ?? payload.input)]
+                                           ④ 吃 inner 的改写形态——只读 payload
+                                             会静默回滚上游中间件
+  input[末项] += "\n\n<system-reminder>\n" + catalog + "\n</system-reminder>"
+  return { input }                         ⑤ 只改输入；不调 reject（注入无否决权）
+})
+
+对照翻车现场（第一版）：next() 调了但丢返回值、无条件返回自己的 passthrough
+  → 场景 28 的 reject 探针被翻案。修法只加两处：读 inner、以 inner 为基线。
+prompt-sections.ts：skills 节删除——system 不再含 "# Available Skills"
+```
+
+### 7.4 skill 双入口分流：一个 registry，两条路
+
+```
+入口 A —— 模型调 skill 工具（agent.ts executeSkillTool）：
+  skill = cordis.require("skills").getByName(input.skill_name)
+  null → return `Unknown skill: <name>`
+  prompt = resolveSkillPrompt(skill, input.args)
+  skill.context === "fork"？
+    ├─ 是 → 白名单过滤父工具集（allowedTools；agent/schedule_wakeup 强制摘除）
+    │       new Agent({ customSystemPrompt: prompt, customTools, isSubAgent: true })
+    │       subAgent.runOnce(args) → 结果作为 tool_result 回主对话
+    └─ 否（inline）→ return `[Skill "<name>" activated]\n\n<prompt>`
+            tool_result 进主对话 → 模型看到后照做
+
+入口 B —— 用户 slash 直调（cli.ts）：
+  /skills        → agent.skills.list()            列目录
+  /<name> args   → agent.skills.getByName(name)
+                   → resolveSkillPrompt → agent（与工具同源 registry，无第二份解析）
+
+  ★ 旧 discoverSkills/getSkillByName/executeSkill/缓存 全部消亡——
+    工具、slash、注入目录三处消费同一 registry 的同一 list()
+```
+
+### 7.5 完整时序走查：场景 9（inline 激活 + Unknown skill）
+
+```
+setup：.claude/skills/commit/SKILL.md（description: Create a conventional commit
+message；正文 Write a conventional commit message for: $ARGUMENTS）
+prompt："Invoke the commit skill with args: fix the login bug. Then invoke the
+nosuch skill."
+
+req0 前置：Agent 构造 → skillsPlugin 挂载（main agent，catalogInjection=true）
+  首步 runOneTurn → pre-step waterfall，historyEmpty = (messages.length===0) = true
+  skills 监听器：inner = next() 无 reject → catalog = "# Available Skills\n\n
+  - **/commit**: Create a conventional commit message" → 首条 user 消息末尾追加
+  <system-reminder> 包裹的目录
+
+req1（模型第 1 调）：
+  ✓ 正面锚：firstUserText 含 "# Available Skills"、"- **/commit**: ..."、
+    "<system-reminder>"
+  ✓ 反面锚：system 不含 "# Available Skills"（skills 节已消亡）
+  → tool_use skill{ skill_name:"commit", args:"fix the login bug" }
+  executeSkillTool：getByName("commit") 命中（project provider rank=20 现扫所得）
+  → resolveSkillPrompt 展开 $ARGUMENTS → context=inline
+  → tool_result `[Skill "commit" activated]\n\nWrite a conventional commit
+    message for: fix the login bug`（无 $ARGUMENTS 残留）
+
+req2（模型第 2 调）：
+  toolResults 含上述激活模板 ✓ / $ARGUMENTS 已替换 ✓
+  → tool_use skill{ skill_name:"nosuch" } → getByName → null
+  → tool_result `Unknown skill: nosuch`
+
+req3（模型第 3 调）：
+  toolResults 含 "Unknown skill: nosuch" ✓ → 文本 "Done." → end-turn
+  ✓ 三次 model call 收敛（reqs.length === 3）
+
+（fork 分支不走本场景——场景 23b：fork 子 agent 用解析后模板当 system、白名单
+工具集，且因 isSubAgent=true 挂载时无 pre-step 注入监听器）
+```

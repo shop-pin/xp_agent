@@ -123,3 +123,98 @@ B2 曾预告"事件按 fiber 域过滤（B4）"——真 cordis 确实有这层�
 ## 8. 下章预告（B5）
 
 Context 树有了生命周期域和事件域，还差最后一块拼图：**同一个服务怎么在一个树里存在多个实例**（两组各配一个 shell、一个 session 一套工具）。B5 只讲原理不动手——isolate 的分槽 key（`root[isolate][name] ??= Symbol(name)`）、realm 的"分域再分组"、以及 dsh 的 preset 怎么组合它们；配套手写一个几十行的 createScope 体验"作用域即子上下文 + 注册入口"。
+
+## 9. 代码执行流程图
+
+> 对应提交 `7fc4f22`。两条主线：on 注册（生命周期归属）→ 五种派发（怎么调）。
+
+### 9.1 注册：`ctx.on(name, listener)`
+
+```
+ctx.on('demo/text', listener)
+ │
+ ├─ eventHooks('demo/text')
+ │      ├─ bags.get(this) → bag（解构调用守卫：没 bag 就抛）
+ │      └─ bag.events.get(name) ?? 新建并 set      ★ 事件域挂 ServiceBag、随树共享
+ │                                                    （同 services 的传递方式）
+ └─ onEvent(hooks, this.fiber, name, listener)
+        ├─ 造 hook = { callback: listener }         摘除靠 identity，不包一层
+        ├─ disposer = () => unregister(hooks, hook) 按 indexOf 找，返回是否删到
+        ├─ fiber 存在（插件内）？
+        │     └─ 是 → fiber.effect(() => { hooks.push(hook); return () => void disposer() },
+        │                        'ctx.on("demo/text")')
+        │           ★ 登记动作走 effect 通道 → 进 _effects → 卸载自动摘除
+        │             （effect 纪律：通道只收 void 语义的 disposer，boolean 留给直接调用者）
+        └─ root（无 fiber）→ 直接 hooks.push(hook)，disposer 由调用者手动管
+```
+
+### 9.2 派发：五种"怎么调"同一份列表
+
+```
+ctx.emit(name, ...args)            同步广播
+ ├─ hooks = eventHooks(name)
+ └─ for { callback } of [...hooks]   ★ 快照迭代：派发中增删同事件监听不影响本轮
+      callback(...args)              不等返回值；同步抛错照常上抛（fail-loud）
+
+ctx.parallel(name, ...args)        全并发
+ └─ Promise.allSettled(全部 callback)
+      └─ 有 rejected？ → throw AggregateError(全部 reason)   收齐才抛，不吞错
+
+ctx.serial(name, ...args)          顺序 + bail
+ └─ for of 快照：
+      result = await callback(...args)
+      isBailed(result)？ → return result            全走完 → undefined
+
+ctx.bail(name, ...args)            serial 的同步版
+ └─ 同上但不 await（listener 返回 promise 会被当"非 bail 值"放过）
+
+isBailed(v)：v !== null && v !== false && v !== undefined
+      ★ 不是 truthy 判定：0/''/NaN 不算 bail
+```
+
+### 9.3 waterfall：next 闭包链
+
+```
+ctx.waterfall('message', body, inner)      调用方把兜底行为 inner 放最后一个参数
+ │
+ ├─ cbs = [...hooks].map(取 callback)      监听器队列副本
+ ├─ args.pop() → inner                     从参数尾部摘出兜底
+ ├─ args.push(next)                        原位补一个 next 进去
+ └─ return next()                          ★ 链的入口
+      next = () => (cbs.shift() ?? inner)(...args)
+        │
+        ├─ 第 1 个 listener(body, next)
+        │     ├─ 调 next() → 第 2 个 listener(body, next) → … → 队列耗尽 → inner(body)
+        │     │   每层可以改写交给下一层的返回值（around 语义）
+        │     └─ 不调 next() → 直接 return 自己的值    ★ 否决：后继与 inner 都不执行
+        └─ 链的返回值 = 最先"停下来"的那层的返回值
+```
+
+### 9.4 卸载：监听器随 fiber 消失
+
+```
+fiber.dispose()（B3 10.2 的流程跑到 on 那条 effect）
+  → 逆序执行到 { label: 'ctx.on("demo/text")', run: () => void disposer() }
+  → disposer() → unregister(hooks, hook)
+       indexOf(hook) ≥ 0？ → splice 摘除，返回 true
+  → 此后任何派发（含正在进行的下一轮）都看不到它
+```
+
+### 9.5 完整时序走查：waterfall 否决
+
+```
+准备：ctx.on('message', l1); ctx.on('message', l2)     （root 上手动注册）
+派发：ctx.waterfall('message', 'hi', () => 'inner-default')
+
+  cbs = [l1, l2]，args 从 ['hi', inner] 变 ['hi', next]
+  next()#1 → shift → l1('hi', next)
+    l1 返回 'blocked'，没调 next
+  → 整个 waterfall 返回 'blocked'
+  → l2 与 inner 都没执行（对照测试断言 innerCalls === 0）
+
+若 l1 里调 next()：next()#2 → shift → l2('hi', next)
+  若 l2 也调：next()#3 → cbs 空 → inner('hi') → 'inner-default'
+  返回值逐层原路往回，l1/l2 可在中途改写
+```
+
+生命周期版本（插件内 on）：把"手动 disposer"换成 fiber 卸载——级联卸载时子树的监听器逐层摘除，见 B3 10.5 走查。

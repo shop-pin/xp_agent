@@ -93,3 +93,105 @@ JSONL 方案三个天花板全拆：每事件即落盘（崩溃最多丢半行�
 ## 8. 下章预告（D1 skills 插件化）
 
 provider registry（同名按 rank 竞争）/ 文件扫描迁入插件 / 目录注入改 user message（catalog 从 system 挪走——**断言变更说明必写**）/ skill 工具走 registry。验收：inline/fork 场景绿 + rank 覆盖测试。
+
+## 9. 代码执行流程图
+
+> 对应提交 `e2511cd`。三条主线：落盘路径（合并前钩子 + JSONL 插件）→ 惰性挂载 → resume 流水线（重放 → 崩溃修复 → derive → 派生恢复）。
+
+### 9.1 落盘路径：双钩子挂合并前
+
+```
+SessionLog（C8 扩）：
+  appendListeners / clearListeners + onAppend(fn)/onClear(fn) → 返回退订函数
+  append(evt):
+    for fn of [...appendListeners]: fn(evt)      ★ 合并【前】触发——JSONL 存原始流
+    连续 user 合并（C3 规则）……                  重放再走 append → 合并自动复现
+  clear():
+    for fn of [...clearListeners]: fn()          → 截断不删文件——标记行见下
+
+session-jsonl 插件（inject ["session-log"]，config { sessionId }）：
+  mkdir sessions 目录；file = <dir>/<sessionId>.jsonl
+  log.onAppend(evt → appendFileSync(file, JSON.stringify(evt) + '\n'))
+      落盘失败吞掉——内存日志仍是真相
+  log.onClear(() → appendFileSync(file, '{"type":"log/clear"}\n'))
+      ★ /clear 是一条标记行，不是截断文件——append-only 世界没有"删前半"
+  ctx.effect(() → 退订双钩子)
+
+PersistLine = SessionEvent | { type: 'log/clear' }
+```
+
+### 9.2 惰性挂载：ensurePersistence
+
+```
+runOneTurn(batch) 第一行：
+  ensurePersistence()
+    isSubAgent || persistenceAttached？ → return（子 agent 不持久化，对齐旧 autoSave）
+    persistenceAttached = true
+    ctx.plugin(sessionJsonlPlugin, { sessionId: this.sessionId })
+
+三个理由的机制落点：
+  ① resume 在挂载【前】重放——重放的事件没有监听器可触发，不自复制
+     （反过来：每次 resume 文件翻倍，clear 标记语义被污染）
+  ② 单测构造 Agent 不跑 turn → 不挂载 → 不写任何文件（结构性杜绝测试污染 HOME）
+  ③ sessionId 在 resume 时才改指向——挂载时烘焙文件路径正好接对文件
+```
+
+### 9.3 resume 流水线：重放 → 修复 → derive → 派生恢复
+
+```
+resume(sessionId):
+  lines = readSessionLines(sessionId)          逐行 parse；半行（崩溃尾巴）静默丢弃
+  for line of lines:
+    line.type === 'log/clear'？ → sessionLog.clear()
+    否则 → sessionLog.append(line)             原始事件重放（合并语义复现）
+  repairUnclosedTurn(sessionLog)
+    扫 events：turn/start 置 open，turn/end 清 open；扫完还 open
+    → append(turn/end, reason:'recovered')     注记层完整性（此时未挂载，不回写）
+  this.messages = sessionLog.derive().messages  请求历史从投影恢复（system 不落地——每请求现算）
+  this.sessionId = sessionId                    续写接同一文件
+  派生恢复（扫 meta/note 与 assistant 事件——零新增记账事件）：
+    meta/note(mode)            → this.mode                 最后一条生效
+    meta/note(activated-tools) → activateTools(names)      超越旧版
+    meta/note(goal)            → goal.set(condition) / goal.clear()
+    assistant/message.usage    → total* 四计数求和；含 tool_use 计 currentTurns
+                                 lastUsage → lastInputTokenCount
+  ★ 边界：日志没记的不恢复（lastApiCallTime 等纯内存态）——派生只能恢复日志记过的
+
+写路径对照（正常 turn）：
+  pushUser/pushAssistant/注记 → sessionLog.append → 合并前 onAppend → jsonl 尾追加
+  （旧 autoSave 快照路径 / restoreSession / session.ts 全部消亡）
+```
+
+### 9.4 完整时序走查：场景 32 三阶段（persist runner）
+
+```
+Phase ① 首会话（Agent a）：
+  chat('read greeting.txt then summarize') → runOneTurn → ensurePersistence 挂载
+  pushUser(M1)  → onAppend → 文件首行 user/message
+  req1 → [tool_use read_file] → pushAssistant(M2, usage) → tool/call|result 注记
+       → pushUser(M3 tool_result 批次 'hello from persistence.')
+  req2 → 文本应答 → pushAssistant(M4, usage) → end-turn
+  ——逐事件落盘（含 turn/start|end、system、注记），a.close()
+
+Phase ② resume 续接（Agent b）：
+  b.resume(sid)：
+    readSessionLines → 逐行 append 重放 → derive → messages = M1..M4（4 条）
+    cost 求和（2 条 assistant usage）非零 ✓ / mode 无注记维持 default
+    （未挂载——重放不回写）
+  sample resume-ok ✓ / resume-cost ✓
+  b.chat('continue: what did it say?') → ensurePersistence 挂载（同 sessionId → 同文件）
+    pushUser(M5) → 续写在原文件尾
+    req3：messageCount 5 ✓ / firstUserText 含 'read greeting.txt'（reminder 待遇
+    由 runOneTurn 给——重放后 M1 仍是首条）✓ / toolResults 含文件内容 ✓ /
+    system 与 req1 逐字节一致（assemble 确定性）✓ → M6 assistant → end-turn
+
+Phase ③ 崩溃修复（Agent c）：
+  人工追加崩溃尾巴：'{"type":"turn/start"}\n' + '{"type":"user/mes'（半行）
+  c.resume(sid)：
+    readSessionLines：完整行照收；'{"type":"user/mes' parse 失败 → 静默丢弃
+    重放后 turn/start 未闭合 → repairUnclosedTurn → append(turn/end,'recovered')
+    derive → messages = 6 条（两个 run 的全部历史，半行不污染）✓
+  sample crash-ok ✓ / crash-last-end = 'recovered' ✓ / crash-msgs = 6 ✓
+  ★ 恢复的历史是压缩前的原始流（C3 双记口径）——比崩溃前工作集大但语义正确，
+    D5 投影 replace 后收敛
+```

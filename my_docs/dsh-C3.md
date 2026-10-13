@@ -86,3 +86,135 @@
 ## 8. 下章预告（C4 Agent handle 与 inbox）
 
 `services/agents.ts`：AgentRegistry + AgentHandle（send/followup/cancel，idle/running/maintenance 三态）；inbox 双队列（next-turn/next-step）与 claim 语义（turn 边界 = 全部 next-step + 恰一条 next-turn）；cli.ts 输入改走 handle；新增 mid-turn 注入场景验证"工具执行间隙 send 的文本出现在下一 step 请求体"。
+
+## 9. 代码执行流程图
+
+> 对应提交 `a8265e3`。三条主线：pushUser/pushAssistant 双写入口 → append 入口的连续 user 合并 → 循环内注记挂点 → derive 纯投影。
+
+### 9.1 挂树与双写入口
+
+```
+Agent 构造（沿用 C1 7.1 的树）追加：
+  new SessionLog(ctx, "session-log")     内部 log: SessionEvent[]，八类事件
+
+消息操作统一入口（工作集 + 日志各进一份）：
+  pushUser(content)
+    ├─ 工作集：末条是 user？ ──是──→ 原地合并（string 拼 \n\n / 批次 push text 块）
+    │                        └─否──→ messages.push({role:'user', content})
+    └─ 日志：sessionLog.append({type:'user/message', content})
+          ★ 两个分支都走 append——工作集合并了旧消息，日志侧在 append 入口
+            做同一套合并（9.2）。双侧同语义，合并后仍逐字节一致
+  pushAssistant(content, usage?)
+    ├─ 工作集：messages.push({role:'assistant', content})
+    └─ 日志：append({type:'assistant/message', content, usage})
+          usage 四计数（input/output/cacheRead/cacheCreation）只挂日志事件，
+          请求体不含 usage——仪表照旧走 agent 的独立累计
+
+旁路操作（不产消息，只动状态）：
+  setMode            → append(meta/note, key='mode')        注记，不进请求
+  loadHistory(msgs)  → this.messages = msgs + sessionLog.load(msgs)   回放 9.4
+  restoreSession     → 改走 loadHistory（恢复路径统一收口）
+  clearHistory / clearHistoryKeepSystem → messages=[] + sessionLog.clear()  双侧清空
+```
+
+### 9.2 append 入口：连续 user 合并（防 API 400）
+
+```
+SessionLog.append(evt)
+  evt.type === 'user/message'？
+    └─ 是 → 末条事件也是 user/message？
+          ├─ 是 → 原地合并，不 push：
+          │     两侧都是 string → last.content += '\n\n' + evt.content
+          │     否则（数组/混形）→ blocks.push({type:'text', text: evt.content})
+          │     ★ 与迁移前 chat() 的合并行为逐字节一致（budget 截停后
+          │       历史末尾停在 tool_result 批次上，followup 直推就是
+          │       连续 user → roles must alternate 400）
+          └─ 否 → 落入 push
+  其余事件 → log.push(evt)
+
+derive().messages 里只见一条 user——合并发生在事件层，投影天然不重复
+```
+
+### 9.3 循环挂点：runAgentLoop 的事件注记
+
+```
+while (true) {
+  append(turn/start)
+  runCompressionPipeline()      T1–T4 原地改写工作集；日志不动——发散点即 D5 缝
+  systemBlocks = buildAnthropicSystem()
+  JSON.stringify(systemBlocks) !== peekLastSystem()？
+    ├─ 是（含首轮 undefined）→ append(system/message, 编码块数组)
+    └─ 否 → 跳过                对比去重：动态段未变不重复记
+  stream 请求：messages = withCacheBreakpoints(this.messages)
+                              ★ 请求源仍是工作集，不是 derive()——D5 前不动
+  响应完成 → usage 四计数 → pushAssistant(response.content, usage)
+  toolUses.length === 0？
+    └─ 是 → append(turn/end, 'end-turn') → 打印成本 / autoSave → break
+  checkBudget() 超限？
+    └─ 是 → append(turn/end, 'budget')
+            pushUser(toolUses.map(tu => {
+              append(tool/result, callId, 'not executed', isError)   拒绝批次注记
+              return {type:'tool_result', ...}
+            }))
+            autoSave → break        日志顺序：turn/end → tool/result×n → user 批次
+  append(turn/end, 'tool-use')
+  for tu of toolUses:
+    append(tool/call, id, name, input)
+    executeCall → denied / 抛错 / 正常 三出口，各自 append(tool/result, isError?)
+  pushUser(toolResult 批次) → 回循环顶（下一轮 turn/start）
+}
+```
+
+### 9.4 derive / load / clear：投影与回放
+
+```
+derive()  纯投影：事件流 → 请求参数
+  for evt of log:
+    system/message → system = JSON.parse(evt.content)   逐条覆盖 → 天然只剩最新
+    user/message   → messages.push({role:'user',   content: clone(...)})
+    assistant/...  → messages.push({role:'assistant', content: clone(...)})
+    其他（tool/call|result、turn/*、meta/note）→ 忽略
+  clone = JSON round-trip → 调用方改写不污染日志；重放任意次结果一致
+
+load(messages)  回放（session 恢复路径）：
+  log 清空 → 逐条 append(user/message | assistant/message)
+  usage 不可考，不带——round-trip 验收只对消息形状
+
+clear()  清空 log——clearHistory / clearHistoryKeepSystem 双侧清空的日志半边
+```
+
+### 9.5 完整时序走查：一轮带工具调用的会话
+
+```
+场景：用户发 "run it" → 模型调 run_shell(echo hi) → 回灌结果 → 模型回 'done' 收尾
+（消息形状即 c3-session-log.test.ts「注记事件不进请求投影」那条）
+
+动作（工作集）                    日志事件（按 append 顺序）
+──────────────────────────      ────────────────────────────────────
+chat('run it') → pushUser       E1  user/message('run it')        末条非 user，直推
+轮 1 循环顶                     E2  turn/start
+system 首次：peekLastSystem()   E3  system/message(JSON 块数组)
+  = undefined ≠ 编码 → append
+模型回 [tool_use t1]            E4  assistant/message(content, usage 四计数)
+  pushAssistant
+有工具 → 预算未超               E5  turn/end(reason:'tool-use')
+executeCall(t1)                 E6  tool/call(t1, run_shell, {command:'echo hi'})
+                                E7  tool/result(t1, 'hi')
+toolResult 批次回灌             E8  user/message([{tool_result t1,'hi'}])
+  pushUser(批次)：末条是 assistant → 工作集直推，日志无合并
+轮 2 循环顶                     E9  turn/start
+system 对比：编码 === E3 内容    （跳过——对比去重，未重复 append）
+模型回 'done'（无 tool_use）    E10 assistant/message('done', usage)
+  pushAssistant                 E11 turn/end(reason:'end-turn') → break
+
+derive() 投影（消费 E1/E3/E4/E8/E10，注记 E2/E5/E6/E7/E9/E11 全忽略）：
+  system   = [静态块(ephemeral 断点), 动态块]        ← 只剩最新一条（仅 E3）
+  messages = [
+    {role:'user',      content:'run it'}                        ← E1
+    {role:'assistant', content:[tool_use t1]}                   ← E4
+    {role:'user',      content:[tool_result t1 'hi']}           ← E8
+    {role:'assistant', content:[text 'done']}                   ← E10
+  ]
+  ★ Agent 集成断言：JSON(derive.messages) === JSON(history())——
+    无压缩会话里投影与工作集逐字节一致，双写的两端被测试钉死
+```

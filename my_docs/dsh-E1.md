@@ -79,3 +79,109 @@ SIGINT：
 - `retry.ts` 的 printRetry 是引擎侧最后一个直印（模块无树访问，改造要动 withRetry 签名传回调）——记档，顺手章再收。
 - dsh 全事件化（叙事也是 surfaceOp）与跨进程渲染差距已记档，真 dsh 对照时再议。
 - **E2 bundle/profile 简版**：插件清单分层（base + app patch）+ `--patch` 覆盖 + `--dump-config`。验收：同一份 my_src 两条配置组装出"全功能"与"无 auto-mode"两个 agent。
+
+## 7. 代码执行流程图
+
+> 对应提交 `a466936`。四条主线：命令面（dispatch 一个入口）→ UI 两个面（消息面日志驱动 / 叙事面服务出口）→ agent 侧接线与消亡清单 → SIGINT 收口。
+
+### 7.1 命令面：slash if 链收口为数据
+
+```
+CommandService（services/commands.ts）：
+  commands: Map<name, CommandDef{ name, description, run }>
+  register(def) / get(name) / list()（注册序 = 横幅展示序）
+  skillResolver: (name) → CommandDef | null        commands 插件注入（动态注册表投影）
+  dispatch(input):
+    非斜杠 → false
+    "/name args" 解析（首个空格切 name/args）
+    静态表命中 → await run(args) → true
+    未命中 → skillResolver(name)（userInvocable 才认）→ run → true
+    都不认 → false                              ★ REPL 收到 false → agent.send 透传
+
+commandsPlugin.apply（注册 = 插件，cli 零知识）：
+  def("clear"/"plan"/"cost"/"compact"/"memory"/"goal"/"loop"/"skills", ...)
+    handler 内自管打印（ui.info）与 await（runGuarded 包错误——abort 不二次报）
+    goal/loop 驱动命令在 handler 里 await 收敛——CLI 不知道谁阻塞
+  setSkillResolver：skills.getByName → userInvocable → 命令形状
+    inline → bridge.send(resolveSkillPrompt(skill, args))
+    fork   → bridge.send(`Use the skill tool to invoke "..." with args: ...`)
+    ★ 与 skill 工具同源：同一 registry、同一 resolveSkillPrompt、同一分流
+
+cli.ts 消费端：
+  printWelcome(agent.commands)——横幅清单消费 list()（注册序即展示序）
+  输入循环：exit/quit（REPL 交互词）→ commands.dispatch → false 则 agent.send
+  130 行 if 链消亡
+```
+
+### 7.2 UI 两个面：事实走日志，旁白走服务
+
+```
+UiService（services/ui-service.ts）：
+  渲染器两格：
+    consoleRenderer（默认）= 旧 ui.ts 的逐字节转接（printInfo 等）
+    setRenderer(null) → 全空实现（测试静默/未来 headless）
+  info/error/text/cost/spinner*/confirmation/subAgent*  → renderer 同名
+                                        ★ 叙事面：引擎只说"发生了什么"
+
+消息面（attachSessionLog，Agent 构造期调用一次）：
+  session-log.onAppend(evt → evt.type === "tool/call" && renderer.toolCall(...))
+  ★ 引擎的 printToolCall 直印消亡——日志里有的事实 UI 自己看得见；
+    onAppend 同步回调 → 渲染顺序 = 日志顺序（无排队无重排）
+  assistant 流式文本不走日志（ctx.ui.text(delta)）——增量是过程不是事实，
+  日志已有完整 assistant/message 事件，走日志渲染必然双打
+
+引擎侧改造（48 个直印点清零）：
+  printInfo/printError/printConfirmation/... → this.ui.info/error/...（agent）
+  print* → ctx.ui.*（autonomy/auto-approval/compaction/approval/subagent 插件）
+  ui.ts 死函数清退：printWelcome/printToolResult/printUserPrompt/printDivider
+```
+
+### 7.3 agent 接线与消亡清单
+
+```
+Agent 构造（装配序）：
+  uiService.attachSessionLog()           消息面挂载（在任何 turn 之前）
+  this.commands = new CommandService(cordis, "commands")
+  this.cordis.plugin(commandsPlugin, this.commandsBridge())
+    bridge：clearHistory/togglePlanMode/showCost/compact/showGoal/
+            startGoal/runLoop/send——REPL 动词 → agent 能力的映射
+  get commands() → cordis.require("commands")     cli 侧句柄
+
+SIGINT → cancel(cause)：
+  旧：cli 判 busy + 自己 console.log("(interrupted)")
+  新：handleInterrupt → agent.cancel(wasBusy ? "(interrupted)" : undefined)
+      agent 判 busy → 经 ui 报告 cause          打断的报告收口进 agent
+  CLI 只剩 sigintCount 两连退出计数——那是 readline 的交互节奏，不是 agent 的事
+```
+
+### 7.4 完整时序走查：REPL 一轮（/goal + 工具调用渲染 + Ctrl+C）
+
+```
+输入 "/goal a.txt has been read"：
+  rl line → input 非空 → agent.commands.dispatch("/goal a.txt has been read")
+    斜杠解析：name="goal"、args="a.txt has been read"
+    静态表命中 → handler：condition 非空 → runGuarded(() → bridge.startGoal(...))
+      → agent.setGoal（meta/note 入日志）+ pursueGoal（首 turn 即开，await 收敛）
+    dispatch 返回 true → ask() 回提示符
+  ✓ 全程 cli 只写了"dispatch + 透传"两个动词
+
+turn 内模型调 read_file(a.txt)：
+  引擎 append({ type:"tool/call", name, input })
+    → onAppend 落盘钩子（JSONL）与 UI 订阅同步触发（注册序：先 jsonl 后 ui）
+    → renderer.toolCall(name, input) → consoleRenderer → printToolCall
+  ✓ 横幅样子与旧 printToolCall 直印逐字节一致（ch1 冒烟对照）——
+    差别只在驱动源：引擎不印了，日志事件推着渲染器印
+
+处理中 Ctrl+C：
+  process 层 SIGINT（无问题挂起，终端信号直达进程）→ handleInterrupt
+    wasBusy = true → agent.cancel("(interrupted)")
+      busy → ui.error("(interrupted)") 由 agent 侧报告；停 loop/goal 旗 +
+      清 inbox + abort 在途请求
+    sigintCount = 0；send 的 settle 以 abort reject → ask 的 catch 回提示符
+  ✓ CLI 对"打断长什么样"零知识——只剩两连退出的计数
+
+对照旧世界（同输入）：
+  /goal 在 cli if 链里解析 + printError 兜错；工具横幅由 agent 直印；
+  "(interrupted)" 由 console.log 出——三处知识现在分别归 commands 插件、
+  日志订阅、cancel(cause)
+```

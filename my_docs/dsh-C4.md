@@ -128,3 +128,145 @@ settle：排空 → idle（冲水 whenIdle waiters）；abort → 补 turn/end �
 ## 8. 下章预告（C5 循环事件化 ★大章）
 
 turn/step 事件序列埋点（`agent/pre-step` 改写/拒绝、`agent/turn-stopping` 挽留、`turn/end reason`）；plan/goal/auto/loop 的硬编码分支迁为 `plugins/autonomy.ts` 监听器；`contextCleared` 布尔消亡。C4 的 runStepLoop 给它留好了位置：pre-step 挂在 claim 之后、请求组装之前；turn-stopping 挂在"末响应无 tool_use"的收敛判定处——正是本章"排空循环"看到 pending 之前的那一格。
+
+## 9. 代码执行流程图
+
+> 对应提交 `a91daea`。三条主线：handle 路由面（输入是数据）→ ensureDriver 排空循环（三态状态机）→ claim 边界（turn/step）认领注入。
+
+### 9.1 handle 路由面：入口只排队
+
+```
+cli.ts：REPL 输入 / one-shot / skill 全改走 send；SIGINT 改走 cancel
+chat(text) = followup(text) + await settle        兼容入口（goal/loop/subagent 沿用）
+
+send(text)
+  status === 'idle'？ ──是──→ followup(text)          idle 的 send ≡ followup
+      └─否──→ inbox.append('next-step', text)          running 的 send = 插话
+               return ensureDriver()                   驱动已活 → 返回同一 settle
+
+followup(text) → inbox.append('next-turn', text) → ensureDriver()
+                   ★ 只排队，不裁决——什么时候进上下文由 claim 边界决定
+
+steer(text) → inbox.append('next-step', text)
+  idle → void ensureDriver().catch(e => 非 abort 才 printError)
+                                       无 awaiter 的驱动在此兜底（SIGINT 静默语义）
+
+cancel(_cause?)：stopLoop() + stopGoal() + inbox.clear()（先 next-step 后 next-turn）
+                 + abortController.abort()
+                 settle 以 abort 错误 reject 给 awaiter——旧 chat() 抛错路径原样
+
+whenIdle()：idle → 立刻 resolve；否则 idleWaiters.push(resolve)
+```
+
+### 9.2 ensureDriver 与 runDriver：排空循环（dsh wake/latch 的 mini 简化）
+
+```
+ensureDriver()
+  driverPromise 已存在？ ──是──→ 返回同一个 promise（并发入口共享一次驱动）
+      └─否──→ setStatus('running')
+              driverPromise = runDriver().finally(→ driverPromise = null)
+
+runDriver()
+  try {
+    while (inbox.hasPending) {          ← 排空循环：排空即收敛
+      batch = claimTurn()               全部 next-step + 恰 1 条 next-turn
+      batch 空 → break
+      await runOneTurn(batch)           一个完整对话轮
+    }
+    setStatus('idle')                   idleWaiters 全部 resolve（冲水）
+  } catch (e) {
+    isAbortLike(e) → append(turn/end, reason:'aborted')   C8 重放要 start/end 配对
+    setStatus('idle')
+    throw e                             awaiter（chat/send 调用方）拿到与旧 chat 同语义
+  }
+
+状态机：idle ──ensureDriver──→ running ──runOneTurn 开场──→ maintenance
+        maintenance ──请求组装前──→ running ──排空/settle/abort──→ idle
+  busy = status ≠ 'idle'（SIGINT 判忙——maintenance 也算，比旧 isProcessing 窗口更早）
+```
+
+### 9.3 claim 语义：Inbox 双队列的三个出口
+
+```
+claimTurn()   turn 边界（runDriver 循环顶）
+  claimed = next-step.splice(0)          插话在前
+  claimed += next-turn.splice(0, 1)      恰一条 turn 输入在后（顺序同形 dsh claim）
+  ★ 两条 followup 各开各的 turn——turn 的所有权不混
+  ★ 下一轮循环顶再看：还有 pending 就继续开 turn
+
+claimStep()   step 边界（runStepLoop 内，首轮之后每轮）
+  next-step.splice(0)                    只取插话，next-turn 不动
+  插话不终结 turn——让模型在下一双眼睛看世界时看到它
+
+clear()       cancel 路径
+  next-step.splice(0) → next-turn.splice(0)     顺序对齐 dsh Inbox.clear
+```
+
+### 9.4 runOneTurn 开场段（maintenance）与 runStepLoop 的 step 边界
+
+```
+runOneTurn(batch)
+  for text of batch:
+    首条消息且无 custom prompt → text += buildUserContextReminder()
+    pushUser(text)                工作集+日志双写；批次多条经 C3 合并器并成一条 user
+  setStatus('maintenance')        turn 开场段 = mini 的维护相位（非独立任务）
+  await checkAndCompact()         T4：此刻末条是纯 user 文本，slice 不变式成立
+  await startMemoryPrefetchForTurn(batch.join('\n\n'), messages)
+  ensureMcp()（子 agent 跳过）→ setStatus('running')
+  abortController = new AbortController()      生命周期覆盖整个 turn
+  try → await runStepLoop(mcpTools)
+  finally → abortController = null
+
+runStepLoop(mcpTools)
+  firstStep = true
+  while (true) {
+    !firstStep → for steerText of claimStep(): pushUser(steerText)
+        ★ 此刻末条是 user(tool_result 批次)——pushUser 走合并器"批次追加
+          text 块"分支：插话并进同一条消息，messageCount 不变
+    firstStep = false
+    ……C3 循环体原样：turn/start → 压缩 T1–T3 → system 对比去重 → 请求
+      → pushAssistant(usage) → end-turn / budget / tool 循环回灌 → 下一 step
+  }
+```
+
+### 9.5 完整时序走查：场景 27 三阶段（mid-turn runner 驱动）
+
+```
+Phase 1 mid-turn 注入（delayMs 卡响应，探针见 req1 即注入）：
+  chat('Read greeting.txt and summarize it.')
+    → idle → followup → next-turn=[任务] → ensureDriver → running
+  runDriver: claimTurn=[任务] → runOneTurn
+    maintenance: pushUser(任务) → M1 user → T4 → prefetch → MCP → running
+    step 1: 请求 req1（delayMs 250 卡住）…… sample phase1-status = running ✓
+  send('MIDTURN-STEER: also check the weather.')
+    → running → next-step=[标记]（驱动已活，不新开）
+    ……req1 响应到：[tool_use read_file] → M2 assistant → tool/call → tool/result
+      → pushUser(tool_result 批次) → M3 user(批次)
+    step 2 边界: claimStep=[标记] → pushUser(标记)
+      ★ 末条 M3 是 tool_result 批次 → 合并器追加 text 块 → 仍是 M3
+    step 2: 请求 req2 → messageCount 仍 3 ✓ / lastUserText 含 MIDTURN-STEER ✓
+      / toolResults 同消息 1 条 ✓
+    模型回文本 → M4 assistant → end-turn
+  runDriver 循环顶: 无 pending → idle（waiters 冲水）→ phase1-after = idle ✓
+
+Phase 2 cancel（运行中取消）：
+  chat('cancel me') → followup → claimTurn → pushUser → M5 user('cancel me')
+    → step 1: 请求 req3（delayMs 卡住）
+  cancel()：stopLoop + stopGoal + inbox.clear + abort
+    在途 req3 以 AbortError 失败 → runStepLoop 向上抛
+  runDriver catch: isAbortLike ✓ → append(turn/end,'aborted') → idle → rethrow
+    settle reject ✓（awaiter catch 记 aborted）/ phase2-status = idle ✓
+    ★ M5 留在历史（push 在请求前，abort 只杀请求）——旧 chat 同款契约，不回滚
+
+Phase 3 followup 自动续 turn：
+  chat('phase three a') → claimTurn → pushUser
+    ★ 末条是 M5 user('cancel me') → 合并器拼接：M5 = 'cancel me\n\nphase three a'
+    → req4（delayMs 卡住）
+  followup('phase three b') → running 中 → 只排 next-turn
+    sample phase3-followup-status = running ✓
+  req4 响应：'phase three a done.' → M6 assistant → end-turn
+  runDriver 循环顶: hasPending（next-turn 有货）→ claimTurn=['phase three b']
+    → runOneTurn → pushUser：末条是 M6 assistant → 不合并，新开 M7 user ✓
+    → req5 → messageCount 7 ✓ / lastUserText 含 'phase three b' ✓
+    → M8 assistant → 排空 → idle → p3 resolve / whenIdle resolve ✓
+```
