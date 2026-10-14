@@ -228,6 +228,12 @@
 | E2 | ✅ 完成（2026-10-07） | `dsh-E2.md`；cordis.config.ts 重写为真实清单（插件表 22 项 + baseRows + AppHost/appRows + profiles + mergeRows/formatRows/buildRows）+ plugins/services.ts 服务行化 + Agent 构造函数换 loadRows（dumpConfig/dumpTree）+ cli `--profile`/`--patch`/`--dump-config`；no-auto profile 抓出 approval 盲弃权真洞（auto-adjudicator 在场标记补位，翻车记档 §4）；B6 玩具清单内联回 b6 测试；新 e2-bundle 8 测试 + 场景 33 双 profile 探针；cordis 140/140、mock 28 场景全绿（零断言变更）；建议 commit：`add layered plugin manifest with profiles and config dump` |
 | E3 | ✅ 完成（2026-10-07，课程收官） | `dsh-E3.md` + `dsh-final.md`；snapshot 体系（snapshot-lib 规范化/diff + run-snapshot 总驱动 + mock `--snapshot-record/replay` + npm run snapshot，28 章 135 请求逐字节锚，28/28 × 4 轮全绿）+ 收官文档（差异清单汇总 + 场景终态 + 源码导读地图）；规范化踩三个坑（JSON 转义路径/mtime/plan sid/truncate 文件名）记档；cordis 140/140、mock 28 全绿；建议 commit：`add snapshot record-replay regression with final course wrap-up docs` |
 
+### F 阶段（web UI，2026-10-14 开工；总纲 `dsh-00-ui-plan.md`）
+
+| 章 | 状态 | 交付 |
+|---|---|---|
+| F1 | ✅ 完成（2026-10-14） | `dsh-F1.md`；host-webserver 插件（node:http 只绑 127.0.0.1、一元 RPC 信封 `{ok,value}\|{ok,error}`、session.create/list/prompt/events?since=、静态目录 + 前缀守卫、ready/shutdown 生命周期）+ 清单接线（baseRows host 行默认 disabled、profiles.web 工厂行——profile 层支持 (host)=>Row[] 工厂、AppHost 增 agentId/isBusy/sendText 三桥方法）+ cli `--web`/`--port`（REPL/one-shot 不进，SIGINT 收口）；Agent.close() 增 Host 收口；f1-host 测试 7 条（echo 路由真 turn 全链 + 错误路径 + 穿越守卫）；cordis 147/147、mock 28 场景全绿、curl 三方法冒烟通过；建议 commit：`add web host plugin with envelope rpc and web profile` |
+
 > 约定：每章完成时在本表打勾，并在 `my_docs/dsh-<n>.md` 末尾附"翻车记档 + 自测题"。
 > 模式（2026-10-03 起）：每章 = Claude 写讲解 md → 自动实现代码 → 验证（cordis 测试 + 22 mock 回归）→ 复查文档 → 给 commit comment（用户自己提交）→ 问是否开下一章。
 > 已交付 commit：A0 `add dsh migration plan, chapter roadmap, and phase-A immersion notes`；B1 `add mini-cordis service container with proxy context and declaration merging`；B2 `add mini-cordis plugin fibers with lifecycle states and provide notification`；B3 `add mini-cordis effect model with cascade disposal and apply rollback`；B4 `add mini-cordis event bus with five dispatch modes and fiber-owned listeners`；B5 `add mini-cordis scope primitive with layered registries and nearest-wins resolution`；B6 `add mini-cordis config loader with row merging and tree dump`；C1 `add mini-cordis tools registry and migrate tool execution to plugins`；C2 `add tool execution pipeline with monotonic approval waterfall`；C3 `add session event log with pure derive projection and dual-write message entry`。

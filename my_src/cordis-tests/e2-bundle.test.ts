@@ -19,6 +19,9 @@ const noopHost = (): AppHost => ({
     getBudget: () => ({ exceeded: false, reason: '' }),
     getMaxTurns: () => null,
     addTokens: () => {},
+    agentId: () => 'test-session',
+    isBusy: () => false,
+    sendText: async () => {},
 })
 
 const rowOf = (rows: Row[], id: string): Row => {

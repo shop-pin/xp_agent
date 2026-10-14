@@ -22,6 +22,8 @@ import type { Plugin } from "./cordis/fiber.js";
 export type { Row };
 import type { PermissionMode } from "./permissions.js";
 import type { CommandsBridge } from "./plugins/commands.js";
+import type { HostBridge } from "./plugins/host-webserver.js";
+import { hostWebserverPlugin } from "./plugins/host-webserver.js";
 import { buildStaticSystemPrompt } from "./prompt.js";
 
 import {
@@ -68,6 +70,7 @@ export const plugins: Record<string, Plugin> = {
     "approval": approvalPlugin,
     "auto-approval": autoApprovalPlugin,
     "autonomy": autonomyPlugin,
+    "host-webserver": hostWebserverPlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -106,6 +109,8 @@ export const baseRows: Row[] = [
     { id: "approval", name: "approval" },
     { id: "auto-approval", name: "auto-approval" },
     { id: "autonomy", name: "autonomy" },
+    // F1：web Host——默认关闭（REPL/mock 不绑端口）；web profile 整行替换启用
+    { id: "host", name: "host-webserver", disabled: true },
 ]
 
 /**
@@ -124,6 +129,10 @@ export interface AppHost {
     getBudget(): { exceeded: boolean; reason: string }
     getMaxTurns(): number | null
     addTokens(input: number, output: number): void
+    /** F1：Host 桥——会话身份/忙闲/驱动入口（web profile 工厂经它取桥）。 */
+    agentId(): string
+    isBusy(): boolean
+    sendText(text: string): Promise<void>
 }
 
 export function appRows(host: AppHost): Row[] {
@@ -164,18 +173,44 @@ export function appRows(host: AppHost): Row[] {
     ]
 }
 
+/** web 端口：env MINI_WEB_PORT（0 合法——测试用随机端口），缺省 3080。 */
+function webPort(): number | undefined {
+    const raw = process.env.MINI_WEB_PORT
+    if (raw === undefined) return undefined
+    const n = Number(raw)
+    return Number.isInteger(n) && n >= 0 && n <= 65535 ? n : undefined
+}
+
 /**
  * 命名补丁层：同一份 my_src，不同 profile 组装出不同产品形态。
+ * 值可以是行数组，也可以是 (host) => Row[] 工厂（F1 起：web profile 需要
+ * 从宿主取桥——产品形态选择器本来就有权看装配宿主）。
  * 'full'：全功能（空补丁 = base 原样）。
  * 'no-auto'：无 auto-mode 版——auto-approval 行换成 disabled 行（"注释掉"），
  * 分类器能力整体下线：auto 模式下的危险动作直落人工确认/headless 拒绝，
  * 瀑布里只剩 approval 外层（deny 规则硬底线 + 九段静态流水线）。
+ * 'web'：web Host 版——启用 host 行并接上桥（--dump-config 无宿主时保持
+ * disabled 占位：预览不该真的绑端口）。
  */
-export const profiles: Record<string, Row[]> = {
+export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     full: [],
     "no-auto": [
         { id: "auto-approval", name: "auto-approval", disabled: true },
     ],
+    web: (host) => host
+        ? [{
+            id: "host",
+            name: "host-webserver",
+            config: {
+                port: webPort(),
+                bridge: {
+                    agentId: host.agentId,
+                    isBusy: host.isBusy,
+                    sendText: host.sendText,
+                } satisfies HostBridge,
+            },
+        }]
+        : [{ id: "host", name: "host-webserver", disabled: true }],
 }
 
 /** 分层铺平：同 id 后写胜（整行替换）。loadRows 内部还有一次同 id 去重，
@@ -199,10 +234,11 @@ export interface AssembleOptions {
 
 export function buildRows(options: AssembleOptions = {}): Row[] {
     const profileName = options.profile ?? "full"
-    const profileRows = profiles[profileName]
-    if (!profileRows) {
+    const profileDef = profiles[profileName]
+    if (!profileDef) {
         throw new Error(`[mini-cordis] unknown profile "${profileName}" (known: ${Object.keys(profiles).join(", ")})`)
     }
+    const profileRows = typeof profileDef === "function" ? profileDef(options.host) : profileDef
     return mergeRows([
         baseRows,
         options.host ? appRows(options.host) : [],

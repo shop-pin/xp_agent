@@ -9,6 +9,7 @@ import { Context } from "./cordis/context.js";
 import { loadRows, dumpTree } from "./cordis/loader.js";
 import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
 import { SkillRegistry } from "./plugins/skills-registry.js";
+import { HostService } from "./plugins/host-webserver.js";
 import { buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
 import { CompactionService } from "./plugins/compaction.js";
 import type { GoalService, LoopService } from "./plugins/autonomy.js";
@@ -175,6 +176,10 @@ export class Agent implements AgentHandle {
                 this.totalInputTokens += input;
                 this.totalOutputTokens += output;
             },
+            // F1：web Host 桥（profiles.web 工厂经它把驱动入口接进 host 行）
+            agentId: () => this.id,
+            isBusy: () => this.busy,
+            sendText: (text: string) => this.send(text),
         };
     }
 
@@ -454,6 +459,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async close(): Promise<void> {
         await this.cordis.get<AgentRegistry>("agents")?.disposeAll();
         await this.cordis.get<McpBridge>("mcp")?.disconnectAll();
+        // F1：web Host 的监听 socket 也挂事件循环——close 时一并收
+        this.cordis.get<HostService>("host")?.shutdown();
     }
 
     // （D4：buildSideQuery/consumeMemoryPrefetchIfReady/startMemoryPrefetchForTurn
@@ -604,6 +611,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     /** D1：skills registry 的 CLI 侧句柄（/skills 列表与 /<name> 直调都走它）。 */
     get skills(): SkillRegistry {
         return this.cordis.require<SkillRegistry>("skills");
+    }
+
+    /** F1：web Host 的 CLI 侧句柄（--web 模式读监听地址；未启用 profile 时为空）。
+     *  叫 webHost 不叫 host——私有 host() 是 E2 的宿主能力面工厂，两者撞名。 */
+    get webHost(): HostService | undefined {
+        return this.cordis.get<HostService>("host");
     }
 
     async send(text: string): Promise<void> {

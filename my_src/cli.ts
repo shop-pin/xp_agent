@@ -38,9 +38,11 @@ Options:
   --goal <condition>  Pursue a goal across turns until an evaluator judges it met
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
-  --profile <name>    Plugin manifest profile: full (default) | no-auto (auto-mode classifier removed)
+  --profile <name>    Plugin manifest profile: full (default) | no-auto | web (HTTP host on 127.0.0.1)
   --patch <file>      Append plugin rows from a .mjs exporting "rows" (same-id rows override)
   --dump-config       Print the final merged plugin manifest and exit
+  --web               Serve the web Host instead of the REPL (implies --profile web)
+  --port <n>          Web host port (env MINI_WEB_PORT; 0 = random; default 3080)
   --help, -h          Show this help
   (model via env: ANTHROPIC_MODEL_ID, base URL via ANTHROPIC_BASE_URL)
 
@@ -124,6 +126,22 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         console.log(`(patch: +${rows.length} row(s) from ${file})`);
     }
 
+    // F1：web Host 模式——--web 起 HTTP 面（缺省配 web profile），REPL/one-shot 不进
+    let web = false;
+    if (argv.includes("--web")) {
+        web = true;
+        argv = argv.filter((t) => t !== "--web");
+        if (!profile) profile = "web";
+    }
+    const portIdx = argv.indexOf("--port");
+    if (portIdx >= 0) {
+        const port = argv[portIdx + 1];
+        if (!port || !/^\d+$/.test(port)) throw new Error("--port requires a number (0 = random)");
+        process.env.MINI_WEB_PORT = port;
+        argv.splice(portIdx, 2);
+        console.log(`(web port: ${port})`);
+    }
+
     if (argv.includes("--dump-config")) {
         // 装配预览：挂完整清单再打行表（app 层的桥/选项只有宿主在才拿得到），
         // 不进 REPL。危险点：这是最终行表视图，运行态 fiber 树看 agent.dumpTree()
@@ -149,6 +167,23 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         const gi = argv.indexOf("--goal");
         goalCondition = argv[gi + 1];
         argv.splice(gi, 2);
+    }
+
+    // F1：web 模式——Host 插件已在装配期监听；等绑定完成（ready 后端点才可知），
+    // SIGINT 收口（服务器连接/MCP 子进程），不进 REPL 与 one-shot。
+    if (web) {
+        const host = agent.webHost;
+        if (!host) {
+            printError(`Profile "${profile}" did not enable the host row — use --profile web.`);
+            await agent.close();
+            process.exitCode = 1;
+            return;
+        }
+        await host.ready;
+        process.once("SIGINT", () => {
+            void agent.close().then(() => process.exit(0));
+        });
+        await new Promise<never>(() => {});
     }
 
     if (argv.includes("--max-cost")) {
