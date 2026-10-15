@@ -233,6 +233,7 @@
 | 章 | 状态 | 交付 |
 |---|---|---|
 | F1 | ✅ 完成（2026-10-14） | `dsh-F1.md`；host-webserver 插件（node:http 只绑 127.0.0.1、一元 RPC 信封 `{ok,value}\|{ok,error}`、session.create/list/prompt/events?since=、静态目录 + 前缀守卫、ready/shutdown 生命周期）+ 清单接线（baseRows host 行默认 disabled、profiles.web 工厂行——profile 层支持 (host)=>Row[] 工厂、AppHost 增 agentId/isBusy/sendText 三桥方法）+ cli `--web`/`--port`（REPL/one-shot 不进，SIGINT 收口）；Agent.close() 增 Host 收口；f1-host 测试 7 条（echo 路由真 turn 全链 + 错误路径 + 穿越守卫）；cordis 147/147、mock 28 场景全绿、curl 三方法冒烟通过；建议 commit：`add web host plugin with envelope rpc and web profile` |
+| F2 | ✅ 完成（2026-10-15） | `dsh-F2.md`；/api/stream WebSocket（ws@8，同 server upgrade 通道、路径白名单、其余 upgrade destroy）——follow-first（先挂 onAppend 缓冲再拍 baseline 快照，seq 去重补发）+ 帧表 baseline/event/heartbeat/resumed/error + resume(since) 尾页补洞 + 单 interval 心跳广播（heartbeatMs 可配、JSON 帧捎带 lastSeq）+ 多客户端独立订阅广播；dispose 收口（心跳 interval + terminate 全部流连接）；f2-stream 测试 7 条（baseline/live、turn 中连接不重不漏、kill 重连无洞无重、resume 精确补洞、广播一致、心跳、坏帧容错 + 非 stream upgrade 拒绝）；cordis 154/154、mock 28 场景全绿、CLI `--web` + 一次性 WS 客户端冒烟（baseline→live→resume 全链）通过；建议 commit：`add stream websocket with follow-first backfill and seq resume` |
 
 > 约定：每章完成时在本表打勾，并在 `my_docs/dsh-<n>.md` 末尾附"翻车记档 + 自测题"。
 > 模式（2026-10-03 起）：每章 = Claude 写讲解 md → 自动实现代码 → 验证（cordis 测试 + 22 mock 回归）→ 复查文档 → 给 commit comment（用户自己提交）→ 问是否开下一章。

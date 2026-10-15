@@ -1,20 +1,28 @@
-// plugins/host-webserver.ts——F1：web Host 最小面（一元 RPC + 信封）。
+// plugins/host-webserver.ts——F1：web Host 最小面（一元 RPC + 信封）；
+// F2 叠 /api/stream WebSocket 事件流（follow-first + seq 补洞 + 多客户端广播）。
 // 参照物：dsh packages/api 的一元调用（HTTP POST，信封 {ok,value}|{ok,error}，
 // 不抛异常）+ packages/host 的 webserver 座位；apps/cli 的 profile 启动拓扑
-// （agent 同进程——Host 是清单上的一行，不是独立守护进程）。
+// （agent 同进程——Host 是清单上的一行，不是独立守护进程）；事件流对照
+// session-controller 的 follow 流（先开 live 推送，再回填历史）+ 重连
+// "尾页补洞 + 每代 baseline"。
 //
-// 方法面（F1 过渡期拉取，F2 换事件流）：
+// 方法面：
 //   POST /api/session.create   幂等返回本树唯一会话（mini Host 单会话——
 //                              multi-session 的 SessionRegistry 记档不抄）
-//   POST /api/session.prompt   { text } → await agent.send（整 turn 结算才回）
+//   POST /api/session.prompt   { text } → await agent.send（整 turn 结算才回；
+//                              F3 客户端有了事件流后换 accepted + 看流观察 settle）
 //   GET  /api/session.list
-//   GET  /api/session.events?since=<seq>   seq = 事件下标（D5 投影同款身份）
-// 语义错误走信封 ok:false；未知方法 404 + 信封；静态目录服务给 F3 的 SPA dist。
+//   GET  /api/session.events?since=<seq>   拉取版兜底（调试/F6 回放对照）
+//   WS   /api/stream           事件流：连上即 baseline（全量回填 + lastSeq），
+//                              之后 live 逐事件推送；帧表见 StreamFrame。
+// seq = 事件下标（D5 投影同款身份）。语义错误走信封 ok:false；未知方法
+// 404 + 信封；静态目录服务给 F3 的 SPA dist。
 //
 // 安全默认：只绑 127.0.0.1（agent 能执行任意命令，绝不暴露到网络面）；
-// 静态目录做前缀守卫防路径穿越；请求体 1MB 上限。
+// 静态目录做前缀守卫防路径穿越；请求体 1MB 上限；upgrade 只认 /api/stream。
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
+import { WebSocketServer, WebSocket } from "ws";
 import { existsSync, readFileSync, statSync } from "fs";
 import { extname, join, resolve, sep } from "path";
 import { Service } from "../cordis/service.js";
@@ -33,7 +41,31 @@ export interface HostConfig {
     port?: number;
     /** SPA dist 目录；缺省 env MINI_WEB_STATIC，目录不存在则静态面关闭。 */
     staticDir?: string;
+    /** /api/stream 心跳间隔 ms；缺省 env MINI_WEB_HEARTBEAT_MS，缺省 30s，0 关闭。 */
+    heartbeatMs?: number;
     bridge: HostBridge;
+}
+
+/** 单流帧表（dsh remote.mux 的 open/item/end 语义简版）：
+ *  s→c baseline = open（每代连接的完整投影 baseline，带 lastSeq）；
+ *  s→c event    = item；heartbeat 代替 mux 心跳并顺带播报 lastSeq；
+ *  c→s resume(since) = 重连补洞原语——客户端报自己已见 seq，服务端回放
+ *  (since, now]（fresh 连接已有全量 baseline，resume 用于客户端本地状态
+ *  对账/带宽优化，不替换 baseline）。 */
+export type ServerStreamFrame =
+    | { type: "baseline"; lastSeq: number; events: Array<{ seq: number; event: unknown }> }
+    | { type: "event"; seq: number; event: unknown }
+    | { type: "heartbeat"; lastSeq: number }
+    | { type: "resumed"; lastSeq: number }
+    | { type: "error"; error: string };
+
+/** 每连接一份的 live 管道状态：订阅期间快照尚未覆盖的增量先落 pending，
+ *  baseline 发出后按 seq 去重补发（follow-first 的防缝缓冲）。 */
+interface StreamClient {
+    /** 已确认推给该客户端的最大 seq（-1 = 还没发过任何事件）。 */
+    lastSent: number;
+    pending: Array<{ seq: number; event: unknown }>;
+    unsubscribe: () => void;
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -57,6 +89,10 @@ type MethodHandler = {
 
 export class HostService extends Service {
     private server: Server;
+    private wss: WebSocketServer;
+    /** 活跃事件流客户端——广播（心跳）与收口都从这里走。 */
+    private streams = new Map<WebSocket, StreamClient>();
+    private heartbeat: NodeJS.Timeout | null = null;
     private endpointUrl: string | null = null;
     private readyPromise: Promise<void>;
 
@@ -75,6 +111,27 @@ export class HostService extends Service {
         });
         this.server = server;
 
+        // F2 事件流：同一 server 的 upgrade 通道，路径只认 /api/stream——
+        // 其余 upgrade 一律 destroy（loopback 也不给陌生协议开口子）
+        const wss = new WebSocketServer({ noServer: true });
+        this.wss = wss;
+        server.on("upgrade", (req, socket, head) => {
+            const url = new URL(req.url ?? "/", "http://127.0.0.1");
+            if (url.pathname !== "/api/stream") {
+                socket.destroy();
+                return;
+            }
+            wss.handleUpgrade(req, socket, head, (ws) => this.attachStream(ws));
+        });
+
+        const heartbeatMs = config.heartbeatMs ?? parseHeartbeat(process.env.MINI_WEB_HEARTBEAT_MS) ?? 30_000;
+        if (heartbeatMs > 0) {
+            // 单 interval 广播而不是每连接一个——多客户端共享同一心跳源；
+            // unref：心跳不该是进程存活的理由（server socket 才是）
+            this.heartbeat = setInterval(() => this.broadcastHeartbeat(), heartbeatMs);
+            this.heartbeat.unref();
+        }
+
         const port = config.port ?? parsePort(process.env.MINI_WEB_PORT) ?? 3080;
         // listen 是异步的——endpoint（含 port 0 的真实端口）在绑定回调才可知，
         // ready 供调用方等就绪（cli --web 与测试的端口发现都走它）
@@ -90,10 +147,7 @@ export class HostService extends Service {
         server.on("error", (err) => this.ui.error(`[host] ${err.message}`));
         // 卸载即收口（cordis effect：dispose 时执行）——keep-alive 连接一并断，
         // 否则测试/one-shot 结束后事件循环被悬挂连接吊住
-        ctx.effect(() => () => {
-            server.close();
-            server.closeAllConnections();
-        });
+        ctx.effect(() => () => this.disposeServer());
     }
 
     /** CLI 侧句柄用：--web 打印端口、测试发现随机端口。 */
@@ -110,9 +164,99 @@ export class HostService extends Service {
      *  server.close 幂等，两处都调安全。keep-alive 连接一并断，否则测试
      *  进程的 fetch 连接会吊住事件循环。 */
     shutdown(): void {
+        this.disposeServer();
+        this.endpointUrl = null;
+    }
+
+    private disposeServer(): void {
+        if (this.heartbeat) {
+            clearInterval(this.heartbeat);
+            this.heartbeat = null;
+        }
+        for (const ws of this.streams.keys()) ws.terminate();
+        this.streams.clear();
+        this.wss.close();
         this.server.close();
         this.server.closeAllConnections();
-        this.endpointUrl = null;
+    }
+
+    // ── F2：/api/stream 事件流 ────────────────────────────────────────────
+
+    /** follow-first（dsh follow 流同款次序）：先挂 live 管道、再拍历史快照。
+     *  mini 两条路都同步、窗口为零，但 F6 回放改成异步读盘后这个次序就是
+     *  唯一防线——订阅之前的增量落在缓冲里，baseline 之后按 seq 去重补发。 */
+    private attachStream(ws: WebSocket): void {
+        const log = this.ctx.require<SessionLog>("session-log");
+        const client: StreamClient = { lastSent: -1, pending: [], unsubscribe: () => {} };
+        client.unsubscribe = log.onAppend((evt) => {
+            // append 先调监听器后 push（C8 时序）——此刻 log.length 即本事件的 seq
+            client.pending.push({ seq: log.events.length, event: evt });
+            this.flushStream(ws, client);
+        });
+        this.streams.set(ws, client);
+
+        const all = log.events;
+        const snapshot = all.map((event, seq) => ({ seq, event }));
+        client.lastSent = all.length - 1;
+        this.sendFrame(ws, { type: "baseline", lastSeq: client.lastSent, events: snapshot });
+        this.flushStream(ws, client);
+
+        ws.on("message", (data) => this.onStreamFrame(ws, client, String(data)));
+        ws.on("close", () => {
+            client.unsubscribe();
+            this.streams.delete(ws);
+        });
+        ws.on("error", () => ws.terminate());
+    }
+
+    /** 把 pending 里快照/上次发送未覆盖的增量按序补发。ws 未 OPEN 时缓冲
+     *  保留不丢（重开由握手后 baseline 兜底，这里不猜）。 */
+    private flushStream(ws: WebSocket, client: StreamClient): void {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        for (const entry of client.pending) {
+            if (entry.seq <= client.lastSent) continue;
+            this.sendFrame(ws, { type: "event", seq: entry.seq, event: entry.event });
+            client.lastSent = entry.seq;
+        }
+        client.pending = client.pending.filter((e) => e.seq > client.lastSent);
+    }
+
+    /** 客户端帧：目前只认 resume(since)——回放 (since, now] 做尾页补洞。
+     *  回放与 live 管道并发时由 lastSent/seq 去重兜住不重不漏。 */
+    private onStreamFrame(ws: WebSocket, client: StreamClient, raw: string): void {
+        let msg: any;
+        try {
+            msg = JSON.parse(raw);
+        } catch {
+            return this.sendFrame(ws, { type: "error", error: "frame is not valid JSON" });
+        }
+        if (msg?.type !== "resume") {
+            return this.sendFrame(ws, { type: "error", error: `unknown frame type: ${String(msg?.type)}` });
+        }
+        const since = Number(msg.since);
+        if (!Number.isInteger(since) || since < -1) {
+            return this.sendFrame(ws, { type: "error", error: `resume requires integer since >= -1, got ${msg.since}` });
+        }
+        const log = this.ctx.require<SessionLog>("session-log");
+        const all = log.events;
+        for (let seq = since + 1; seq < all.length; seq++) {
+            this.sendFrame(ws, { type: "event", seq, event: all[seq] });
+        }
+        client.lastSent = Math.max(client.lastSent, all.length - 1);
+        client.pending = [];
+        this.sendFrame(ws, { type: "resumed", lastSeq: all.length - 1 });
+    }
+
+    private broadcastHeartbeat(): void {
+        if (this.streams.size === 0) return;
+        const lastSeq = this.ctx.require<SessionLog>("session-log").events.length - 1;
+        for (const ws of this.streams.keys()) {
+            this.sendFrame(ws, { type: "heartbeat", lastSeq });
+        }
+    }
+
+    private sendFrame(ws: WebSocket, frame: ServerStreamFrame): void {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
     }
 
     private get ui(): UiService {
@@ -215,6 +359,12 @@ function parsePort(raw: string | undefined): number | undefined {
     if (raw === undefined) return undefined;
     const n = Number(raw);
     return Number.isInteger(n) && n >= 0 && n <= 65535 ? n : undefined;
+}
+
+function parseHeartbeat(raw: string | undefined): number | undefined {
+    if (raw === undefined) return undefined;
+    const n = Number(raw);
+    return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
 function sendEnvelope(res: ServerResponse, status: number, body: unknown): void {
