@@ -5,6 +5,8 @@
     "moduleResolution": "NodeNext",
     "outDir": "./dist",
     "rootDir": "./",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -15,6 +17,8 @@
     "cordis/**/*.ts",
     "cordis-tests/**/*.ts",
     "services/**/*.ts",
-    "plugins/**/*.ts"
+    "plugins/**/*.ts",
+    "webui/**/*.ts",
+    "webui/**/*.tsx"
   ]
 }

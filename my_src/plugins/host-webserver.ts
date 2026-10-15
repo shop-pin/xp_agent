@@ -22,6 +22,7 @@
 // 静态目录做前缀守卫防路径穿越；请求体 1MB 上限；upgrade 只认 /api/stream。
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "http";
+import { fileURLToPath } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { existsSync, readFileSync, statSync } from "fs";
 import { extname, join, resolve, sep } from "path";
@@ -69,6 +70,11 @@ interface StreamClient {
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
+
+/** SPA dist 缺省位（F3 起静态面的第三优先级）：config.staticDir > env
+ *  MINI_WEB_STATIC > 编译产物相对的 webui/dist。后者让 `--web` 开箱即服务
+ *  SPA——相对本模块（dist/plugins/）上溯两级到包根。 */
+const DEFAULT_WEBUI_DIST = fileURLToPath(new URL("../../webui/dist", import.meta.url));
 const CONTENT_TYPES: Record<string, string> = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -330,10 +336,10 @@ export class HostService extends Service {
     }
 
     private serveStatic(url: URL, res: ServerResponse): void {
-        const root = this.config.staticDir ?? process.env.MINI_WEB_STATIC;
-        if (!root || !existsSync(root)) {
+        const root = this.config.staticDir ?? process.env.MINI_WEB_STATIC ?? DEFAULT_WEBUI_DIST;
+        if (!existsSync(root)) {
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-            res.end("static dir not configured (set staticDir or MINI_WEB_STATIC)");
+            res.end("static dir not found (set staticDir, MINI_WEB_STATIC, or build webui: npm run webui)");
             return;
         }
         const pathname = decodeURIComponent(url.pathname);

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mini dsh</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+        background: #101418;
+        color: #d7dde3;
+      }
+      .mono { font-family: ui-monospace, Consolas, monospace; }
+      .muted { color: #77828c; }
+      .app { display: grid; grid-template: "header header" auto "sidebar main" 1fr / 240px 1fr; height: 100vh; }
+      header {
+        grid-area: header; display: flex; align-items: center; gap: 10px;
+        padding: 10px 16px; border-bottom: 1px solid #232a31;
+      }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #566; }
+      .dot[data-phase="live"] { background: #43c463; }
+      .dot[data-phase="connecting"], .dot[data-phase="reconnecting"] { background: #e0a63a; }
+      .dot[data-phase="idle"] { background: #667; }
+      .title { font-weight: 600; }
+      aside { grid-area: sidebar; padding: 16px; border-right: 1px solid #232a31; }
+      aside h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #8b96a0; }
+      .session-card { padding: 10px 12px; border: 1px solid #2a333c; border-radius: 8px; background: #161c22; }
+      .toolbar { display: flex; gap: 8px; margin-top: 12px; }
+      button {
+        padding: 6px 12px; border: 1px solid #2f3944; border-radius: 6px;
+        background: #1b232b; color: #d7dde3; cursor: pointer;
+      }
+      button:hover { background: #232d37; }
+      main { grid-area: main; display: flex; flex-direction: column; }
+      .conversation-empty { flex: 1; display: grid; place-content: center; text-align: center; }
+      .composer { padding: 12px 16px; border-top: 1px solid #232a31; }
+      .composer input {
+        width: 100%; padding: 9px 12px; border-radius: 8px;
+        border: 1px solid #2a333c; background: #161c22; color: #d7dde3;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
