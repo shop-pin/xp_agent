@@ -201,7 +201,9 @@ export function startMock({ scenario, logPath, capturePath } = {}) {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const port = server.address().port;
-      resolve({ url: `http://127.0.0.1:${port}`, port, close: () => new Promise((r) => server.close(r)) });
+      // closeAllConnections：SDK fetch 的 keep-alive 空闲连接不主动断，
+      // server.close 会等它们到天荒地老（进程内复用 mock 的测试会被吊死）
+      resolve({ url: `http://127.0.0.1:${port}`, port, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }) });
     });
   });
 }

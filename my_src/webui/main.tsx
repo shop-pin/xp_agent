@@ -45,6 +45,18 @@ async function boot(): Promise<void> {
         refreshSession: () => {
             void refreshSession();
         },
+        // F4 accepted 语义：accept 落地即挂 busy，结算看流（turn/end /
+        // prompt-error 界碑在 app-state 写集里解除）——HTTP 请求不等 turn
+        sendText: (text: string) => {
+            void (async () => {
+                store.actions.beginPrompt();
+                try {
+                    await conn.call("session.prompt", { text });
+                } catch (e) {
+                    store.actions.failPrompt(e instanceof Error ? e.message : String(e));
+                }
+            })();
+        },
     };
 
     createRoot(document.getElementById("root")!).render(<App store={store} actions={actions} />);

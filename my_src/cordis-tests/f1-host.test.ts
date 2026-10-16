@@ -22,6 +22,25 @@ async function api(method: 'POST' | 'GET', path: string, body?: unknown): Promis
     return { status: res.status, body: await res.json() }
 }
 
+// F4：accepted 语义——prompt 只保证已受理；测试要等结算就轮询到 turn/end
+// （正式客户端走流，拉取轮询是 F1 拉取期的脚手架用法）
+async function waitForSettle(): Promise<void> {
+    for (let i = 0; i < 400; i++) {
+        const e = await api('GET', '/api/session.events')
+        const events = e.body.value.events as Array<{ event: { type: string } }>
+        if (events.length > 0 && events[events.length - 1].event.type === 'turn/end') return
+        await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    throw new Error('turn never settled (no trailing turn/end)')
+}
+
+async function promptAndSettle(text: string): Promise<void> {
+    const p = await api('POST', '/api/session.prompt', { text })
+    assert.equal(p.body.ok, true)
+    assert.equal(p.body.value.accepted, true)
+    await waitForSettle()
+}
+
 beforeEach(async () => {
     sandbox = mkdtempSync(join(tmpdir(), 'f1-host-'))
     staticDir = join(sandbox, 'static')
@@ -60,10 +79,11 @@ test('session.create 幂等返回本树会话（id/busy/messageCount）', async 
     assert.equal(r2.body.value.id, r1.body.value.id)
 })
 
-test('session.prompt 跑完整 turn（echo 路由），事件流可见', async () => {
+test('session.prompt 受理即回（accepted），turn 结算走事件流', async () => {
     const p = await api('POST', '/api/session.prompt', { text: 'hello host' })
     assert.equal(p.body.ok, true)
-    assert.equal(p.body.value.settled, true)
+    assert.equal(p.body.value.accepted, true, 'accept should not block on the turn')
+    await waitForSettle()
 
     const e = await api('GET', '/api/session.events')
     assert.equal(e.body.ok, true)
@@ -73,10 +93,11 @@ test('session.prompt 跑完整 turn（echo 路由），事件流可见', async (
     const flat = JSON.stringify(events)
     assert.ok(flat.includes('hello host'), 'user message should be logged')
     assert.ok(flat.includes('[echo] hello host'), 'assistant reply should be logged')
+    assert.equal(events[events.length - 1].event.type, 'turn/end')
 })
 
 test('session.events?since= 只回增量', async () => {
-    await api('POST', '/api/session.prompt', { text: 'turn one' })
+    await promptAndSettle('turn one')
     const all = (await api('GET', '/api/session.events')).body.value.events
     assert.ok(all.length >= 4)
 
@@ -94,7 +115,7 @@ test('session.events?since= 只回增量', async () => {
 })
 
 test('session.list 返回单会话条目', async () => {
-    await api('POST', '/api/session.prompt', { text: 'list me' })
+    await promptAndSettle('list me')
     const l = await api('GET', '/api/session.list')
     assert.equal(l.body.ok, true)
     assert.equal(l.body.value.length, 1)

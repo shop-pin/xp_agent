@@ -9,8 +9,8 @@
 // 方法面：
 //   POST /api/session.create   幂等返回本树唯一会话（mini Host 单会话——
 //                              multi-session 的 SessionRegistry 记档不抄）
-//   POST /api/session.prompt   { text } → await agent.send（整 turn 结算才回；
-//                              F3 客户端有了事件流后换 accepted + 看流观察 settle）
+//   POST /api/session.prompt   { text } → { accepted: true }（F4：send 不
+//                              await；结算看流——turn/end / prompt-error 界碑）
 //   GET  /api/session.list
 //   GET  /api/session.events?since=<seq>   拉取版兜底（调试/F6 回放对照）
 //   WS   /api/stream           事件流：连上即 baseline（全量回填 + lastSeq），
@@ -278,12 +278,23 @@ export class HostService extends Service {
         };
     }
 
-    private async prompt(input: any): Promise<{ settled: boolean }> {
+    /** F4：accepted 语义（F1 记档的脚手架退役）——send 不 await，立即回
+     *  accepted；结算由客户端看流观察（turn/end 界碑）。非 abort 失败会从
+     *  send 直接抛出、不落 turn/end（runDriver 的 catch 只给 abort 补注记），
+     *  这里补 meta/note prompt-error 进日志：失败的 prompt 是会话事实，也是
+     *  客户端 busy 的第二个解除界碑（引擎外插件追加事件在 D5 有先例）。 */
+    private prompt(input: any): { accepted: boolean } {
         const text = typeof input?.text === "string" ? input.text.trim() : "";
         if (!text) throw new Error("session.prompt requires { text: string }");
         if (this.config.bridge.isBusy()) throw new Error("agent is busy — retry after the current turn settles");
-        await this.config.bridge.sendText(text);
-        return { settled: true };
+        void this.config.bridge.sendText(text).catch((e) => {
+            const message = String(e?.message ?? e);
+            this.ui.error(`[host] prompt failed: ${message}`);
+            this.ctx.require<SessionLog>("session-log").append({
+                type: "meta/note", key: "prompt-error", value: message,
+            });
+        });
+        return { accepted: true };
     }
 
     /** since = 已见过的最大 seq；返回 (since, now] 的事件。seq 是事件下标
