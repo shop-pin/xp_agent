@@ -11,7 +11,7 @@
 //   - 断线重连 = generation++ → 新代连接必得全量 baseline（F2 保证），
 //     本地状态被整体替换收敛——resume 只做代内带宽优化，不做跨代对账
 
-import type { ServerStreamFrame } from "../plugins/host-webserver.js";
+import type { ServerStreamFrame, ApprovalRequest } from "../plugins/host-webserver.js";
 
 /** 浏览器 WebSocket / node 'ws' 客户端的最小结构面（node:test 经 wsFactory 注入）。 */
 export interface WsLike {
@@ -28,13 +28,21 @@ export interface StreamStatus {
     generation: number;
 }
 
-/** connection 的状态出口：传输层把帧翻译成三个语义动作，落地由装配层定。 */
+/** connection 的状态出口：传输层把帧翻译成语义动作，落地由装配层定。
+ *  日志帧（baseline/event）与瞬态帧（narrative/approval）分道——后者不进
+ *  事件囤积，store 另有落点。 */
 export interface StreamSink {
     /** 新代连接的全量回填（整体替换，不做 merge）。 */
     setBaseline(events: Array<{ seq: number; event: unknown }>, lastSeq: number): void;
     /** live/补洞增量（调用方保证按 seq 顺序、无洞无重）。 */
     appendEvent(seq: number, event: unknown): void;
     setStatus(status: StreamStatus): void;
+    /** 叙事面旁白（瞬态，不回放）。 */
+    narrative(kind: "info" | "error" | "cost", text: string): void;
+    /** 待决交互卡到场（ask 现场推送 / baseline 后重宣告）。 */
+    announceApproval(request: ApprovalRequest): void;
+    /** 待决交互落定（任一来源：首个 decide / 超时 / 断线 fail-closed）。 */
+    resolveApproval(id: string, by: string): void;
 }
 
 export interface ConnectionOptions {
@@ -159,6 +167,15 @@ export class Connection {
             }
             case "resumed":
                 break; // 回放帧已按 event 逐条落地，界碑无状态
+            case "narrative":
+                this.sink.narrative(frame.kind, frame.text);
+                break;
+            case "approval":
+                this.sink.announceApproval(frame.request);
+                break;
+            case "approval-resolved":
+                this.sink.resolveApproval(frame.id, frame.by);
+                break;
             case "error":
                 console.warn(`[stream] server rejected a frame: ${frame.error}`);
                 break;

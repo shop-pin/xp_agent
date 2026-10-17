@@ -179,6 +179,10 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
             process.exitCode = 1;
             return;
         }
+        // F5：plan 审批的远程 answerer 接线（工具审批由 Host 插件自注册
+        // interactive provider）。与 REPL 分支的两条 readline 接线互为镜像——
+        // 三端同缝，入口层只决定"谁作答"。
+        agent.setPlanApprovalFn((planContent) => host.requestPlanApproval(planContent));
         await host.ready;
         process.once("SIGINT", () => {
             void agent.close().then(() => process.exit(0));

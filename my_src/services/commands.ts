@@ -49,6 +49,16 @@ export class CommandService extends Service {
         await cmd.run(args);
         return true;
     }
+
+    /** dispatch 会处理这个输入吗（同步可判定：查表不 run）。web Host 的
+     *  fire-and-forget 分发靠它先回 { handled }——run 的长驻（/goal /loop）
+     *  不能吊死一元 RPC。与 dispatch 的解析保持同一套切词规则。 */
+    handles(input: string): boolean {
+        if (!input.startsWith("/")) return false;
+        const spaceIdx = input.indexOf(" ");
+        const name = spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
+        return this.commands.has(name) || (this.skillResolver?.(name) ?? null) !== null;
+    }
 }
 
 declare module "../cordis/context.js" {

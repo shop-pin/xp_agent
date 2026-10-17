@@ -12,12 +12,19 @@ async function boot(): Promise<void> {
     const endpoint = location.origin;
     store.actions.setEndpoint(endpoint);
 
+    const narrateError = (e: unknown): void => {
+        store.actions.pushNarrative("error", e instanceof Error ? e.message : String(e));
+    };
+
     const conn = new Connection(
         { baseUrl: endpoint },
         {
             setBaseline: (events, lastSeq) => store.actions.setBaseline(events, lastSeq),
             appendEvent: (seq, event) => store.actions.appendEvent(seq, event),
             setStatus: ({ phase, generation }) => store.actions.setStreamPhase(phase, generation),
+            narrative: (kind, text) => store.actions.pushNarrative(kind, text),
+            announceApproval: (request) => store.actions.announceApproval(request),
+            resolveApproval: (id) => store.actions.resolveApproval(id),
         } satisfies StreamSink,
     );
     conn.connectStream();
@@ -57,10 +64,41 @@ async function boot(): Promise<void> {
                 }
             })();
         },
+        // F5：裁决回传 = 审批瀑布的远程 answerer 在客户端的半边。乐观摘卡
+        // （resolved 帧随后幂等兜底）；迟到作答（超时已 deny）的信封错误
+        // 落叙事面——用户看得见"为什么卡没了"。
+        decideApproval: (id, verdict) => {
+            store.actions.resolveApproval(id);
+            conn.call("approval.decide", { id, verdict }).catch(narrateError);
+        },
+        decidePlan: (id, choice, feedback) => {
+            store.actions.resolveApproval(id);
+            conn.call("plan.decide", { id, choice, feedback }).catch(narrateError);
+        },
+        // 终端同款分流：注册表（静态命令/技能）认领 → fire-and-forget 分发，
+        // 输出走叙事面帧；没人认 → 原文透传给模型。
+        dispatchCommand: (text: string) => {
+            void (async () => {
+                try {
+                    const r = await conn.call("commands.dispatch", { input: text });
+                    if (!r?.handled) actions.sendText(text);
+                } catch (e) {
+                    narrateError(e);
+                }
+            })();
+        },
     };
 
     createRoot(document.getElementById("root")!).render(<App store={store} actions={actions} />);
     void refreshSession();
+    void (async () => {
+        try {
+            const { commands } = await conn.call("commands.list");
+            store.actions.setCommands(commands);
+        } catch (e) {
+            console.warn("[commands.list]", e);
+        }
+    })();
 }
 
 void boot();

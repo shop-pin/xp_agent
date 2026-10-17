@@ -120,6 +120,23 @@ function storeSink(store: ReturnType<typeof webUiStore.create>): StreamSink {
         setBaseline: (events, lastSeq) => store.actions.setBaseline(events, lastSeq),
         appendEvent: (seq, event) => store.actions.appendEvent(seq, event),
         setStatus: ({ phase, generation }) => store.actions.setStreamPhase(phase as any, generation),
+        narrative: (kind, text) => store.actions.pushNarrative(kind, text),
+        announceApproval: (request) => store.actions.announceApproval(request),
+        resolveApproval: (id) => store.actions.resolveApproval(id),
+    }
+}
+
+/** F5 瞬态帧不落地时的哑出口（三个新语义动作各记一笔，测试可断言）。 */
+function recordingSink(): StreamSink & { seen: Array<[string, any]> } {
+    const seen: Array<[string, any]> = []
+    return {
+        seen,
+        setBaseline: () => {},
+        appendEvent: () => {},
+        setStatus: () => {},
+        narrative: (kind, text) => seen.push(['narrative', { kind, text }]),
+        announceApproval: (request) => seen.push(['approval', request]),
+        resolveApproval: (id, by) => seen.push(['approval-resolved', { id, by }]),
     }
 }
 
@@ -150,7 +167,7 @@ afterEach(async () => {
 })
 
 test('connection.call：信封 ok→value；业务失败与未知方法 → RpcError', async () => {
-    const conn = new Connection({ baseUrl: base }, { setBaseline: () => {}, appendEvent: () => {}, setStatus: () => {} })
+    const conn = new Connection({ baseUrl: base }, recordingSink())
     openConns.push(conn)
 
     const list = await conn.call('session.list')
@@ -268,6 +285,9 @@ test('合成帧：跳号触发 resume 补洞、重复 seq 丢弃、心跳揭示�
             setBaseline: (baseline) => events.push(...(baseline as any)),
             appendEvent: (seq, event) => events.push({ seq, event }),
             setStatus: () => {},
+            narrative: () => {},
+            announceApproval: () => {},
+            resolveApproval: () => {},
         },
     )
     conn.connectStream()

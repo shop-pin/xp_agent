@@ -10,14 +10,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStoreSelector } from "./renderer.js";
 import { assembleConversation } from "./conversation.js";
-import { ConversationView } from "./views.js";
+import { ConversationView, ApprovalCard } from "./views.js";
 import type { StoreInstance } from "./store.js";
-import type { WebUiState } from "./app-state.js";
+import type { WebUiState, PlanChoice } from "./app-state.js";
 
 export interface AppActions {
     createSession(): void;
     refreshSession(): void;
     sendText(text: string): void;
+    decideApproval(id: string, verdict: "allow-once" | "deny"): void;
+    decidePlan(id: string, choice: PlanChoice, feedback?: string): void;
+    dispatchCommand(text: string): void;
 }
 
 const selSession = (s: WebUiState) => s.session;
@@ -27,6 +30,9 @@ const selEvents = (s: WebUiState) => s.events;
 const selEndpoint = (s: WebUiState) => s.endpoint;
 const selPending = (s: WebUiState) => s.pendingPrompt;
 const selError = (s: WebUiState) => s.lastError;
+const selApproval = (s: WebUiState) => s.pendingApproval;
+const selNarrative = (s: WebUiState) => s.narrative;
+const selCommands = (s: WebUiState) => s.commands;
 
 export function App({ store, actions }: { store: StoreInstance<WebUiState, any>; actions: AppActions }) {
     const session = useStoreSelector(store, selSession);
@@ -36,6 +42,9 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
     const endpoint = useStoreSelector(store, selEndpoint);
     const pending = useStoreSelector(store, selPending);
     const lastError = useStoreSelector(store, selError);
+    const approval = useStoreSelector(store, selApproval);
+    const narrative = useStoreSelector(store, selNarrative);
+    const commands = useStoreSelector(store, selCommands);
 
     const nodes = useMemo(() => assembleConversation(events), [events]);
 
@@ -49,11 +58,28 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
         if (el) el.scrollTop = el.scrollHeight;
     }, [events.length]);
 
+    // "/" 补全：首词以斜杠开头时列候选（子串模糊命中，前缀命中排前——
+    // 与终端技能回退同一张表：静态命令 + 可调用技能）
+    const completing = draft.startsWith("/") && !draft.includes(" ");
+    const query = completing ? draft.slice(1).toLowerCase() : "";
+    const matches = useMemo(() => {
+        if (!completing) return [];
+        const scored = commands
+            .filter((c) => c.name.toLowerCase().includes(query))
+            .sort((a, b) => {
+                const ap = a.name.toLowerCase().startsWith(query) ? 0 : 1;
+                const bp = b.name.toLowerCase().startsWith(query) ? 0 : 1;
+                return ap - bp || a.name.localeCompare(b.name);
+            });
+        return scored.slice(0, 8);
+    }, [completing, query, commands]);
+
     const submit = (): void => {
         const text = draft.trim();
         if (!text || busy) return;
         setDraft("");
-        actions.sendText(text);
+        if (text.startsWith("/")) actions.dispatchCommand(text);
+        else actions.sendText(text);
     };
 
     return (
@@ -91,15 +117,48 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
                         <ConversationView nodes={nodes} />
                     )}
                 </div>
+                {narrative.length > 0 && (
+                    <div className="narrative-strip">
+                        {narrative.map((line) => (
+                            <div key={line.id} className="narrative-line" data-kind={line.kind}>{line.text}</div>
+                        ))}
+                    </div>
+                )}
                 {lastError && <div className="error-line composer-error">{lastError}</div>}
+                {approval && (
+                    <ApprovalCard
+                        request={approval}
+                        onDecide={(id, verdict) => actions.decideApproval(id, verdict)}
+                        onPlanDecide={(id, choice, feedback) => actions.decidePlan(id, choice, feedback)}
+                    />
+                )}
                 <div className="composer">
+                    {completing && matches.length > 0 && (
+                        <div className="completion">
+                            {matches.map((c) => (
+                                <button
+                                    key={`${c.kind}:${c.name}`}
+                                    className="completion-item"
+                                    onClick={() => setDraft(`/${c.name} `)}
+                                >
+                                    <span className="mono">/{c.name}</span>
+                                    <span className="muted">{c.description}</span>
+                                    <span className="completion-kind" data-kind={c.kind}>{c.kind}</span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
                     <input
                         value={draft}
                         disabled={!session || busy}
-                        placeholder={busy ? "turn 进行中…" : session ? "发消息（Enter 发送）" : "先连接会话"}
+                        placeholder={busy ? "turn 进行中…" : session ? "发消息（Enter 发送，/ 唤出命令）" : "先连接会话"}
                         onChange={(e) => setDraft(e.target.value)}
                         onKeyDown={(e) => {
                             if (e.key === "Enter") submit();
+                            else if (e.key === "Tab" && completing && matches.length > 0) {
+                                e.preventDefault();
+                                setDraft(`/${matches[0].name} `);
+                            }
                         }}
                     />
                     <button disabled={!session || busy} onClick={submit}>发送</button>
