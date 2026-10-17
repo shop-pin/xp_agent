@@ -10,6 +10,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStoreSelector } from "./renderer.js";
 import { assembleConversation } from "./conversation.js";
+import { projectSession } from "./projection.js";
 import { ConversationView, ApprovalCard } from "./views.js";
 import type { StoreInstance } from "./store.js";
 import type { WebUiState, PlanChoice } from "./app-state.js";
@@ -47,8 +48,13 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
     const commands = useStoreSelector(store, selCommands);
 
     const nodes = useMemo(() => assembleConversation(events), [events]);
+    // 侧栏投影：conversation 之后的第二个 fold——同一份 events，各折各的视图
+    const projection = useMemo(() => projectSession(events), [events]);
 
     const busy = (session?.busy ?? false) || pending;
+    // F5 已知限的兑现：goal/loop 活跃期服务器会拒 prompt（bridge.isBusy），
+    // 侧栏投影让这件事在 UI 可见——composer 与终端 REPL 同款锁死
+    const autonomyActive = projection.goal !== null || projection.loop !== null;
     const [draft, setDraft] = useState("");
 
     // 新事件落地滚到底部（增量渲染的观感线）
@@ -101,6 +107,28 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
                 ) : (
                     <div className="muted">尚未连接会话</div>
                 )}
+                <div className="projection">
+                    <h2>投影 <span className="muted">seq {projection.lastSeq}</span></h2>
+                    <div className="projection-row">
+                        <span className="mono">{projection.mode ?? "default"}</span>
+                        <span className="muted">{projection.turns} turns · {projection.compactions} 次压缩</span>
+                    </div>
+                    <div className="projection-row muted">
+                        in {projection.tokens.input} · out {projection.tokens.output}
+                        {projection.tokens.cacheRead > 0 ? ` · cache ${projection.tokens.cacheRead}` : ""}
+                        {` · ~$${projection.costUsd.toFixed(4)}`}
+                    </div>
+                    <div className="projection-row" data-active={projection.goal !== null}>
+                        {projection.goal
+                            ? <>◎ {projection.goal.condition}{projection.goal.iterations > 0 ? `（第 ${projection.goal.iterations} 次评估未达）` : ""}</>
+                            : <span className="muted">goal：无</span>}
+                    </div>
+                    <div className="projection-row" data-active={projection.loop !== null}>
+                        {projection.loop
+                            ? <>⟳ loop {projection.loop.mode === "dynamic" ? "dynamic" : `${projection.loop.intervalSeconds}s`}</>
+                            : <span className="muted">loop：无</span>}
+                    </div>
+                </div>
                 <div className="toolbar">
                     <button onClick={() => actions.createSession()}>新会话</button>
                     <button onClick={() => actions.refreshSession()}>刷新</button>
@@ -150,8 +178,13 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
                     )}
                     <input
                         value={draft}
-                        disabled={!session || busy}
-                        placeholder={busy ? "turn 进行中…" : session ? "发消息（Enter 发送，/ 唤出命令）" : "先连接会话"}
+                        disabled={!session || busy || autonomyActive}
+                        placeholder={
+                            autonomyActive ? "goal/loop 进行中…"
+                            : busy ? "turn 进行中…"
+                            : session ? "发消息（Enter 发送，/ 唤出命令）"
+                            : "先连接会话"
+                        }
                         onChange={(e) => setDraft(e.target.value)}
                         onKeyDown={(e) => {
                             if (e.key === "Enter") submit();
@@ -161,7 +194,7 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
                             }
                         }}
                     />
-                    <button disabled={!session || busy} onClick={submit}>发送</button>
+                    <button disabled={!session || busy || autonomyActive} onClick={submit}>发送</button>
                 </div>
             </main>
         </div>

@@ -88,6 +88,12 @@ export class LoopService extends Service {
     start(spec: LoopSpec): Promise<void> {
         this.stopFlag = false;
         this.ctx.get<ScheduleService>("schedule")?.cancel("loop-tick");
+        // F6：loop 状态入日志（与 goal 同律）——web 投影/resume 可考
+        this.ctx.get<SessionLog>("session-log")?.append({
+            type: "meta/note",
+            key: "loop",
+            value: { mode: spec.mode, intervalSeconds: spec.intervalSeconds, prompt: spec.prompt },
+        });
         return new Promise((resolve) => {
             this.state = { spec, iterations: 1, prompt: spec.prompt, done: resolve };
         });
@@ -115,6 +121,9 @@ export class LoopService extends Service {
         const schedule = this.ctx.get<ScheduleService>("schedule");
         schedule?.cancel("loop-tick");
         schedule?.clearWakeup();
+        if (this.state) {
+            this.ctx.get<SessionLog>("session-log")?.append({ type: "meta/note", key: "loop", value: null });
+        }
         this.state?.done?.();
         this.state = null;
     }
@@ -223,6 +232,13 @@ export const autonomyPlugin = {
             // 未达：记录并决定是否还允许下一轮
             g.iterations++;
             g.lastReason = verdict.reason;
+            // F6：评估进度入日志（goal set/clear 已在 GoalService 落注记——
+            // 进度是同一事实链的延续；web 投影侧栏的 live 数据源）
+            ctx.get<SessionLog>("session-log")?.append({
+                type: "meta/note",
+                key: "goal-progress",
+                value: { iterations: g.iterations, lastReason: verdict.reason },
+            });
             ui.info(`Hooks: Prompt hook condition was not met: ${verdict.reason}`);
 
             const budget = bridge.getBudget();

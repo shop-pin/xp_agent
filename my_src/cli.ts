@@ -183,6 +183,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         // interactive provider）。与 REPL 分支的两条 readline 接线互为镜像——
         // 三端同缝，入口层只决定"谁作答"。
         agent.setPlanApprovalFn((planContent) => host.requestPlanApproval(planContent));
+        // F6：--web --resume——JSONL 重放进 Host 的日志，浏览器 baseline 即
+        // 全量历史（投影/装配照常工作：重启 Host 后打开旧会话=回放重现）
+        if (resume) {
+            const sessionId = getLatestSessionId();
+            if (sessionId) {
+                if (!agent.resume(sessionId)) printInfo("No session found to resume.");
+            } else {
+                printInfo("No previous sessions found.");
+            }
+        }
         await host.ready;
         process.once("SIGINT", () => {
             void agent.close().then(() => process.exit(0));

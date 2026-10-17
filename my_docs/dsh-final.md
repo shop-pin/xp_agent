@@ -101,3 +101,34 @@
 三轮学习（ch1–15 复现 → ch16–26 进阶 → dsh 24 章重构）的最终形态：**同一个 mini agent，三次架构**——if 链脚本 → 模块化单文件（`agent.ts` 1095 行，仍是 bootstrap+宿主）→ mini-cordis 插件树（框架 800 行与业务解耦，agent.ts 收缩为 bootstrap）。dsh 课程的核心兑现："换 provider 即换产品"不再是口号——`cordis.config.ts` 一份清单、两条 profile、一个 `--patch`，同一份代码装出全功能与无 auto-mode 两个 agent（场景 33 的裁决路径差是行为证据）。
 
 遗留（不阻塞收官）：E1 REPL 手测清单待终端过一遍；快照首跑 flaky 记档在案；思考题回补按队列并入后续。
+
+## 6. F 阶段（web UI）收官增补（2026-10-17）
+
+F1–F6 交付了 mini 的第三张脸：**引擎一行语义不改，Host/Client 都是清单上的行与新顶层目录**——`--web` 起 HTTP 面（127.0.0.1、一元信封 + WS 流），浏览器拿到与终端同缝的会话（装配/审批/命令/plan/投影），`--profile web` 成为与 full/no-auto 并列的第三种产品形态。章文档：`dsh-F1.md`…`dsh-F6.md`（总纲 `dsh-00-ui-plan.md`）。
+
+### 6.1 UI 层差异清单（vs `packages/client` + `packages/host` + `packages/interaction`）
+
+| 机制 | 真 dsh | mini | 裁决 |
+|---|---|---|---|
+| 投影面 | server fold（session-projection）+ `session.projections` RPC + control stream baseline | 客户端第二 fold（webui/projection.ts）；baseline 即快照、live 即增量 | 不抄——mini 的 Host 是哑管道、journal 单流（F6 决策 1） |
+| 交互跨端 | Agent-scoped Remote 瀑布转发 + `$on` 接管 | ApprovalService 换 interactive provider（Host 构造期自注册） | 语义同构：**只换 answerer 不换瀑布**；fail-closed 三连 + 裁决事实落日志为 mini 补充 |
+| 审批通道 | journal / control 双流分离 | 单 WS 三类帧（journal 事件 / approval 瞬态 / narrative 旁白） | 简化——帧类型即语义分层，seq 连续性只对 journal 帧（F5 rebaseline 是这条红线的执法者） |
+| 客户端模块 | 50 个 ui-* 包 + boot graph 懒加载 | webui 七文件 + 五 feature（conversation/tool/approval/commands/plan） | 记档裁剪（ui-plan §4） |
+| 状态推导位置 | 消费层拿语义更新 | 消费层 fold 原始日志 | 有意差异——"UI 是日志的投影"在客户端走到底 |
+| 叙事面 | surfaceOp 全面事件化（可回放） | narrative 瞬态帧（不回放） | 已知差距记档（F5 决策 5） |
+
+### 6.2 终态数字（2026-10-17 增补）
+
+cordis **188/188**（22 测试文件）；mock **28 场景**全绿；snapshot **28/28**（F5/F6 重录 ch7/ch15/ch24：goal-progress/loop 注记进事件流锚；ch8 偶发红观察中）；vite build 245.9KB / gzip 77.6KB。`--profile web` 冒烟手测清单在 `dsh-F6.md` §3。
+
+### 6.3 导读地图增补（F 阶段读过的 dsh 面）
+
+| dsh 包/文档 | 对应 mini | 章 |
+|---|---|---|
+| `docs/subsystems/web-client.md`（分层红线） | webui/ 全目录的 import 图 | F3 |
+| `packages/client/{store,connection,ui-renderer,ui-slots}` | `webui/{store,connection,renderer,slots}.ts` | F3 |
+| `packages/client/ui-conversation` + `ui-tool` | `webui/{conversation,views}.ts` | F4 |
+| `packages/interaction/{user-approval,commands}` + `ui-approval/ui-plan` | Host 审批面 + `webui/views.tsx` ApprovalCard + `services/commands.ts` | F5 |
+| `packages/host/` + `packages/api/`（一元调用 + webserver + remote.mux） | `plugins/host-webserver.ts` | F1/F2/F5 |
+
+`packages/client` 的 feature 包内部（ui-chat 等 50 包的实现细节）仍留第二轮——mini 五 feature 的粒度已够教学对照。

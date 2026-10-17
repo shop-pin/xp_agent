@@ -21,6 +21,7 @@
 {"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_2_0","content":"   1 | gamma"}]}
 {"type":"turn/start"}
 {"type":"assistant/message","content":[{"type":"text","text":"All three read: alpha, beta, gamma."}],"usage":{"input":100000,"output":500,"cacheRead":0,"cacheCreation":0}}
+{"type":"meta/note","key":"goal-progress","value":{"iterations":1,"lastReason":"the files have not been read yet."}}
 {"type":"turn/end","reason":"end-turn"}
 {"type":"user/message","content":"Hooks: Prompt hook condition was not met: the files have not been read yet.\n\nKeep working toward the goal."}
 {"type":"history/truncate","reason":"compact"}

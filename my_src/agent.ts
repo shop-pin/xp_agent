@@ -435,8 +435,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if (activated) activateTools(activated);
         const goal = this.cordis.get<GoalService>("goal");
         if (goal) {
+            // 幂等守卫：clear() 会落 goal:null 注记——无 goal 的会话不该在
+            // resume 时多出一条假事件（F6 流对比照出的老疣；注记不落盘，
+            // 只污染 in-memory 流/baseline）
             if (goalCondition) goal.set(goalCondition);
-            else goal.clear();
+            else if (goal.active) goal.clear();
         }
         this.ui.info(`Session restored (${this.sessionLog.derive().messages.length} messages).`);
         return true;
