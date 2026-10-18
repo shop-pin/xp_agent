@@ -1510,6 +1510,44 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "36": {
+    // S4：/news-brief 技能全链——product 技能激活 → get_watchlist（无清单
+    // 引导路径）→ latest_news（token 预算锚：30 条池 limit=15 生效，工具
+    // 输出长度有上限）。extraRows 最小装配：skills 行带 productSkills +
+    // news 行 MockNewsSource（30 条），market 保持 disabled 零网络。
+    needsLog: true,
+    setup: () => {},
+    runs: [{ newsBriefProbe: true }],
+    turns: [
+      { tools: [{ name: "skill", input: { skill_name: "news-brief", args: "" } }] },
+      { tools: [{ name: "get_watchlist", input: {} }] },
+      { tools: [{ name: "latest_news", input: { limit: 15 } }] },
+      { text: "news brief delivered." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("four main requests (skill -> watchlist -> news -> answer)", reqs.length === 4);
+      check("catalog lists the product skill (/news-brief)",
+        typeof reqs[0]?.firstUserText === "string" && reqs[0].firstUserText.includes("- **/news-brief**:"));
+      check("skill tool activates the news-brief template",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes('[Skill "news-brief" activated]')
+          && t.content.includes("limit 不超过 15")));
+      check("empty watchlist returns creation guidance (skill 走全流要闻分支)",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("No watchlist yet")));
+      // token 预算锚：30 条池只回 15 行，输出总长有硬上限。
+      // 锚用 latest_news 独有的头行（"快讯 N 条（内存"）——技能模板正文里
+      // 也出现"快讯"二字，泛锚会找错 tool_result
+      const news = (reqs[3]?.toolResults || []).find((t) => /快讯 \d+ 条（内存/.test(t.content));
+      check("token budget: limit honored (30-item pool yields exactly 15 rows)",
+        !!news && (news.content.match(/\[\d{2}:\d{2}\]/g) || []).length === 15);
+      check("token budget: tool output length capped (< 4000 chars)",
+        !!news && news.content.length < 4000);
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1819,6 +1857,37 @@ if (s.runs) {
           extraRows: [{ id: "news", name: "news-feed", config: { source: mockNews } }],
         });
         await agent.chat("Check the latest news about lithium.");
+        if (agent.close) await agent.close();
+      } else if (r.newsBriefProbe !== undefined) {
+        // S4：/news-brief 探针——最小装配（skills 行 productSkills + news 行
+        // 30 条 MockNewsSource；market disabled 零网络）。token 预算锚在
+        // 场景断言里：limit 生效 + 输出长度上限。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const pool = [];
+        for (let i = 0; i < 30; i++) {
+          pool.push({
+            id: `m${29 - i}`,
+            time: Date.UTC(2026, 9, 18, 7, i, 0),
+            text: `第${29 - i}号快讯：` + "市场消息正文样例。".repeat(4),
+            tags: i === 0 ? ["锂", "宁德时代"] : [],
+            codes: i === 0 ? ["sz300750"] : [],
+          });
+        }
+        const mockNews = { async fetchLatest() { return pool; } };
+        // get_watchlist 在 market-data 插件里——技能的空参分支要读清单，
+        // 所以 market 行也得挂（34 场景同款 mock 源，零网络）
+        const mockMarket = {
+          async fetchMarketSnapshot() { return []; },
+          async fetchQuotes(codes) { return []; },
+        };
+        const agent = new agentMod.Agent({
+          extraRows: [
+            { id: "skills", name: "skills-registry", config: { productSkills: true } },
+            { id: "market", name: "market-data", config: { source: mockMarket } },
+            { id: "news", name: "news-feed", config: { source: mockNews } },
+          ],
+        });
+        await agent.chat("Invoke the news-brief skill with no args.");
         if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);

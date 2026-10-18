@@ -10,14 +10,14 @@
 //     关联显示名（"石油"/"微软"……中英文话题都进，query 匹配面更宽）
 //   - 新闻 7x24 流动（美股/期货夜间也在跑）——不做交易时段 gating，
 //     间隔可配（默认 60s）；夜间降频留给配置，不做代码分支
-//   - JSONL 只增不删（rotation 记档为 deferred）；启动读尾部 ~2000 行重建
-//     去重集与内存环，文件无界增长到 S4 再处理
+//   - JSONL 追加 + 超限折叠（默认 2MB 保半重写，S4 收口）；启动读尾部
+//     ~2000 行重建去重集与内存环
 
 import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
 import type { ToolsService } from "../services/tools.js";
-import { existsSync, mkdirSync, readFileSync, appendFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -138,6 +138,8 @@ export interface NewsConfig {
     pollIntervalMs?: number;
     /** 内存环容量（默认 500 条；超出丢最旧）。 */
     keepInMemory?: number;
+    /** 落盘折叠阈值字节（默认 2MB；超出保半重写——均摊 O(1)，S4 收口 S3 的 deferred）。 */
+    maxStorageBytes?: number;
     /** 消息源注入（测试用 MockNewsSource）。 */
     source?: NewsSource;
     /** 存储路径注入（测试用临时文件）。 */
@@ -148,6 +150,7 @@ export class NewsFeedService extends Service {
     private source: NewsSource;
     private pollIntervalMs: number;
     private keepInMemory: number;
+    private maxStorageBytes: number;
     private storagePath: string;
     private timer: NodeJS.Timeout | null = null;
     private inFlight: Promise<void> | null = null;
@@ -163,6 +166,7 @@ export class NewsFeedService extends Service {
         this.source = config.source ?? sinaZhiboSource;
         this.pollIntervalMs = config.pollIntervalMs ?? 60_000;
         this.keepInMemory = config.keepInMemory ?? 500;
+        this.maxStorageBytes = config.maxStorageBytes ?? 2 * 1024 * 1024;
         this.storagePath = config.storagePath ?? newsStoragePath();
         this.loadFromDisk();
     }
@@ -216,7 +220,19 @@ export class NewsFeedService extends Service {
         try {
             mkdirSync(dirname(this.storagePath), { recursive: true });
             appendFileSync(this.storagePath, items.map((it) => JSON.stringify(it)).join("\n") + "\n");
+            this.maybeCompact();
         } catch { /* 落盘失败不炸轮询——内存环仍在 */ }
+    }
+
+    /** 折叠：超过 maxStorageBytes 就保半重写（丢最旧一半）。均摊成本 O(1)——
+     *  折半而不是截到固定条数，避免"每次追加都触发重写"的抖动带。 */
+    private maybeCompact(): void {
+        try {
+            if (statSync(this.storagePath).size < this.maxStorageBytes) return;
+            const lines = readFileSync(this.storagePath, "utf-8").split("\n").filter(Boolean);
+            const keep = lines.slice(Math.floor(lines.length / 2));
+            writeFileSync(this.storagePath, keep.join("\n") + (keep.length > 0 ? "\n" : ""));
+        } catch { /* 折叠失败不影响主流程——下轮追加再试 */ }
     }
 
     /** 启动回读：尾部 ~2000 行重建去重集与内存环（老→新读入后翻新→旧）。 */
