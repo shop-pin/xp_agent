@@ -47,6 +47,7 @@ import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin } from "./plugins/autonomy.js";
 import { marketDataPlugin } from "./plugins/market-data.js";
 import { newsFeedPlugin } from "./plugins/news-feed.js";
+import { signalEnginePlugin } from "./plugins/signal-engine.js";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -75,6 +76,7 @@ export const plugins: Record<string, Plugin> = {
     "host-webserver": hostWebserverPlugin,
     "market-data": marketDataPlugin,
     "news-feed": newsFeedPlugin,
+    "signal-engine": signalEnginePlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -119,6 +121,8 @@ export const baseRows: Row[] = [
     { id: "market", name: "market-data", disabled: true },
     // S3：消息面——同上
     { id: "news", name: "news-feed", disabled: true },
+    // S5：信号引擎——同上（依赖 market 行，行序在后即依赖就绪）
+    { id: "signals", name: "signal-engine", disabled: true },
 ]
 
 /**
@@ -227,10 +231,12 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
         { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
         { id: "market", name: "market-data" },
         { id: "news", name: "news-feed" },
+        { id: "signals", name: "signal-engine" },
     ] : [
         { id: "skills", name: "skills-registry", config: { productSkills: true } },
         { id: "market", name: "market-data" },
         { id: "news", name: "news-feed" },
+        { id: "signals", name: "signal-engine" },
     ],
 }
 

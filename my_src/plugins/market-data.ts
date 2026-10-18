@@ -345,6 +345,14 @@ export interface Snapshot {
     byCode: Map<string, Quote>;
 }
 
+/** 环形缓冲的一轮：每码三值（S5 起——量类指标要口粮）。
+ *  p=价格 v=当日累计成交量(手) a=当日累计成交额(元)——后两者是累计量，
+ *  差分出区间量。 */
+export interface HistoryRound {
+    at: number;
+    rows: Map<string, { p: number; v: number; a: number }>;
+}
+
 export interface MarketConfig {
     /** 交易时段轮询间隔 ms（默认 5,000）。 */
     pollIntervalMs?: number;
@@ -372,8 +380,8 @@ export class MarketDataService extends Service {
     private inFlight: Promise<Snapshot> | null = null;
 
     latest: Snapshot | null = null;
-    /** 最近 N 轮价格序列（环形，S5 信号引擎的口粮）。 */
-    history: { at: number; prices: Map<string, number> }[] = [];
+    /** 最近 N 轮序列（环形，S5 信号引擎的口粮：价格+量+额）。 */
+    history: HistoryRound[] = [];
     /** 测试可见：全市场刷新计数。 */
     refreshCount = 0;
 
@@ -402,20 +410,27 @@ export class MarketDataService extends Service {
         this.timer = null;
     }
 
-    /** 全市场刷新（并发去重：进行中就等同一趟）。 */
+    /** 全市场刷新（并发去重：进行中就等同一趟）。完成时同步广播
+     *  market/snapshot——S5 信号引擎等消费者在此挂评估。 */
     async refresh(): Promise<Snapshot> {
         if (this.inFlight) return this.inFlight;
         this.inFlight = (async () => {
             const quotes = await this.source.fetchMarketSnapshot();
-            const snap: Snapshot = { at: Date.now(), quotes, byCode: new Map(quotes.map((q) => [q.code, q])) };
+            // at 走注入时钟（测试/场景确定性）；缺省=真钟表
+            const snap: Snapshot = { at: this.now().getTime(), quotes, byCode: new Map(quotes.map((q) => [q.code, q])) };
             this.latest = snap;
-            this.history.push({ at: snap.at, prices: new Map(quotes.map((q) => [q.code, q.price])) });
+            this.history.push({
+                at: snap.at,
+                rows: new Map(quotes.map((q) => [q.code, { p: q.price, v: q.volume, a: q.amount }])),
+            });
             while (this.history.length > this.historyRounds) this.history.shift();
             this.refreshCount++;
             return snap;
         })();
         try {
-            return await this.inFlight;
+            const snap = await this.inFlight;
+            this.ctx.emit("market/snapshot", snap);
+            return snap;
         } finally {
             this.inFlight = null;
         }
@@ -537,6 +552,13 @@ export class MarketDataService extends Service {
 declare module "../cordis/context.js" {
     interface Context {
         market?: MarketDataService;
+    }
+}
+
+declare module "../cordis/events.js" {
+    interface Events {
+        /** 每轮全市场快照落定（refresh 尾同步广播）——消费方：S5 信号引擎。 */
+        "market/snapshot"(snap: Snapshot): void;
     }
 }
 
