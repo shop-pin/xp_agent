@@ -1484,6 +1484,32 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "35": {
+    // S3：消息面——latest_news 工具（query 过滤 + 输出形态）。extraRows 单行
+    // 启用 news 插件并注入 MockNewsSource（不进 stock profile——market 行
+    // 保持 disabled，mock 进程零网络）。
+    needsLog: true,
+    setup: () => {},
+    runs: [{ newsProbe: true }],
+    turns: [
+      { tools: [{ name: "latest_news", input: { query: "锂" } }] },
+      { text: "news checked." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("two main requests (query -> answer)", reqs.length === 2);
+      check("latest_news filters by query and reports counts",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("快讯 2 条（内存 4 条")
+          && t.content.includes("锂价继续上涨")
+          && !t.content.includes("美联储")));
+      check("timeline rows carry time brackets and topic tags",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("［锂、宁德时代］")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1770,6 +1796,29 @@ if (s.runs) {
           extraRows: [{ id: "market", name: "market-data", config: { source: mockSource } }],
         });
         await agent.chat("Invoke the brief skill with no args.");
+        if (agent.close) await agent.close();
+      } else if (r.newsProbe !== undefined) {
+        // S3：消息面探针——extraRows 单行启用 news 插件 + MockNewsSource
+        // （字面量 4 条，其中 2 条带"锂"）。不走 stock profile：market 保持
+        // disabled，mock 进程零网络。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const item = (id, mins, text, tags, codes) => ({
+          id, time: Date.UTC(2026, 9, 18, 6, mins, 0), text, tags, codes,
+        });
+        const mockNews = {
+          async fetchLatest() {
+            return [
+              item("n4", 44, "碳酸锂期货主力合约涨超3%", ["锂"], []),
+              item("n3", 40, "锂价继续上涨 电池厂承压", ["锂", "宁德时代"], ["sz300750"]),
+              item("n2", 30, "美联储降息预期升温", ["美联储"], []),
+              item("n1", 20, "某公司发布年报", [], []),
+            ];
+          },
+        };
+        const agent = new agentMod.Agent({
+          extraRows: [{ id: "news", name: "news-feed", config: { source: mockNews } }],
+        });
+        await agent.chat("Check the latest news about lithium.");
         if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);

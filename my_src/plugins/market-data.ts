@@ -385,12 +385,14 @@ export class MarketDataService extends Service {
         this.now = config.now ?? (() => new Date());
     }
 
-    /** 启动轮询：立即拉一轮（休市也拉——收盘快照可用），此后只在交易时段刷。 */
+    /** 启动轮询：立即拉一轮（休市也拉——收盘快照可用），此后只在交易时段刷。
+     *  后台刷新失败只吞不炸（离线/接口改版时进程不死，下个 tick 再试）——
+     *  工具面的 ensureFresh 仍会抛，由调用侧给用户看到错误。 */
     start(): void {
         if (this.timer) return;
-        void this.refresh();
+        void this.refresh().catch(() => { });
         this.timer = setInterval(() => {
-            if (isPollingActive(marketPhase(this.now()))) void this.refresh();
+            if (isPollingActive(marketPhase(this.now()))) void this.refresh().catch(() => { });
         }, this.pollIntervalMs);
         this.timer.unref?.();
     }

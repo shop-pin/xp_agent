@@ -46,6 +46,7 @@ import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin } from "./plugins/autonomy.js";
 import { marketDataPlugin } from "./plugins/market-data.js";
+import { newsFeedPlugin } from "./plugins/news-feed.js";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -73,6 +74,7 @@ export const plugins: Record<string, Plugin> = {
     "autonomy": autonomyPlugin,
     "host-webserver": hostWebserverPlugin,
     "market-data": marketDataPlugin,
+    "news-feed": newsFeedPlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -115,6 +117,8 @@ export const baseRows: Row[] = [
     { id: "host", name: "host-webserver", disabled: true },
     // S1：行情数据面——默认关闭（base 产品无股票能力）；stock profile 启用
     { id: "market", name: "market-data", disabled: true },
+    // S3：消息面——同上
+    { id: "news", name: "news-feed", disabled: true },
 ]
 
 /**
@@ -222,9 +226,11 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     stock: (host) => host ? [
         { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
         { id: "market", name: "market-data" },
+        { id: "news", name: "news-feed" },
     ] : [
         { id: "skills", name: "skills-registry", config: { productSkills: true } },
         { id: "market", name: "market-data" },
+        { id: "news", name: "news-feed" },
     ],
 }
 
