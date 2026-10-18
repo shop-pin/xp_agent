@@ -1574,6 +1574,39 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "38": {
+    // S6：裁决技能全链——skills+market(两态)+signals+news 全 mock 装配。
+    // 真假摔用例：rapid-move 向上信号 × 减持利空新闻 → 契约要求 confidence
+    // 压低并点破矛盾（裁决质量本身是手测面；场景锚的是取数链与输入面）。
+    needsLog: true,
+    setup: () => {},
+    runs: [{ adjudicateProbe: true }],
+    turns: [
+      { tools: [{ name: "skill", input: { skill_name: "adjudicate", args: "" } }] },
+      { tools: [{ name: "get_signals", input: { live: true } }] },
+      { tools: [{ name: "latest_news", input: { codes: ["sh600000"], limit: 5 } }] },
+      { text: '{"verdicts":[{"code":"sh600000","action":"watch","confidence":0.25,"reasons":["放量上攻与减持公告矛盾"],"risks":["利空落地"]}]}\n\n裁决为研究输出，非投资建议。' },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("four main requests (skill -> signals -> news -> verdict)", reqs.length === 4);
+      check("catalog lists /adjudicate",
+        typeof reqs[0]?.firstUserText === "string" && reqs[0].firstUserText.includes("- **/adjudicate**:"));
+      check("skill activates the adjudicate template (contract rides in)",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes('[Skill "adjudicate" activated]')
+          && t.content.includes("只允许四值")));
+      check("get_signals(live) refreshes and returns the rapid-move shortlist",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("rapid-move")
+          && t.content.includes("sh600000")));
+      check("per-stock news pulled with codes filter (bearish fixture for the contradiction case)",
+        (reqs[3]?.toolResults || []).some((t) => t.content.includes("减持")
+          && t.content.includes("快讯 1 条")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1942,6 +1975,43 @@ if (s.runs) {
         });
         await new Promise((r) => setTimeout(r, 50)); // 等 start() 首轮（平静）落定
         await agent.chat("Check the live market signals.");
+        if (agent.close) await agent.close();
+      } else if (r.adjudicateProbe !== undefined) {
+        // S6：裁决探针——全 mock 装配（skills/market 两态/signals/news）。
+        // 新闻 fixture 刻意利空（减持）对冲向上信号：真假摔输入面。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const q = (code, name, price, chgPct) => ({
+          code, name, price, change: 0, changePercent: chgPct,
+          open: price, high: price, low: price, preClose: price / (1 + chgPct / 100),
+          volume: 1000, amount: price * 1000 * 100, turnoverRate: 1, volumeRatio: 0,
+          marketCap: 0, floatCap: 0, pb: 0,
+        });
+        const calm = [q("sh600000", "平平稳稳", 10, 1.0)];
+        const spike = [q("sh600000", "平平稳稳", 10.35, 4.5)];
+        let fetchCount = 0;
+        const src = {
+          async fetchMarketSnapshot() { fetchCount++; return fetchCount === 1 ? calm : spike; },
+          async fetchQuotes() { return []; },
+        };
+        const mockNews = {
+          async fetchLatest() {
+            return [
+              { id: "a1", time: Date.UTC(2026, 9, 19, 1, 50, 0), text: "平平稳稳：控股股东拟减持不超过2%股份", tags: ["平平稳稳"], codes: ["sh600000"] },
+              { id: "a2", time: Date.UTC(2026, 9, 19, 1, 40, 0), text: "某行业例行会议召开", tags: [], codes: [] },
+            ];
+          },
+        };
+        const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const agent = new agentMod.Agent({
+          extraRows: [
+            { id: "skills", name: "skills-registry", config: { productSkills: true } },
+            { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
+            { id: "signals", name: "signal-engine" },
+            { id: "news", name: "news-feed", config: { source: mockNews } },
+          ],
+        });
+        await new Promise((r) => setTimeout(r, 50));
+        await agent.chat("Invoke the adjudicate skill.");
         if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);
