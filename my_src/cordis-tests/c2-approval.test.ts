@@ -58,6 +58,16 @@ function buildTree(autoYes: boolean): Harness {
   ctx.plugin(coreMetaTools)
   ctx.plugin(approvalPlugin)
   ctx.plugin(autoApprovalPlugin)
+  // plan 收口按 permissionHint 裁决：真实树里 agent 工具由 subagent 插件注册
+  // （hint meta），本 harness 不挂整套 subagent（要 bridge/agents 服务）——
+  // 用同 hint 的桩 def 对齐"管线在真实树里看到的事实"
+  ctx.require<ToolsService>('tools').register({
+    name: 'agent',
+    description: 'stub',
+    parameters: { type: 'object', properties: {} },
+    permissionHint: 'meta',
+    execute: async () => '',
+  })
   const approval = ctx.require<ApprovalService>('approval')
   const providerCalls: string[] = []
   approval.setInteractiveProvider(async (_call, message) => {

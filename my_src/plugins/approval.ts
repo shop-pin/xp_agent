@@ -62,6 +62,11 @@ async function staticPipeline(ctx: Context, call: PreExecCall, next: () => PreEx
         if (call.name === "run_shell") {
             return { type: "deny", reason: "Shell commands blocked in plan mode" };
         }
+        // 只读契约收口：plan 下除 read（⑤放行）/meta（tool_search、plan 工具
+        // 本身等工作面）外一律拒——MCP 等未声明 hint 的写入面不能靠⑨兜底放行
+        if (call.def?.permissionHint !== "read" && call.def?.permissionHint !== "meta") {
+            return { type: "deny", reason: `Blocked in plan mode: ${call.name} (not a read tool)` };
+        }
     }
     // bypass 是用户明示的主权让渡：终局 allow，不受内层策略约束
     if (call.mode === "bypassPermissions") return { type: "allow" };

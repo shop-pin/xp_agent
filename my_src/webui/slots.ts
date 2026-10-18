@@ -16,7 +16,11 @@ export function addSlot(slot: string, entry: SlotEntry, mode: "single" | "list" 
     const entries = registry.get(slot) ?? [];
     const next = mode === "single" ? [...entries.filter((e) => e.id !== entry.id), entry] : [...entries, entry];
     registry.set(slot, next);
-    return () => registry.set(slot, entries);
+    // 按条目身份摘除——恢复"加入前快照"会连带抹掉后加入的条目
+    return () => {
+        const cur = registry.get(slot) ?? [];
+        registry.set(slot, cur.filter((e) => e !== entry));
+    };
 }
 
 export function slotEntries(slot: string): SlotEntry[] {

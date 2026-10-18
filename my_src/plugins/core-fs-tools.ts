@@ -70,7 +70,10 @@ function writeFile(input: { file_path: string; content: string }, readFileState?
 function autoUpdateMemoryIndex(filePath: string): void {
     try {
         const memDir = getMemoryDir();
-        if (filePath.startsWith(memDir) && filePath.endsWith(".md") && !filePath.endsWith("MEMORY.md")) {
+        // 前缀要吃到分隔符——裸 startsWith 会让 ...\mem 也命中 ...\memories
+        const inMemDir = filePath === memDir
+            || filePath.startsWith(memDir + "\\") || filePath.startsWith(memDir + "/");
+        if (inMemDir && filePath.endsWith(".md") && !filePath.endsWith("MEMORY.md")) {
             updateMemoryIndex();
         }
     } catch { /* non-critical */ }

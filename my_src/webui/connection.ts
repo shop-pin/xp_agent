@@ -114,6 +114,10 @@ export class Connection {
         this.generation += 1;
         this.sink.setStatus({ phase: this.generation === 1 ? "connecting" : "reconnecting", generation: this.generation });
         const generation = this.generation;
+        // 换代先关旧连接——僵尸 ws 会一直挂在服务端 streams 里，令"无客户端
+        // 即拒"的 fail-closed 判定失真。旧代 close 事件被代数守卫拦下，不会
+        // 触发重连。
+        this.ws?.close();
         const ws = this.wsFactory(this.streamUrl());
         this.ws = ws;
 
@@ -122,7 +126,13 @@ export class Connection {
         });
         ws.addEventListener("message", (ev: any) => {
             if (generation !== this.generation) return;
-            this.onFrame(JSON.parse(String(ev.data)) as ServerStreamFrame);
+            let frame: ServerStreamFrame | null = null;
+            try {
+                frame = JSON.parse(String(ev.data)) as ServerStreamFrame;
+            } catch {
+                return; // 坏帧丢弃——不让一条畸形数据炸掉整代连接
+            }
+            if (frame) this.onFrame(frame);
         });
         ws.addEventListener("close", () => {
             if (generation !== this.generation || this.manualClosed) return;

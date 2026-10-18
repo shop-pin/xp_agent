@@ -7,6 +7,9 @@ export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermiss
 
 export const READ_TOOLS = new Set(["read_file", "list_files", "grep_search", "web_fetch"]);
 export const EDIT_TOOLS = new Set(["write_file", "edit_file"]);
+// 工作面工具（registry 里 permissionHint "meta" 的同名集）：plan 模式放行的
+// 非只读例外——进出 plan、skill/agent 派发、tool_search 都是纯路由面
+export const META_TOOLS = new Set(["enter_plan_mode", "exit_plan_mode", "skill", "agent", "tool_search"]);
 
 // src 清单全量移植（含 Windows）。语义变化：从旧版 deny 升级为 confirm——
 // 由人决定而非机器拒绝；--dont-ask（CI）下 confirm 自动转 deny
@@ -102,14 +105,17 @@ export function checkPermissionRules(
 
 // 返回 true = 这条规则适用于本次调用。四步各是一个 return：
 // 工具名不等最先排除（最便宜）；pattern null = 管一切；取值 run_shell→command、
-// 其余→file_path，都没有视为"值无关"命中；* 结尾前缀匹配，否则全等
+// file 工具→file_path、web_fetch→url，取不到值视为**不命中**——带 pattern 的
+// 规则管不到"值未知"的调用（否则 web_fetch(domain*) 这类规则会变成对整个
+// 工具的全量放行/拒绝）；* 结尾前缀匹配，否则全等
 export function matchesRule(rule: ParsedRule, toolName: string, input: Record<string, any>): boolean {
     if (rule.tool !== toolName) return false;
     if (!rule.pattern) return true;
     let value = "";
     if (toolName === "run_shell") value = String(input.command || "");
     else if (input.file_path) value = String(input.file_path);
-    else return true;
+    else if (input.url) value = String(input.url);
+    else return false;
     if (rule.pattern.endsWith("*")) {
         return value.startsWith(rule.pattern.slice(0, -1));
     }
@@ -146,6 +152,10 @@ export function checkPermission(
         }
         if (toolName === "run_shell") {
             return { action: "deny", message: "Shell commands blocked in plan mode" };
+        }
+        // 与 approval 插件同步收口：plan 下只认只读与工作面工具，未知工具拒
+        if (!READ_TOOLS.has(toolName) && !META_TOOLS.has(toolName)) {
+            return { action: "deny", message: `Blocked in plan mode: ${toolName} (not a read tool)` };
         }
     }
     if (mode === "bypassPermissions") return { action: "allow" };

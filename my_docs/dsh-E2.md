@@ -51,7 +51,7 @@ buildRows({ host, profile, extraRows }) = mergeRows([
 
 - 代码：`cordis.config.ts` 重写（插件表 22 项 + baseRows + AppHost/appRows + profiles + mergeRows/formatRows/buildRows）；`plugins/services.ts` 新增（7 个服务行）；`plugins/approval.ts` 弃权前查在场标记；`plugins/auto-approval.ts` 提供标记；`agent.ts` 构造函数换 `loadRows`（+dumpConfig/dumpTree 方法，sessionLog/commands 转 getter）；`cli.ts` 加 `--profile`/`--patch`/`--dump-config`。
 - B6 玩具清单（core/greeter/clock）原样内联回 `cordis-tests/b6-loader.test.ts`——loader 的教学夹具归测试，清单归产品。
-- 新测试：`cordis-tests/e2-bundle.test.ts` 8 条（服务先行/广告序/瀑布序、app 层接线、isSubAgent 开关、full ≙ base 原样且 no-auto 只动一行、未知 profile fail-loud、extra 赢过 profile、整行替换不合并、formatRows 形状）。
+- 新测试：`cordis-tests/e2-bundle.test.ts` 9 条（服务先行/广告序/瀑布序、app 层接线、isSubAgent 开关、full ≙ base 原样且 no-auto 只动一行、未知 profile fail-loud、extra 赢过 profile、整行替换不做字段合并、整行替换连 name 一起换（漏写 name 的 patch 行 resolve 时炸出）、formatRows 形状）。
 - 新场景 33（profileProbe）：双 agent 直调，dump 双视图断言（运行态树一含一不含该行、行表 disabled 占位）+ 裁决路径差断言（full 走分类器 1 次后落盘；no-auto 零分类器调用、写被 confirm 否掉）。**全量 mock 28/28 全绿，既有场景零断言变更**；cordis 140/140；CLI 三旗标冒烟通过（dump 行表/patch 覆盖）。
 
 ## 6. 自测三题（答案在文末）

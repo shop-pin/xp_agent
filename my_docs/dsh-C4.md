@@ -120,7 +120,7 @@ settle：排空 → idle（冲水 whenIdle waiters）；abort → 补 turn/end �
 4. `cancel()` 为什么要清 inbox（dsh 默认行为）？不清会在什么交互下出问题？
 
 > **答案**：
-> 1. 差别只在**状态判定**：idle 的 send 等价 followup（排 next-turn、开新 turn），running 的 send 排 next-step（等最近 step 边界认领）。mid-turn 直接 push 有两个问题：撞连续 user（靠合并器兜成拼接，但）；更本质的是**绕过了认领边界**——输入该在哪个 step 可见成了一场竞速。
+> 1. 差别只在**状态判定**：idle 的 send 等价 followup（排 next-turn、开新 turn），running 的 send 排 next-step（等最近 step 边界认领）。mid-turn 直接 push 有两个问题：撞连续 user（靠合并器兜成拼接，但两条独立输入的边界就此含混）；更本质的是**绕过了认领边界**——输入该在哪个 step 可见成了一场竞速。
 > 2. dsh 走 turn-stopping：同 turn 续一个 step，消息流 [.., assistant, user(插话)]；mini 收敛后开新 turn 消费，消息流完全同形——因为"turn"在本轮 mini 里只是请求级注记，消息流才是请求体的全部。两个实现争的不是消息形状，是驱动归属；请求体只看消息形状。
 > 3. 此刻历史末尾是 user(tool_result 批次)——新开 user 消息即连续同角色（API 400）。依赖 C3 合并器的"批次数组追加 text 块"分支：插话作为 text 块并入批次，一条 user 消息同时携带工具结果和新指令，形状合法且语义准确。
 > 4. Ctrl+C 之后的下一条输入应该获得干净的上下文。不清的话：旧 turn 排队的插话会混进下一次 turn 的首批消息（或更糟——被下一个 turn 的 step 边界注入），用户以为打断了的指令还在暗处生效。dsh 把它做成默认行为并留 `keepInbox` 逃生口，mini 只取默认。

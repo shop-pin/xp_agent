@@ -1,7 +1,7 @@
 # dsh 收官：mini-cordis vs 真 Cordis 差异清单 · 场景终态 · 源码导读地图
 
 > E3 收官文档（`dsh-00-chapters.md` §E3 指定交付）。配套：本章 snapshot 机制见 `dsh-E3.md`（若拆章）或 §3。
-> 一句话总结：**24 章（A0 + B1–B6 + C1–C8 + D1–D6 + E1–E3）走完，my_src 从单文件 agent 演进为 mini-cordis 插件树——框架 131 行为断言 + 业务 140 测试全绿，mock 28 场景 + snapshot 28 章全绿。**
+> 一句话总结：**24 章（A0 + B1–B6 + C1–C8 + D1–D6 + E1–E3）走完，my_src 从单文件 agent 演进为 mini-cordis 插件树——cordis 140 断言全绿，mock 28 场景（run-mock 29 键含 23b 探针，口径=不含探针 28）+ snapshot 28 章全绿。**
 
 ## 1. mini-cordis vs 真 Cordis 差异清单
 
@@ -54,7 +54,7 @@
 
 | 测试面 | 规模 | 状态 | 说明 |
 |---|---|---|---|
-| 框架行为（cordis-tests） | 140 断言 / 19 文件 | ✅ 全绿 | B 阶段框架语义 + C/D 每章服务级行为 + E2 装配 8 条 |
+| 框架行为（cordis-tests） | 140 断言 / 20 文件 | ✅ 全绿 | B 阶段框架语义 + C/D 每章服务级行为 + E2 装配 9 条 |
 | mock 回归（run-mock） | 28 场景 | ✅ 全绿 | 22 个旧场景锚点存活 + C4/C5/C6/C8/D 阶段新增；手写 verify 点状锚 |
 | snapshot 回放（run-snapshot） | 28 章 / 135 请求 / 44 会话文件 | ✅ 28/28 × 4 轮 | 全量逐字节锚（规范化后），任何请求组装/事件序改动即红 |
 | 真机 | glm-5.3-flash | ✅ 可用 | 沿用 ch14 纪律（--accept-edits、日志直写文件）；E1 REPL 手测清单仍待过 |
@@ -98,9 +98,9 @@
 
 ## 5. 课程终点回望
 
-三轮学习（ch1–15 复现 → ch16–26 进阶 → dsh 24 章重构）的最终形态：**同一个 mini agent，三次架构**——if 链脚本 → 模块化单文件（`agent.ts` 1095 行，仍是 bootstrap+宿主）→ mini-cordis 插件树（框架 800 行与业务解耦，agent.ts 收缩为 bootstrap）。dsh 课程的核心兑现："换 provider 即换产品"不再是口号——`cordis.config.ts` 一份清单、两条 profile、一个 `--patch`，同一份代码装出全功能与无 auto-mode 两个 agent（场景 33 的裁决路径差是行为证据）。
+三轮学习（ch1–15 复现 → ch16–26 进阶 → dsh 24 章重构）的最终形态：**同一个 mini agent，三次架构**——if 链脚本 → 模块化单文件（`agent.ts` 峰值 1311 行，bootstrap+宿主一体）→ mini-cordis 插件树（框架 800 行与业务解耦，agent.ts 收缩为纯 bootstrap）。dsh 课程的核心兑现："换 provider 即换产品"不再是口号——`cordis.config.ts` 一份清单、两条 profile、一个 `--patch`，同一份代码装出全功能与无 auto-mode 两个 agent（场景 33 的裁决路径差是行为证据）。
 
-遗留（不阻塞收官）：E1 REPL 手测清单待终端过一遍；快照首跑 flaky 记档在案；思考题回补按队列并入后续。
+遗留（不阻塞收官）：E1 REPL 手测清单待终端过一遍；思考题回补按队列并入后续；三章留了"后章再议"最终无人接单（2026-10-17 检视轮收录在此）：C4 §4 的独立维护相位（dsh runMaintenance 从 idle 起维护任务，mini 的 compact 仍内联 turn 开场）、C5 §9 的 turn 注记粒度（mini 是 per-request，dsh 是 turn/step 分层）、D6 §6 的预算/轮数仪表服务（仍在 agent 字段上，bridge getBudget/getMaxTurns 是最后的缝）。
 
 ## 6. F 阶段（web UI）收官增补（2026-10-17）
 
@@ -119,7 +119,18 @@ F1–F6 交付了 mini 的第三张脸：**引擎一行语义不改，Host/Clien
 
 ### 6.2 终态数字（2026-10-17 增补）
 
-cordis **188/188**（22 测试文件）；mock **28 场景**全绿；snapshot **28/28**（F5/F6 重录 ch7/ch15/ch24：goal-progress/loop 注记进事件流锚；ch8 偶发红观察中）；vite build 245.9KB / gzip 77.6KB。`--profile web` 冒烟手测清单在 `dsh-F6.md` §3。
+cordis **188/188**（26 测试文件）；mock **28 场景**全绿；snapshot **28/28**（F5/F6 重录 ch7/ch15/ch24：goal-progress/loop 注记进事件流锚）；vite build 245.9KB / gzip 77.6KB。`--profile web` 冒烟手测清单在 `dsh-F6.md` §3。
+
+### 6.4 全面检视修复轮（2026-10-17，F6 之后）
+
+收官后的一天集中检视轮，修了两类问题（详记 `dsh-E3.md` §3 增补、`dsh-F5.md` §4 增补、`dsh-F3.md` §4 增补）：
+
+- **两个偶发红根因修复**：① ch10 mock 计数闪断 = Windows PID 高速复用撞日志/捕获文件名（append 把上一轮的行带进来数出 12 个请求）——`run-mock.mjs` 开跑前 `rmSync` 清场；② ch8 snapshot 闪断 = memory 侧调与主轨请求的**到达顺序**是回环 TCP 竞态——capture 行带 `track`，规范层按轨名稳定排序（跨轨到达序不锚，轨内到达序=轮次序仍锚），全量 28 章重录 + 两轮 replay 全绿。
+- **审批与跨站安全收口**：plan 模式下未声明 read/meta hint 的工具一律拒（旧路径只拦 edit/run_shell，MCP 等未知写入面靠⑨兜底放行）；MCP 工具不再冒充 hint "meta"；带 pattern 的权限规则取不到值时不再"值无关命中"（`web_fetch(domain*)` 恒全量放行的洞）；host-webserver 校验 Origin/Host（恶意页面跨站连 WS / DNS rebinding 被拒，Node/curl 不发 Origin 不受影响）；MCP `tools/call` 60s 超时（挂死 server 不再吊死 turn）；配置只认 `mcpServers` 键（statusLine 等带 command 的对象不再被当 server spawn）。
+- **webui 修复**：换代关旧 ws（僵尸连接不再令 fail-closed 判定失真）；坏帧 JSON.parse 不再炸整代连接；槽位 disposer 按条目身份摘除（不再连带抹掉后加入项）；memory 目录前缀吃到分隔符（`\mem` 不再命中 `\memories`）。
+- snapshot 格式变更（请求行 `{track, body}`）→ 全量重录一次；`agent.ts` 死方法 `childPermissionMode` 删除。
+
+**终态复核**：cordis 188/188、mock 21/21（13/14/16/17/22 n/a）、snapshot 28/28 × 2 轮。
 
 ### 6.3 导读地图增补（F 阶段读过的 dsh 面）
 

@@ -90,10 +90,6 @@ export function startMock({ scenario, logPath, capturePath } = {}) {
       let body;
       try { body = JSON.parse(raw); } catch { res.writeHead(400); res.end("bad json"); return; }
 
-      // E3 snapshot：完整请求体逐字节捕获（快照录制用；与 logPath 的摘要
-      // 事件互不影响——录制是追加通道，replay 断言吃的是规范化后的产物）
-      if (capturePath) appendFileSync(capturePath, JSON.stringify({ body }) + "\n");
-
       const system = typeof body.system === "string" ? body.system : (Array.isArray(body.system) ? body.system.map((b) => b.text).join("") : "");
       // ch20 起 withCacheBreakpoints 会把最后一条消息的字符串 content 规范化为
       // block 数组（打 cache_control 用），所以提取要兼容两种形状
@@ -135,6 +131,13 @@ export function startMock({ scenario, logPath, capturePath } = {}) {
         res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify(err)); return;
       }
       if (hits.length === 1) track = hits[0][0];
+
+      // E3 snapshot：完整请求体逐字节捕获（快照录制用；与 logPath 的摘要
+      // 事件互不影响——录制是追加通道，replay 断言吃的是规范化后的产物）。
+      // 带 track 写入——并行轨（memory 侧调等）与主轨的**到达顺序**是回环
+      // TCP 竞态，规范层按轨名稳定排序后字节锚；轨内到达序 = 轮次序，仍锚。
+      if (capturePath) appendFileSync(capturePath, JSON.stringify({ track, body }) + "\n");
+
       const turnIndex = counters[track] || 0;
       const turn = (tracks[track]?.turns || [])[turnIndex];
 

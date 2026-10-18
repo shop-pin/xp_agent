@@ -4,7 +4,7 @@
 //   npm run mock -- 2   → chapter 2
 //   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
 import { startMock } from "./mock-anthropic.mjs";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync } from "fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync, rmSync } from "fs";
 import { createHash } from "crypto";
 import { tmpdir, homedir } from "os";
 import { join, dirname } from "path";
@@ -1454,6 +1454,10 @@ s.setup(workdir);
 
 const logPath = s.needsLog ? join(tmpdir(), `my-ch${chapter}-log-${process.pid}.jsonl`) : undefined;
 const capturePath = snapshotMode ? join(tmpdir(), `my-ch${chapter}-capture-${process.pid}.jsonl`) : undefined;
+// Windows 上 PID 高速复用：两次跑可能撞同一个日志/捕获文件名，append 模式把
+// 上一轮的行带进来（ch10 曾偶发数出 12 个请求）。开跑前先清场。
+if (logPath) rmSync(logPath, { force: true });
+if (capturePath) rmSync(capturePath, { force: true });
 // tracks 支持函数形式 (dir) => tracks——ch22 记忆目录含 sha256(cwd) 动态段，
 // 脚本化的 write_file 路径必须等 workdir 生成后才能算出来
 const tracks = typeof s.tracks === "function" ? s.tracks(workdir) : s.tracks;

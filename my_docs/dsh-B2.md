@@ -111,7 +111,7 @@ Error: [mini-cordis] plugin <boom> apply failed: kaboom
 - `cordis-tests/b2-fiber.test.ts`（新增 11 条测试）
 - `cordis-tests/b1-context.test.ts`（修改：遮蔽测试→冲突测试、disposer 测试→冲突语义、新增通知测试）
 
-**验证**：`npm run cordis` **22/22 绿**（B1 11 条 + B2 11 条）；全量 mock 回归 **22/22 绿**（业务代码零改动）。
+**验证**：`npm run cordis` **22/22 绿**（B1 11 条 + B2 11 条。注：本章为验证 provide 通知在 `b1-context.test.ts` 里补了 1 条，B1 时点该文件是 10 条）；全量 mock 回归 **22/22 绿**（业务代码零改动）。
 
 **翻车记档**：
 1. 匿名箭头函数的 `.name` 是 **`''` 不是 `undefined`**——`name ?? '<anonymous>'` 兜不住空串，改用 `||`。（又一例"值的身份与直觉不符"）

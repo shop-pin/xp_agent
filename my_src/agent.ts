@@ -10,7 +10,7 @@ import { loadRows, dumpTree } from "./cordis/loader.js";
 import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
 import { SkillRegistry } from "./plugins/skills-registry.js";
 import { HostService } from "./plugins/host-webserver.js";
-import { buildPresetFromSkill, childModeOf } from "./plugins/subagent.js";
+import { buildPresetFromSkill } from "./plugins/subagent.js";
 import { CompactionService } from "./plugins/compaction.js";
 import type { GoalService, LoopService } from "./plugins/autonomy.js";
 import { resolveSkillPrompt } from "./skills.js";
@@ -1027,12 +1027,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     private clearHistoryKeepSystem() {
         this.sessionLog.clear();
         this.cordis.require<CompactionService>("compaction").lastInputTokenCount = 0;
-    }
-
-    // 权限模式子 agent 继承规则（防洗白）：裁决在 plugins/subagent.ts 的
-    // childModeOf——agent 工具的 preset 构造与 skill fork 共用同一份
-    private childPermissionMode(): PermissionMode {
-        return childModeOf(this.mode);
     }
 
     // skill 的双入口分流：fork 派给隔离子 agent（system=解析后模板，tools=白名单过滤

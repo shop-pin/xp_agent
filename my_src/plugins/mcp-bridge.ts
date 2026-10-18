@@ -150,7 +150,9 @@ class McpConnection {
     }
 
     async callTool(name: string, args: any): Promise<string> {
-        const result = await this.sendRequest("tools/call", { name, arguments: args });
+        // 挂起的 server 不能吊死整个 turn——与 initialize/listTools 同款超时
+        // 纪律，但窗口放宽（工具调用是真正的干活，15s 不够）
+        const result = await withTimeout(this.sendRequest("tools/call", { name, arguments: args }), 60_000);
         if (result?.content && Array.isArray(result.content)) {
             return result.content
                 .filter((c: any) => c.type === "text")
@@ -186,7 +188,9 @@ function mergeConfigFile(filePath: string, target: Record<string, McpServerConfi
     if (!existsSync(filePath)) return;
     try {
         const raw = JSON.parse(readFileSync(filePath, "utf-8"));
-        const servers = raw.mcpServers || raw;
+        // 只认 mcpServers 键——settings.json 里其它带 command 字段的对象
+        //（如 statusLine）不能被当成 MCP server 在开场 spawn
+        const servers = raw.mcpServers;
         for (const [name, config] of Object.entries(servers)) {
             if (config && typeof config === "object" && typeof (config as McpServerConfig).command === "string") {
                 target[name] = config as McpServerConfig;
@@ -258,7 +262,8 @@ export class McpBridge extends Service {
                 name: publicName,
                 description: t.description || `MCP tool ${t.name} from ${t.serverName}`,
                 parameters: (t.inputSchema || { type: "object", properties: {} }) as unknown as JSONSchema,
-                permissionHint: "meta" as const,
+                // MCP 工具不带 permissionHint（未知写入面，plan 模式拒；hint
+                // "meta" 是 agent 自身工作面工具的专属标记）
                 // dispatch 用闭包捕获 server/raw 名——公共名被截断/规范化也能路由
                 execute: (input: Record<string, any>) => this.callRaw(t.serverName, t.name, input),
             };

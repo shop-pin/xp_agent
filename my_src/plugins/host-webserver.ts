@@ -154,6 +154,7 @@ export class HostService extends Service {
     private pending = new Map<string, PendingInteraction>();
     private heartbeat: NodeJS.Timeout | null = null;
     private endpointUrl: string | null = null;
+    private boundPort = 0;
     private readyPromise: Promise<void>;
 
     constructor(ctx: Context, name: string, private config: HostConfig) {
@@ -181,7 +182,7 @@ export class HostService extends Service {
         this.wss = wss;
         server.on("upgrade", (req, socket, head) => {
             const url = new URL(req.url ?? "/", "http://127.0.0.1");
-            if (url.pathname !== "/api/stream") {
+            if (url.pathname !== "/api/stream" || this.crossSiteBlocked(req)) {
                 socket.destroy();
                 return;
             }
@@ -216,6 +217,7 @@ export class HostService extends Service {
             server.listen(port, "127.0.0.1", () => {
                 const addr = server.address();
                 const realPort = typeof addr === "object" && addr ? addr.port : port;
+                this.boundPort = realPort;
                 this.endpointUrl = `http://127.0.0.1:${realPort}`;
                 this.ui.info(`Host listening on ${this.endpointUrl}`);
                 resolveReady();
@@ -577,10 +579,29 @@ export class HostService extends Service {
         return { events: out };
     }
 
+    /** 跨站防护（F5 收口补）：服务只绑回环，但用户浏览器里的恶意页面仍可
+     *  向 127.0.0.1:port 发请求（跨站 POST 带 Origin；DNS rebinding 带 attacker
+     *  域的 Host）。规则：带 Origin 的请求必须同源；Host 必须是本机回环域名
+     *  + 实际端口。非浏览器客户端（Node/curl）不发 Origin——不受影响。 */
+    private crossSiteBlocked(req: IncomingMessage): boolean {
+        const p = this.boundPort;
+        const origin = req.headers.origin;
+        if (origin !== undefined) {
+            const allowed = [`http://127.0.0.1:${p}`, `http://localhost:${p}`, `http://[::1]:${p}`];
+            if (!allowed.includes(String(origin).toLowerCase())) return true;
+        }
+        const host = String(req.headers.host || "").toLowerCase();
+        const hostOk = [`127.0.0.1:${p}`, `localhost:${p}`, `[::1]:${p}`];
+        return !hostOk.includes(host);
+    }
+
     private async handle(req: IncomingMessage, res: ServerResponse, methods: Record<string, MethodHandler>): Promise<void> {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
         try {
             if (url.pathname.startsWith("/api/")) {
+                if (this.crossSiteBlocked(req)) {
+                    return sendEnvelope(res, 403, { ok: false, error: "cross-origin request blocked" });
+                }
                 const name = url.pathname.slice("/api/".length);
                 const method = methods[name];
                 if (!method) return sendEnvelope(res, 404, { ok: false, error: `unknown method: ${name}` });

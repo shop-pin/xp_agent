@@ -42,6 +42,7 @@
 2. **瞬态断言等不到**：`reconnecting` 相位从重连发出到 baseline 落地只有毫秒级，10ms 轮询天然错过 → 5s 超时。改成等最终态（live + generation 2）。**断言相位迁移要断言"迁移发生过的证据"（generation），不是去追瞬态本身。**
 3. **Connection 构造第二参忘了**：纯 call 测试 `new Connection({baseUrl})` 编译报错——sink 是必选。顺手确认了"构造时强制注入 sink"比"可选 sink 后判空"更能逼出分层（传输层没有 sink 就不该存在）。
 4. **DOM lib 与 @types/node 共存**：担心的全局冲突没有发生（fetch/Response 双方兼容），`jsx: react-jsx` + lib DOM 一次过——根 tsconfig 直接收编 webui 全部源码，vite 用 esbuild 只做转译不查类型，类型检查全靠这条 tsc 路径，**不要为了"干净"把 webui 拆出独立 tsconfig**。
+5. **2026-10-17 检视轮三修（记档级）**：① `openGeneration` 换代先关旧 ws——不关的话僵尸连接一直挂在服务端 `streams` 里，F5 的"无客户端即拒"fail-closed 判定会失真（服务端以为还有人能作答）。② message 回调的 `JSON.parse` 加守卫——一条坏帧不再炸掉整代连接。③ slots 的 disposer 改按条目身份摘除——原实现恢复"加入前快照"，先注销早加入项会连带抹掉后加入项。另：`core-fs-tools.ts` 的记忆目录前缀判断吃到分隔符（`\mem` 不再误命中 `\memories`）。详单见 `dsh-final.md` §6.4。
 
 ## 5. 自测三题（答案在文末）
 

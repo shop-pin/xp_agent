@@ -53,6 +53,7 @@
 2. **waitFor 从帧序头扫，二次踩坑（F4 翻车 #1 同款）**：第二张 plan 卡的等待谓词没排除第一张的 id——waitFor 每次从头扫描，永远命中旧帧 → 拿旧 id 去 decide → `no pending`。**谓词查找必须携带"排除已消费"条件**（或改订阅增量）；这条记过一次还会踩，说明正确姿势要变成默认写法。
 3. **mock 响应按"LLM 请求"消耗，不按"用户 prompt"**：按"一次 prompt 一个 turn"排场景节奏 → keep-planning 打回后 r2 在同一 turn 里继续，第二次 prompt 撞 busy、mock 响应用尽报 Connection error。**http 驱动的场景脚本，节拍器是模型的响应次数。**
 4. **断言"清史后还剩什么"之前，先问"什么先落笔"**：期望零域里有 `mode=acceptEdits` 注记，实际 `setMode` 在 `clearHistoryKeepSystem` 之前执行——注记跟第一轮一起被清。同段还有：`/cost` 走的是 `ui.info`（"Estimated cost"），`kind=cost` 帧来自引擎每轮 usage 旁白——**断言对着引擎事实写，不对着记忆猜**（F4 翻车 #4 的延续）。
+5. **2026-10-17 检视轮：跨站与审批收口（记档级修复，非翻车）**：① host-webserver 补 Origin/Host 校验——服务只绑回环不等于只有本机能连：用户浏览器里的恶意页面可以跨站 POST `approval.decide`、连 `ws://127.0.0.1:3080` 读全会话；带 Origin 的请求必须同源，Host 必须回环域名+实际端口（Node/curl 不发 Origin，不受影响）。② plan 模式收口——旧路径只拦 edit/run_shell，MCP 等未声明 permissionHint 的写入面靠⑨兜底放行；现在 plan 下非 read/meta 一律拒（c2 对拍 oracle 同步改，harness 给 `agent` 补了同 hint 桩 def）。③ MCP 工具不再冒充 hint "meta"（meta 是 agent 自身工作面工具的标记）；`tools/call` 60s 超时；配置只认 `mcpServers` 键（statusLine 等带 command 的对象不再被当 server spawn）。④ matchesRule 取不到值不再"值无关命中"——`web_fetch(domain*)` 这类带 pattern 的规则曾恒全量放行该工具。全量回归：cordis 188/188、mock 21/21、snapshot 28/28（重录）。详单见 `dsh-final.md` §6.4。
 
 ## 5. 自测三题（答案在文末）
 

@@ -10,6 +10,8 @@
 //   替换成 {{cwd}}/{{home}}/{{session:n}} 占位）——比猜模式可靠；
 //   只能猜模式的（git log 段、日期、命令路径）用正则折叠。
 // diff 规则：先比条数再逐行比，首个差异打印上下文（截断），失败即红。
+//   请求行带 track（mock 路由名）：跨轨到达序是并行竞态不锚，按轨名稳定
+//   排序后逐行比（轨内到达序 = 轮次序，仍锚）。
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
@@ -86,10 +88,14 @@ export function buildSnapshotPayload({ capturePath, workdir, home }) {
     };
     const requests = existsSync(capturePath)
         ? readFileSync(capturePath, "utf-8").split("\n").filter(Boolean).map((line) => {
-            const { body } = JSON.parse(line);
-            return normalizeJsonDeep(body, vars);
+            const { track, body } = JSON.parse(line);
+            return { track: track || "main", body: normalizeJsonDeep(body, vars) };
         })
         : [];
+    // 并行轨（memory 侧调 / auto 分类器 / compact）与主轨的到达顺序是回环 TCP
+    // 竞态（ch8 偶发红的根因）——跨轨顺序不锚，按轨名稳定排序；轨内到达序
+    // = 轮次序（主轨严格串行），仍是字节锚的一部分。录制与回放同走本函数。
+    requests.sort((a, b) => (a.track < b.track ? -1 : a.track > b.track ? 1 : 0));
     const events = [];
     files.forEach(({ f }, i) => {
         // 事件行先 parse 再深度规范化：整行字符串替换吃不到 JSON 转义形式
