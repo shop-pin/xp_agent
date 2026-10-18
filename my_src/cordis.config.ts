@@ -45,6 +45,7 @@ import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin } from "./plugins/autonomy.js";
+import { marketDataPlugin } from "./plugins/market-data.js";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -71,6 +72,7 @@ export const plugins: Record<string, Plugin> = {
     "auto-approval": autoApprovalPlugin,
     "autonomy": autonomyPlugin,
     "host-webserver": hostWebserverPlugin,
+    "market-data": marketDataPlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -111,6 +113,8 @@ export const baseRows: Row[] = [
     { id: "autonomy", name: "autonomy" },
     // F1：web Host——默认关闭（REPL/mock 不绑端口）；web profile 整行替换启用
     { id: "host", name: "host-webserver", disabled: true },
+    // S1：行情数据面——默认关闭（base 产品无股票能力）；stock profile 启用
+    { id: "market", name: "market-data", disabled: true },
 ]
 
 /**
@@ -211,6 +215,11 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
             },
         }]
         : [{ id: "host", name: "host-webserver", disabled: true }],
+    // S1：股票版——启用行情数据面（get_quote/screen_market 两个只读工具）。
+    // 纯数据面插件无需宿主桥，行数组即可；与 web 的组合走 extraRows（--patch）。
+    stock: [
+        { id: "market", name: "market-data" },
+    ],
 }
 
 /** 分层铺平：同 id 后写胜（整行替换）。loadRows 内部还有一次同 id 去重，
