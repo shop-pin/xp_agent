@@ -32,6 +32,16 @@ export interface ProjectionLoop {
     prompt?: string;
 }
 
+/** S7：成交流水（broker 插件的 meta/note key="trade" fold）。 */
+export interface ProjectionTrades {
+    fills: number;
+    fees: number;
+    realizedPnl: number;
+    /** 成交后的现金余额（末笔为准；null = 无成交）。 */
+    cash: number | null;
+    last: string | null;
+}
+
 export interface SessionProjection {
     /** 折叠反映到的最后 seq（快照身份——与流 lastSeq 对账用）。 */
     lastSeq: number;
@@ -42,6 +52,7 @@ export interface SessionProjection {
     costUsd: number;
     goal: ProjectionGoal | null;
     loop: ProjectionLoop | null;
+    trades: ProjectionTrades;
 }
 
 const EMPTY_USAGE: UsageLike = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
@@ -56,6 +67,7 @@ export function projectSession(entries: Array<{ seq: number; event: any }>): Ses
         costUsd: 0,
         goal: null,
         loop: null,
+        trades: { fills: 0, fees: 0, realizedPnl: 0, cash: null, last: null },
     };
     for (const { seq, event } of entries) {
         p.lastSeq = seq;
@@ -92,6 +104,16 @@ export function projectSession(entries: Array<{ seq: number; event: any }>): Ses
                     }
                 } else if (event.key === "loop") {
                     p.loop = (event.value as ProjectionLoop | null) ?? null;
+                } else if (event.key === "trade") {
+                    const v = event.value as {
+                        side?: string; code?: string; qty?: number; price?: number;
+                        fee?: number; realizedPnl?: number | null; cash?: number;
+                    };
+                    p.trades.fills += 1;
+                    p.trades.fees += Number(v.fee ?? 0);
+                    p.trades.realizedPnl += Number(v.realizedPnl ?? 0);
+                    if (typeof v.cash === "number") p.trades.cash = v.cash;
+                    p.trades.last = `${v.side === "sell" ? "卖出" : "买入"} ${v.code ?? ""} ${v.qty ?? 0}@${v.price ?? 0}`;
                 }
                 break;
             }

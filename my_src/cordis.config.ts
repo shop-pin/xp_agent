@@ -48,6 +48,7 @@ import { autonomyPlugin } from "./plugins/autonomy.js";
 import { marketDataPlugin } from "./plugins/market-data.js";
 import { newsFeedPlugin } from "./plugins/news-feed.js";
 import { signalEnginePlugin } from "./plugins/signal-engine.js";
+import { paperBrokerPlugin } from "./plugins/paper-broker.js";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -77,6 +78,7 @@ export const plugins: Record<string, Plugin> = {
     "market-data": marketDataPlugin,
     "news-feed": newsFeedPlugin,
     "signal-engine": signalEnginePlugin,
+    "paper-broker": paperBrokerPlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -123,6 +125,8 @@ export const baseRows: Row[] = [
     { id: "news", name: "news-feed", disabled: true },
     // S5：信号引擎——同上（依赖 market 行，行序在后即依赖就绪）
     { id: "signals", name: "signal-engine", disabled: true },
+    // S7：模拟盘——同上（依赖 market；订单 hint=exec，S8 前靠既有 confirm 摩擦）
+    { id: "broker", name: "paper-broker", disabled: true },
 ]
 
 /**
@@ -232,12 +236,34 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
         { id: "market", name: "market-data" },
         { id: "news", name: "news-feed" },
         { id: "signals", name: "signal-engine" },
+        { id: "broker", name: "paper-broker" },
     ] : [
         { id: "skills", name: "skills-registry", config: { productSkills: true } },
         { id: "market", name: "market-data" },
         { id: "news", name: "news-feed" },
         { id: "signals", name: "signal-engine" },
+        { id: "broker", name: "paper-broker" },
     ],
+    // S7：web + stock 组合——F6 投影侧栏要看 trade 流水，得同时有 host 行和
+    // broker 行。profile 是单选的，组合形态就显式做成第四个名字（不加多层
+    // 组合语法——两个真实需求之前不发明机制）。
+    "web-stock": (host) => host
+        ? [
+            ...((profiles.web as (host?: AppHost) => Row[])(host)),
+            { id: "skills", name: "skills-registry", config: { catalogInjection: true, productSkills: true } },
+            { id: "market", name: "market-data" },
+            { id: "news", name: "news-feed" },
+            { id: "signals", name: "signal-engine" },
+            { id: "broker", name: "paper-broker" },
+        ]
+        : [
+            { id: "host", name: "host-webserver", disabled: true },
+            { id: "skills", name: "skills-registry", config: { productSkills: true } },
+            { id: "market", name: "market-data" },
+            { id: "news", name: "news-feed" },
+            { id: "signals", name: "signal-engine" },
+            { id: "broker", name: "paper-broker" },
+        ],
 }
 
 /** 分层铺平：同 id 后写胜（整行替换）。loadRows 内部还有一次同 id 去重，

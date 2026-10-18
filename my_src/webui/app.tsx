@@ -128,6 +128,14 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
                             ? <>⟳ loop {projection.loop.mode === "dynamic" ? "dynamic" : `${projection.loop.intervalSeconds}s`}</>
                             : <span className="muted">loop：无</span>}
                     </div>
+                    <div className="projection-row" data-active={projection.trades.fills > 0}>
+                        {projection.trades.fills > 0
+                            ? <>¥ {projection.trades.fills} 笔 · 费 {projection.trades.fees.toFixed(2)}
+                                {" "}· 已实现 {(projection.trades.realizedPnl >= 0 ? "+" : "") + projection.trades.realizedPnl.toFixed(2)}
+                                {projection.trades.cash !== null ? ` · 现金 ${Math.round(projection.trades.cash)}` : ""}
+                                <div className="muted">↳ {projection.trades.last}</div></>
+                            : <span className="muted">trade：无</span>}
+                    </div>
                 </div>
                 <div className="toolbar">
                     <button onClick={() => actions.createSession()}>新会话</button>

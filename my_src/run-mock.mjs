@@ -1607,6 +1607,41 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "39": {
+    // S7：模拟盘——买入成交（exec hint 过 confirm）→ 当日卖拒（T+1）→
+    // 坏单拒（不足一手）→ get_portfolio 汇总。市场 mock 固定时钟（价带确定），
+    // 账本落沙箱 HOME。place_order 走审批 confirm（setConfirmFn 放行首笔）。
+    needsLog: true,
+    setup: () => {},
+    runs: [{ paperProbe: true }],
+    turns: [
+      { tools: [{ name: "place_order", input: { code: "sh600000", side: "buy", price: 10, qty: 10_000, reason: "signal rapid-move" } }] },
+      { tools: [{ name: "place_order", input: { code: "sh600000", side: "sell", price: 11, qty: 10_000 } }] },
+      { tools: [{ name: "place_order", input: { code: "sh600000", side: "buy", price: 10, qty: 50 } }] },
+      { tools: [{ name: "get_portfolio", input: {} }] },
+      { text: "paper trading checked." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("five main requests (buy/sell/bad/portfolio/answer)", reqs.length === 5);
+      check("buy fills with fee and cash after",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("Filled P0001: 买入 sh600000 10000 股 @ 10")
+          && t.content.includes("费用 26 元")));
+      check("same-day sell rejected by T+1",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("Rejected: 可卖不足")
+          && t.content.includes("T+1")));
+      check("odd lot rejected",
+        (reqs[3]?.toolResults || []).some((t) => t.content.includes("Rejected") && t.content.includes("不足一手")));
+      check("portfolio summarizes position and cash",
+        (reqs[4]?.toolResults || []).some((t) => t.content.includes("现金 899974 元")
+          && t.content.includes("持10000股 可卖0")
+          && t.content.includes("已实现盈亏 +0 元")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -2012,6 +2047,30 @@ if (s.runs) {
         });
         await new Promise((r) => setTimeout(r, 50));
         await agent.chat("Invoke the adjudicate skill.");
+        if (agent.close) await agent.close();
+      } else if (r.paperProbe !== undefined) {
+        // S7：模拟盘探针——market mock（固定钟）+ broker（账本落沙箱 HOME）。
+        // place_order hint=exec → 审批 confirm（放行）——S8 前的既有摩擦路径。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const q = {
+            code: "sh600000", name: "浦发银行", price: 10, change: 0, changePercent: 0,
+            open: 10, high: 10, low: 10, preClose: 10, volume: 1000, amount: 1e7,
+            turnoverRate: 0.3, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0,
+        };
+        const src = {
+            async fetchMarketSnapshot() { return [q]; },
+            async fetchQuotes() { return []; },
+        };
+        const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const agent = new agentMod.Agent({
+          extraRows: [
+            { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
+            { id: "broker", name: "paper-broker", config: { now: () => fixed } },
+          ],
+        });
+        agent.setConfirmFn(async () => true);
+        await new Promise((r) => setTimeout(r, 50));
+        await agent.chat("Run the paper trading checks.");
         if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);
