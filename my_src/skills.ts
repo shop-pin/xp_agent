@@ -14,13 +14,14 @@ export interface SkillDefinition {
     userInvocable: boolean;
     context: "inline" | "fork";
     promptTemplate: string;
-    source: "project" | "user";
+    /** 发现层：product（产品内置，S2）/ user / project——同名高 rank 胜。 */
+    source: "project" | "user" | "product";
     skillDir: string;
 }
 
 export function parseSkillFile(
     filePath: string,
-    source: "project" | "user",
+    source: "project" | "user" | "product",
     skillDir: string
 ): SkillDefinition | null {
     try {

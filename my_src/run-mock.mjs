@@ -1441,6 +1441,49 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "34": {
+    // S2：/brief 速览全链——product 技能层（stock profile 经 productSkills 打开
+    // my_src/skills/ 内置技能目录）+ get_watchlist（沙箱 HOME 清单）+ get_quote
+    // （extraRows 注入 MockQuoteSource：网络零依赖，快照确定性）。
+    // 目录注入含 /brief、skill 激活模板、清单解析、明细四段链路逐一断言。
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-claude", "stocks"), { recursive: true });
+      writeFileSync(join(dir, ".mini-claude", "stocks", "watchlist.txt"),
+        "# my watchlist\nsh600000  # 浦发银行\nsz300750\n\nnot-a-code\n");
+    },
+    runs: [{ stockProbe: true }],
+    turns: [
+      { tools: [{ name: "skill", input: { skill_name: "brief", args: "" } }] },
+      { tools: [{ name: "get_watchlist", input: {} }] },
+      { tools: [{ name: "get_quote", input: { codes: ["sh600000", "sz300750"] } }] },
+      { text: "brief delivered." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("catalog injection lists the product skill (/brief)",
+        typeof reqs[0]?.firstUserText === "string"
+        && reqs[0].firstUserText.includes("# Available Skills")
+        && reqs[0].firstUserText.includes("- **/brief**:")
+        && reqs[0].firstUserText.includes("<system-reminder>"));
+      check("four main requests (skill -> watchlist -> quote -> answer)", reqs.length === 4);
+      check("skill tool activates the brief template",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes('[Skill "brief" activated]')
+          && t.content.includes("一页纸行情速览")));
+      check("get_watchlist returns codes + remarks, drops bad lines",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("watchlist (2)")
+          && t.content.includes("sh600000  # 浦发银行")
+          && t.content.includes("sz300750")
+          && !t.content.includes("not-a-code")));
+      check("get_quote serves mock detail for both codes",
+        (reqs[3]?.toolResults || []).some((t) => t.content.includes("浦发银行")
+          && t.content.includes("宁德时代")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -1702,6 +1745,32 @@ if (s.runs) {
         sample("bare-auto-reqs", countAutoReqs() - autoBefore);
         if (full.close) await full.close();
         if (bare.close) await bare.close();
+      } else if (r.stockProbe !== undefined) {
+        // S2：stock 装配探针——profile stock 打开产品技能层，extraRows 把
+        // market 行的默认源换成 MockQuoteSource（同 id 后写胜，赢过 profile 层）
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const md = await import(pathToFileURL(join(HERE, "dist", "plugins", "market-data.js")).href);
+        const q = (code, name, price, chgPct, volume, amount, turnover) => ({
+          code, name, price, change: 0, changePercent: chgPct, open: price, high: price,
+          low: price, preClose: price, volume, amount, turnoverRate: turnover,
+          volumeRatio: 0, marketCap: 0, floatCap: 0, pb: 0,
+          quotedAt: "2026-10-16 15:00:00",
+        });
+        const quotes = [
+          q("sh600000", "浦发银行", 9.73, 0.93, 922942, 8.96e8, 0.31),
+          q("sz300750", "宁德时代", 277.0, -0.54, 297424, 8.22e9, 0.66),
+          q("sh688981", "中芯国际", 102.66, -1.7, 378552, 3.88e9, 1.9),
+        ];
+        const mockSource = {
+          async fetchMarketSnapshot() { return quotes; },
+          async fetchQuotes(codes) { return quotes.filter((x) => codes.includes(x.code)); },
+        };
+        const agent = new agentMod.Agent({
+          profile: "stock",
+          extraRows: [{ id: "market", name: "market-data", config: { source: mockSource } }],
+        });
+        await agent.chat("Invoke the brief skill with no args.");
+        if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);
       }

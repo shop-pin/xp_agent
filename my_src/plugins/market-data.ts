@@ -19,6 +19,9 @@ import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
 import type { ToolsService } from "../services/tools.js";
+import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 
 // ---------- 数据词汇表 ----------
 
@@ -260,6 +263,33 @@ export const eastmoneySource: QuoteSource = {
     },
 };
 
+// ---------- 自选股清单（S2：/brief 技能的默认输入源） ----------
+
+/** 清单路径：HOME 沙箱下全局一份（跨项目共享，与 sessions/memory 同区）。 */
+export function watchlistPath(): string {
+    return join(homedir(), ".mini-claude", "stocks", "watchlist.txt");
+}
+
+export interface WatchlistEntry {
+    code: string;
+    remark: string;
+}
+
+/** 清单解析（纯函数）：一行 = 代码 [# 备注]；# 后是备注、空行跳过、
+ *  不合法行丢弃（不炸整份）；无 # 时代码后的余词也收作备注。 */
+export function parseWatchlist(text: string): WatchlistEntry[] {
+    const out: WatchlistEntry[] = [];
+    for (const raw of text.split(/\r?\n/)) {
+        const hashIdx = raw.indexOf("#");
+        const line = (hashIdx >= 0 ? raw.slice(0, hashIdx) : raw).trim();
+        const hashRemark = hashIdx >= 0 ? raw.slice(hashIdx + 1).trim() : "";
+        if (!line) continue;
+        const [code, ...rest] = line.split(/\s+/);
+        if (/^(sh|sz|bj)\d{6}$/.test(code)) out.push({ code, remark: hashRemark || rest.join(" ") });
+    }
+    return out;
+}
+
 // ---------- 筛选（纯函数，测试可见） ----------
 
 export interface ScreenFilter {
@@ -400,9 +430,28 @@ export class MarketDataService extends Service {
         return this.source.fetchQuotes(codes);
     }
 
-    /** 注册模型面的两个只读工具。 */
+    /** 注册模型面的只读工具（S1 两件 + S2 自选股清单）。 */
     attachTools(): void {
         const tools = this.ctx.require<ToolsService>("tools");
+        tools.register({
+            name: "get_watchlist",
+            description: "读取自选股清单（代码 + 备注）。文件：~/.mini-claude/stocks/watchlist.txt，"
+                + "一行一只（sh600000  # 备注可选）。不存在时返回创建指引。/brief 技能的默认输入源。",
+            parameters: { type: "object", properties: {} },
+            permissionHint: "read",
+            execute: () => {
+                const path = watchlistPath();
+                if (!existsSync(path)) {
+                    return `No watchlist yet. Create it at:\n  ${path}\nFormat: one code per line, e.g.\n`
+                        + `  sh600000  # 浦发银行\n  sz300750  # 宁德时代\n`
+                        + `Or pass codes directly as /brief arguments: /brief sh600000,sz300750`;
+                }
+                const entries = parseWatchlist(readFileSync(path, "utf-8"));
+                if (entries.length === 0) return `Watchlist is empty (${path}).`;
+                return [`watchlist (${entries.length}) — ${path}`,
+                    ...entries.map((e) => `${e.code}${e.remark ? `  # ${e.remark}` : ""}`)].join("\n");
+            },
+        });
         tools.register({
             name: "get_quote",
             description: "获取 A 股个股实时行情明细（价格/涨跌/成交量额/买卖五档快照来源：新浪）。"

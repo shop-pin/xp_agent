@@ -215,9 +215,15 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
             },
         }]
         : [{ id: "host", name: "host-webserver", disabled: true }],
-    // S1：股票版——启用行情数据面（get_quote/screen_market 两个只读工具）。
-    // 纯数据面插件无需宿主桥，行数组即可；与 web 的组合走 extraRows（--patch）。
-    stock: [
+    // S1+S2：股票版——启用行情数据面 + 产品内置技能层（my_src/skills/，
+    // product rank 5：用户/项目同名技能可覆盖）。工厂形态是因为 skills 行
+    // 的 catalogInjection 要跟宿主走（子 agent 不注入目录——D1 语义，整行
+    // 替换不能丢掉 app 层给的这个开关）。
+    stock: (host) => host ? [
+        { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
+        { id: "market", name: "market-data" },
+    ] : [
+        { id: "skills", name: "skills-registry", config: { productSkills: true } },
         { id: "market", name: "market-data" },
     ],
 }

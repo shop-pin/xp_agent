@@ -111,8 +111,7 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 | 章 | 状态 | 完成记录 |
 |---|---|---|
 | S1 | ✅ 完成（2026-10-18） | `stock-S1.md`；market-data 插件（QuoteSource 接缝——**主源新浪/备源东财，东财 WAF 掐 Node 记档 §4-1**、MarketDataService 时段 duty cycle + 环形缓冲、get_quote/screen_market 两只读工具）+ `--profile stock`（base 默认 disabled）+ 11 测试（fixture 回放 + 两源对拍）+ 真机冒烟 5,576 只/1.73s；顺路抓获 ch8 偶发红第二根因（memory 索引/selector 双排序竞态，独立修）；cordis 199/199、mock 28 全绿、snapshot 28/28×2（ch8 重录）；建议 commit：`add market data plugin with sina quote sources and stock profile`（ch8 修另立：`make memory index and selector ordering deterministic`） |
-| S2 | ⬜ 未开始 | /brief 速览技能 + watchlist |
-| S3 | ⬜ 未开始 | 新闻插件（轮询+去重+latest_news） |
+| S2 | ✅ 完成（2026-10-18） | `stock-S2.md`；**产品内置技能层**（skills-registry 增 product provider rank 5，`my_src/skills/` 随产品发货，productSkills 配置开关——base 目录注入零变化）+ `/brief` 技能（inline，只报事实边界条款）+ `get_watchlist` 工具（路径归属代码；`~/.mini-claude/stocks/watchlist.txt`）+ stock profile 工厂化（catalogInjection 跟宿主）+ **mock 场景 34**（stock 首个进快照体系：extraRows 注入 MockQuoteSource 的样板模式）；cordis 203/203、mock 29 场景、snapshot 29/29×2（ch34 新录）；翻车记档：parseWatchlist 剥 `#` 自相矛盾（测试抓获）；建议 commit：`add product skill layer with brief skill and watchlist` |
 | S4 | ⬜ 未开始 | /news-brief 消息技能 |
 | S5 | ⬜ 未开始 | 信号引擎（指标+规则+信号事件） |
 | S6 | ⬜ 未开始 | 裁决技能（verdict JSON） |

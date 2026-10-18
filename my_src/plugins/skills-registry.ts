@@ -3,7 +3,8 @@
 //
 // 三层：
 //   ① provider registry（SkillRegistry 服务）：同名按 rank 竞争——project 覆盖
-//      user 的现状 = rank 实现（user=10，project=20，高 rank 后写胜）
+//      user 的现状 = rank 实现（S2 增产品内置层：product=5 < user=10 < project=20，
+//      高 rank 后写胜——用户/项目同名可覆盖产品技能）
 //   ② 目录发现：文件扫描从 skills.ts 迁入（每次现扫——旧的模块级缓存消亡，
 //      换取 registry 视图永远新鲜）
 //   ③ 目录注入：pre-step 监听器在会话首批输入（historyEmpty）追加 catalog
@@ -13,6 +14,7 @@
 import { existsSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { fileURLToPath } from "url";
 import { Service } from "../cordis/service.js";
 import type { Context } from "../cordis/context.js";
 import { parseSkillFile, buildSkillDescriptions, type SkillDefinition } from "../skills.js";
@@ -54,8 +56,8 @@ export class SkillRegistry extends Service {
     }
 }
 
-/** 目录扫描（自 skills.ts 的 loadSkillsFromDir 原样迁入）。 */
-function scanSkillDir(baseDir: string, source: "user" | "project"): SkillDefinition[] {
+/** 目录扫描（自 skills.ts 的 loadSkillsFromDir 原样迁入；S2 增 product 层）。 */
+function scanSkillDir(baseDir: string, source: "user" | "project" | "product"): SkillDefinition[] {
     if (!existsSync(baseDir)) return [];
     let entries: string[];
     try {
@@ -79,8 +81,20 @@ function scanSkillDir(baseDir: string, source: "user" | "project"): SkillDefinit
 
 export const skillsPlugin = {
     name: "skills-registry",
-    apply(ctx: Context, config: { catalogInjection?: boolean } = {}) {
+    apply(ctx: Context, config: { catalogInjection?: boolean; productSkills?: boolean } = {}) {
         const reg = new SkillRegistry(ctx, "skills");
+        // S2：产品内置技能层（对齐真 CC 的 built-in skills）——rank 5 低于
+        // user(10)/project(20)：产品给的默认能力，用户/项目同名可覆盖。
+        // 默认关（stock profile 打开）：base 的目录注入不增行，mock/snapshot
+        // 锚定的首条 user 消息零变化。
+        if (config.productSkills) {
+            reg.registerProvider({
+                source: "product",
+                rank: 5,
+                list: () => scanSkillDir(
+                    fileURLToPath(new URL("../../skills", import.meta.url)), "product"),
+            });
+        }
         reg.registerProvider({
             source: "user",
             rank: 10,
