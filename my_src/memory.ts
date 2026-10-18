@@ -71,13 +71,11 @@ export function listMemories(): MemoryEntry[] {
             });
         } catch { /* skip corrupt files */ }
     }
-    entries.sort((a, b) => {
-        try {
-            const statA = statSync(join(dir, a.filename));
-            const statB = statSync(join(dir, b.filename));
-            return statB.mtimeMs - statA.mtimeMs;
-        } catch { return 0; }
-    });
+    // 排序键=文件名字典序：索引是目录页不是时间线。mtime 排序在批量写入下
+    // 是竞态——同毫秒完成的两次写在 NTFS 时间片粒度下时序不稳定（同 tick 平局
+    // 落 readdir 序、跨 tick 落真实先后），MEMORY.md 行序随之闪变（ch8 snapshot
+    // 偶发红的第二根因，2026-10-18 抓获：editor→deploy→color 闪成 →color→deploy）
+    entries.sort((a, b) => a.filename.localeCompare(b.filename));
     return entries;
 }
 
@@ -164,7 +162,12 @@ export function scanMemoryHeaders(): MemoryHeader[] {
             });
         } catch { /* skip corrupt files */ }
     }
-    headers.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    // 秒级时间桶降序 + 文件名字典序决胜：批量写入的相邻两次写常落进同一
+    // NTFS 时间片——mtimeMs 平局落 readdir 序、跨片落真实先后，manifest 行序
+    // 随之闪变（ch8 snapshot 偶发红的根因之二，2026-10-18 抓获）。桶内字典序
+    // 完全确定；桶间仍保近似新近度（MAX_MEMORY_FILES 截断的语义）。
+    const bucket = (ms: number) => Math.floor(ms / 1000);
+    headers.sort((a, b) => bucket(b.mtimeMs) - bucket(a.mtimeMs) || a.filename.localeCompare(b.filename));
     return headers.slice(0, MAX_MEMORY_FILES);
 }
 
