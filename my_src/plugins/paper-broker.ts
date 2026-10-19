@@ -127,6 +127,9 @@ export class PaperBroker extends Service {
     cash: number;
     /** 累计已实现盈亏（元）。 */
     realizedPnl = 0;
+    /** 当日已实现盈亏（S8 日亏上限的口粮；日切清零）。 */
+    dayPnl = 0;
+    private dayPnlDate = "";
     private positions = new Map<string, PositionState>();
     private orderSeq = 0;
 
@@ -157,6 +160,19 @@ export class PaperBroker extends Service {
             p.day = today;
             p.boughtToday = 0;
         }
+    }
+
+    private rollPnlDay(today: string): void {
+        if (this.dayPnlDate !== today) {
+            this.dayPnlDate = today;
+            this.dayPnl = 0;
+        }
+    }
+
+    /** 当日已实现盈亏（惰性日切——读取即对齐今天）。 */
+    todayPnl(): number {
+        this.rollPnlDay(cnDay(this.now().getTime()));
+        return this.dayPnl;
     }
 
     /** 下单：校验（码/整手/价带/资金/持仓）→ 纸面成交 → 账本+注记+事件。 */
@@ -207,6 +223,8 @@ export class PaperBroker extends Service {
         const pnl = round2(amount - fee - basis);
         this.cash = round2(this.cash + amount - fee);
         this.realizedPnl = round2(this.realizedPnl + pnl);
+        this.rollPnlDay(today);
+        this.dayPnl = round2(this.dayPnl + pnl);
         p.qty -= qty;
         p.cost = round2(p.cost - basis);
         if (p.qty === 0) this.positions.delete(order.code);
@@ -279,6 +297,8 @@ export class PaperBroker extends Service {
         } else {
             this.cash = round2(this.cash + amount - f.fee);
             this.realizedPnl = round2(this.realizedPnl + (f.realizedPnl ?? 0));
+            this.rollPnlDay(today);
+            this.dayPnl = round2(this.dayPnl + (f.realizedPnl ?? 0));
             if (p) {
                 this.rollDay(p, today);
                 const basis = round2(p.cost * (f.qty / p.qty));

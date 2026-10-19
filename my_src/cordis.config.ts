@@ -49,6 +49,7 @@ import { marketDataPlugin } from "./plugins/market-data.js";
 import { newsFeedPlugin } from "./plugins/news-feed.js";
 import { signalEnginePlugin } from "./plugins/signal-engine.js";
 import { paperBrokerPlugin } from "./plugins/paper-broker.js";
+import { tradeGuardPlugin } from "./plugins/trade-guard.js";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -79,6 +80,7 @@ export const plugins: Record<string, Plugin> = {
     "news-feed": newsFeedPlugin,
     "signal-engine": signalEnginePlugin,
     "paper-broker": paperBrokerPlugin,
+    "trade-guard": tradeGuardPlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -114,6 +116,10 @@ export const baseRows: Row[] = [
     { id: "core-fs", name: "core-fs-tools" },
     { id: "core-exec", name: "core-exec-tools" },
     { id: "core-meta", name: "core-meta-tools" },
+    // S8：交易风控——行位在 approval 之前（瀑布最外层：违规单 deny 短路，
+    // 审批卡不发问）。带 inject 等待的插件激活晚、会掉到内层——guard 只
+    // inject 行位最早的 commands，market/broker 惰性取（章内记档）。
+    { id: "guard", name: "trade-guard", disabled: true },
     { id: "approval", name: "approval" },
     { id: "auto-approval", name: "auto-approval" },
     { id: "autonomy", name: "autonomy" },
@@ -233,12 +239,14 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     // 替换不能丢掉 app 层给的这个开关）。
     stock: (host) => host ? [
         { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
+        { id: "guard", name: "trade-guard" },
         { id: "market", name: "market-data" },
         { id: "news", name: "news-feed" },
         { id: "signals", name: "signal-engine" },
         { id: "broker", name: "paper-broker" },
     ] : [
         { id: "skills", name: "skills-registry", config: { productSkills: true } },
+        { id: "guard", name: "trade-guard" },
         { id: "market", name: "market-data" },
         { id: "news", name: "news-feed" },
         { id: "signals", name: "signal-engine" },
@@ -251,6 +259,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
         ? [
             ...((profiles.web as (host?: AppHost) => Row[])(host)),
             { id: "skills", name: "skills-registry", config: { catalogInjection: true, productSkills: true } },
+            { id: "guard", name: "trade-guard" },
             { id: "market", name: "market-data" },
             { id: "news", name: "news-feed" },
             { id: "signals", name: "signal-engine" },
@@ -259,6 +268,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
         : [
             { id: "host", name: "host-webserver", disabled: true },
             { id: "skills", name: "skills-registry", config: { productSkills: true } },
+            { id: "guard", name: "trade-guard" },
             { id: "market", name: "market-data" },
             { id: "news", name: "news-feed" },
             { id: "signals", name: "signal-engine" },

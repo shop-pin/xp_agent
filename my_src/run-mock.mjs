@@ -1642,6 +1642,43 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "40": {
+    // S8：风控五件套端到端——ST 拒 / "全仓"指令拒（单票仓位上限）/ 合规单
+    // 放行成交 / 持仓汇总。guard 行位在 approval 外圈：两张拒单不该惊动
+    // confirm（计数文件锚定），只有放行那笔才问一次。
+    needsLog: true,
+    setup: () => {},
+    runs: [{ guardProbe: true }],
+    turns: [
+      { tools: [{ name: "place_order", input: { code: "sh600999", side: "buy", price: 5, qty: 100, reason: "cheap st stock" } }] },
+      { tools: [{ name: "place_order", input: { code: "sh600000", side: "buy", price: 10, qty: 25_000, reason: "verdict says all-in" } }] },
+      { tools: [{ name: "place_order", input: { code: "sh600000", side: "buy", price: 10, qty: 1_900, reason: "sized to risk limit" } }] },
+      { tools: [{ name: "get_portfolio", input: {} }] },
+      { text: "guard checks done." },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("five main requests (st/allin/ok/portfolio/answer)", reqs.length === 5);
+      check("ST order denied by guard",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("Denied: 风控排除标的：ST贵人")));
+      check("all-in order denied by position cap",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("Denied: 单票仓位上限：买入后 25.0% > 20%")
+          && t.content.includes("全仓")));
+      check("sized order fills",
+        (reqs[3]?.toolResults || []).some((t) => t.content.includes("Filled P0001: 买入 sh600000 1900 股 @ 10")
+          && t.content.includes("费用 5.19 元")));
+      check("portfolio reflects the one fill",
+        (reqs[4]?.toolResults || []).some((t) => t.content.includes("现金 980994.81 元")
+          && t.content.includes("持1900股 可卖0")));
+      const confirms = Number(readFileSync(join(dir, "confirms.txt"), "utf-8"));
+      check("denies short-circuit approval: exactly one confirm (the passing order)", confirms === 1);
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -2072,6 +2109,36 @@ if (s.runs) {
         await new Promise((r) => setTimeout(r, 50));
         await agent.chat("Run the paper trading checks.");
         if (agent.close) await agent.close();
+      } else if (r.guardProbe !== undefined) {
+        // S8：风控探针——profile stock 装配（guard 行替换 baseRows 占位行，
+        // 行位在 approval 之外圈——deny 短路审批）；market/broker/guard 三行
+        // 同 id 换 mock 配置（固定钟=开盘），news 行禁用保零网络。confirm
+        // 计数落 workdir——verify 锚定"拒单不惊动审批"。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const quotes = [
+          { code: "sh600000", name: "浦发银行", price: 10, change: 0, changePercent: 0, open: 10, high: 10, low: 10, preClose: 10, volume: 1000, amount: 1e7, turnoverRate: 0.3, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
+          { code: "sh600999", name: "ST贵人", price: 5, change: 0, changePercent: 0, open: 5, high: 5, low: 5, preClose: 5, volume: 1000, amount: 5e6, turnoverRate: 0.2, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
+        ];
+        const src = {
+          async fetchMarketSnapshot() { return quotes; },
+          async fetchQuotes() { return []; },
+        };
+        const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0)); // 周一 10:00 CST
+        let confirms = 0;
+        const agent = new agentMod.Agent({
+          profile: "stock",
+          extraRows: [
+            { id: "news", name: "news-feed", disabled: true },
+            { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
+            { id: "broker", name: "paper-broker", config: { now: () => fixed } },
+            { id: "guard", name: "trade-guard", config: { now: () => fixed } },
+          ],
+        });
+        agent.setConfirmFn(async () => { confirms++; return true; });
+        await new Promise((r) => setTimeout(r, 50));
+        await agent.chat("Run the guard checks.");
+        if (agent.close) await agent.close();
+        writeFileSync(join(workdir, "confirms.txt"), String(confirms));
       } else {
         await mod.runCli(r.argv);
       }
