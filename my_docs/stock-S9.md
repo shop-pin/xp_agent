@@ -89,6 +89,7 @@ S6 记档"fork 对插件工具白名单是断的（toolDefinitions 静态集）�
 3. **watch tick 链挂死进程（场景 41 首跑不退出）**：verify 全部打印完但进程挂着——ScheduleService 的 `after` 是裸 setTimeout（不 unref；对照 market-data 的轮询定时器 unref 了，所以 S7/S8 探针能退），探针手动 `watch.start()` 却只关 agent 不停 watch。修法：探针 finally 显式 `watch.stop()`。教训：**谁手动 start 谁 stop；挂在 schedule 上的键控定时器是事件循环的活句柄**。
 4. **快照波及面**：加 /review 技能（目录）+ save_memory/get_trades（tools 数组）→ stock 装配的请求体全变 → 34/36/38/39/40 五章重录（与 S4/S6 的"目录演进重录"同型，product 技能层是共享面的第三次兑现）。ch41 首放即绿。
 5. **snapshot runner record 模式尾行误报（记档不修）**：runner 的绿判定找 "✓ snapshot" 尾行，录制模式打的是 "⚑ snapshot recorded"——record 汇总恒显 ✗，文件实际落盘正常。改 runner 判定属工具修缮，遇下次批量重录再并。
+6. **web 黑屏 = F3 时代旧雷（手测清单第 4 项踩响，独立修复）**：用户跑 `--profile web-stock --web` 全黑。诊断链：curl 静态面 200（排除服务端）→ 无头 Chrome 复现 `#root` 空 → 控制台抓 `TypeError: Cannot read properties of undefined (reading 'listeners')` → 定位 renderer.tsx 把**脱绑方法** `store.subscribe` 直传 `useSyncExternalStore`——React 裸调 `subscribe(fn)` 不绑接收者，ES module 严格模式 `this=undefined`，首帧抛错整树卸载，只剩暗色背景。修法：`useCallback` 包一层箭头再传。教训：**方法当回调传必问"this 谁绑"；这类雷 tsc 不报、只在首帧炸，浏览器手测要进验收线**（此前手测显然没复跑过 10-18 构建）。另带出观察：host 只实现 GET，HEAD 请求落 API 404（非本次成因，挂账）。webui 修复独立 commit。
 
 ## 5. 验证记录（终态）
 

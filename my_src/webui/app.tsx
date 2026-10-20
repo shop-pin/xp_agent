@@ -7,7 +7,7 @@
 // app-state 的写集里维护）。节点装配用 useMemo 挂在 events 引用上——immer
 // 无变更不换引用，装配器不会空转（F3 自测题 2 的等值红利）。
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStoreSelector } from "./renderer.js";
 import { assembleConversation } from "./conversation.js";
 import { projectSession } from "./projection.js";
@@ -34,6 +34,23 @@ const selError = (s: WebUiState) => s.lastError;
 const selApproval = (s: WebUiState) => s.pendingApproval;
 const selNarrative = (s: WebUiState) => s.narrative;
 const selCommands = (s: WebUiState) => s.commands;
+
+// 主题（presentation 层状态，不进 store）：初值由 index.html 内联脚本在
+// 首帧前写好 data-theme（localStorage → 系统偏好 → dark），这里只做切换。
+function useTheme(): { theme: "dark" | "light"; toggle: () => void } {
+    const [theme, setTheme] = useState<"dark" | "light">(
+        () => (document.documentElement.dataset.theme === "light" ? "light" : "dark"),
+    );
+    const toggle = useCallback(() => {
+        setTheme((t) => {
+            const next = t === "dark" ? "light" : "dark";
+            document.documentElement.dataset.theme = next;
+            try { localStorage.setItem("mini-theme", next); } catch { /* 存储不可写，主题本次会话仍生效 */ }
+            return next;
+        });
+    }, []);
+    return { theme, toggle };
+}
 
 export function App({ store, actions }: { store: StoreInstance<WebUiState, any>; actions: AppActions }) {
     const session = useStoreSelector(store, selSession);
@@ -88,12 +105,17 @@ export function App({ store, actions }: { store: StoreInstance<WebUiState, any>;
         else actions.sendText(text);
     };
 
+    const { theme, toggle } = useTheme();
+
     return (
         <div className="app">
             <header>
                 <span className="dot" data-phase={phase} />
                 <span className="title">mini dsh</span>
                 <span className="muted">{endpoint} · {phase} · lastSeq {lastSeq}</span>
+                <button className="theme-toggle" onClick={toggle}>
+                    {theme === "dark" ? "浅色" : "深色"}
+                </button>
             </header>
             <aside>
                 <h2>会话</h2>

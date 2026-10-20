@@ -30,5 +30,8 @@ export function useStoreSelector<T, S>(
         cache.current = { source, value };
         return value;
     }, [store, sel, eq]);
-    return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
+    // subscribe 必须绑接收者——useSyncExternalStore 裸调 subscribe(fn) 不带
+    // this，脱绑方法（store.subscribe）首帧就抛 TypeError 整树卸载
+    const subscribe = useCallback((fn: () => void) => store.subscribe(fn), [store]);
+    return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
