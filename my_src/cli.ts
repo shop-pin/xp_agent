@@ -1,6 +1,8 @@
 import * as readline from "readline";
 import { pathToFileURL } from "url";
-import { resolve } from "path";
+import { resolve, dirname, join } from "path";
+import { mkdirSync, openSync, writeSync, closeSync } from "fs";
+import { homedir } from "os";
 import chalk from "chalk";
 import { Agent } from "./agent.js";
 import { getLatestSessionId } from "./plugins/session-jsonl.js";
@@ -8,6 +10,41 @@ import type { PermissionMode } from "./permissions.js";
 import { printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
 import type { CommandService } from "./services/commands.js";
 import type { Row } from "./cordis.config.js";
+
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+const SPINNER_RE = /^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+
+/** --log：终端输出同步转录到文件（挂机盯盘的滚屏替代品）。\r 是行重写不是
+ *  换行——spinner 每帧覆盖同一行，转录里只留最终版本；帧行与空行丢弃。 */
+function teeTerminalOutput(path: string): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const fd = openSync(path, "a");
+    let carry = "";
+    const flush = (line: string): void => {
+        if (SPINNER_RE.test(line)) return;
+        const t = line.trim();
+        if (t) writeSync(fd, t + "\n");
+    };
+    const feed = (chunk: string | Buffer): void => {
+        for (const ch of chunk.toString().replace(ANSI_RE, "")) {
+            if (ch === "\r") { carry = ""; continue; }
+            if (ch === "\n") { flush(carry); carry = ""; continue; }
+            carry += ch;
+        }
+    };
+    for (const stream of [process.stdout, process.stderr] as const) {
+        const orig = stream.write.bind(stream);
+        stream.write = ((chunk: any, ...rest: any[]) => { feed(chunk); return orig(chunk, ...rest); }) as typeof stream.write;
+    }
+    process.on("exit", () => closeSync(fd));
+}
+
+function cliLogPath(): string {
+    const p = (n: number) => String(n).padStart(2, "0");
+    const d = new Date();
+    const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    return join(homedir(), ".mini-claude", "logs", `cli-${ts}.log`);
+}
 
 /** E1：欢迎横幅消费命令注册表——命令清单不再是 cli 的硬编码知识。 */
 function printWelcome(commands: CommandService) {
@@ -42,6 +79,7 @@ Options:
   --patch <file>      Append plugin rows from a .mjs exporting "rows" (same-id rows override)
   --dump-config       Print the final merged plugin manifest and exit
   --web               Serve the web Host instead of the REPL (implies --profile web)
+  --log[=path]        Tee all terminal output to a file (default ~/.mini-claude/logs/cli-<ts>.log)
   --port <n>          Web host port (env MINI_WEB_PORT; 0 = random; default 3080)
   --help, -h          Show this help
   (model via env: ANTHROPIC_MODEL_ID, base URL via ANTHROPIC_BASE_URL)
@@ -69,6 +107,14 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     if (argv.includes("--resume")) {
         resume = true;
         argv = argv.filter((t) => t !== "--resume");
+    }
+    // --log 最先解析—— tee 从第一行输出（横幅/模式提示）就开始转录
+    const logFlag = argv.find((t) => t === "--log" || t.startsWith("--log="));
+    if (logFlag) {
+        argv = argv.filter((t) => t !== logFlag);
+        const logPath = logFlag.startsWith("--log=") ? logFlag.slice(6) : cliLogPath();
+        teeTerminalOutput(logPath);
+        console.log(`(log: ${logPath})`);
     }
     // 模式 flag 先解析完再构造 Agent——--plan 的 plan 文件路径在构造期生成
     // （对齐 src：parseArgs → new Agent({ permissionMode })，构造函数处理 plan 态）

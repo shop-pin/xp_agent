@@ -163,6 +163,8 @@ export class WatchService extends Service {
 
     private async fire(text: string, kind: string, day: string): Promise<void> {
         this.note({ kind, day, text: text.slice(0, 120) });
+        // 唤醒文本本身不进终端——转录里要有"这个 turn 是谁叫醒的"的头行
+        this.ctx.get<UiService>("ui")?.info(`🔔 ${text}`);
         if (!this.wake) return; // 无桥的树（dump-config 预览）只留注记
         try {
             await this.wake(text);
