@@ -348,7 +348,7 @@ export class PaperBroker extends Service {
         });
         tools.register({
             name: "get_portfolio",
-            description: "模拟盘账户：现金、持仓（可卖/成本/市值/浮盈）、总资产、累计已实现盈亏。市值按最新快照价估。",
+            description: "模拟盘账户：现金、持仓（可卖/成本/市值/浮盈）、总资产、累计与当日已实现盈亏。市值按最新快照价估。",
             parameters: { type: "object", properties: {} },
             permissionHint: "read",
             execute: () => {
@@ -364,8 +364,46 @@ export class PaperBroker extends Service {
                     const price = this.market?.latest?.byCode.get(pos.code)?.price ?? 0;
                     return s + price * pos.qty;
                 }, 0));
-                const header = `现金 ${round2(this.cash)} 元 | 持仓市值 ${totalValue} 元 | 总资产 ${round2(this.cash + totalValue)} 元 | 已实现盈亏 ${this.realizedPnl >= 0 ? "+" : ""}${this.realizedPnl} 元`;
+                const day = this.todayPnl();
+                const header = `现金 ${round2(this.cash)} 元 | 持仓市值 ${totalValue} 元 | 总资产 ${round2(this.cash + totalValue)} 元`
+                    + ` | 已实现盈亏 ${this.realizedPnl >= 0 ? "+" : ""}${this.realizedPnl} 元`
+                    + ` | 当日已实现 ${day >= 0 ? "+" : ""}${day} 元`;
                 return [header, ...(rows.length > 0 ? rows : ["（无持仓）"])].join("\n");
+            },
+        });
+        tools.register({
+            name: "get_trades",
+            description: "当日（或指定日）成交流水——复盘的账本视图。day 格式 YYYY-MM-DD（北京时间），缺省今天。",
+            parameters: {
+                type: "object",
+                properties: { day: { type: "string", description: "YYYY-MM-DD；缺省今天" } },
+            },
+            permissionHint: "read",
+            execute: (input) => {
+                const day = typeof input.day === "string" && /^\d{4}-\d{2}-\d{2}$/.test(input.day)
+                    ? input.day
+                    : cnDay(this.now().getTime());
+                const fills: any[] = [];
+                try {
+                    if (existsSync(this.ledgerPath)) {
+                        for (const line of readFileSync(this.ledgerPath, "utf-8").split("\n").filter(Boolean)) {
+                            try {
+                                const e = JSON.parse(line);
+                                if (e.type === "fill" && cnDay(e.at) === day) fills.push(e);
+                            } catch { /* 跳过坏行——账本以可解析行为准 */ }
+                        }
+                    }
+                } catch { /* 读不了当空账处理 */ }
+                if (fills.length === 0) return `${day} 无成交记录`;
+                const rows = fills.map((f) => {
+                    const pnl = f.realizedPnl !== null && f.realizedPnl !== undefined
+                        ? `，已实现 ${f.realizedPnl >= 0 ? "+" : ""}${f.realizedPnl}` : "";
+                    return `${f.orderId} ${f.side === "buy" ? "买" : "卖"} ${f.code} ${f.qty}股 @${f.price}`
+                        + ` 费${f.fee}${pnl}`;
+                });
+                const feeSum = round2(fills.reduce((s, f) => s + (f.fee ?? 0), 0));
+                const pnlSum = round2(fills.reduce((s, f) => s + (f.realizedPnl ?? 0), 0));
+                return [`${day} 成交 ${fills.length} 笔 | 费用合计 ${feeSum} 元 | 已实现合计 ${pnlSum} 元`, ...rows].join("\n");
             },
         });
     }

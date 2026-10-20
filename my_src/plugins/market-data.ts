@@ -410,6 +410,11 @@ export class MarketDataService extends Service {
         this.timer = null;
     }
 
+    /** 注入时钟的公共读口（S9 watch 的单一时钟源——行情时间就是盯盘时间）。 */
+    clock(): Date {
+        return this.now();
+    }
+
     /** 全市场刷新（并发去重：进行中就等同一趟）。完成时同步广播
      *  market/snapshot——S5 信号引擎等消费者在此挂评估。 */
     async refresh(): Promise<Snapshot> {

@@ -1679,6 +1679,70 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+
+  "41": {
+    // S9：盯盘编排全日走查（P3 总验收）——watch 启动即开盘巡检 turn；
+    // spike 刷新触发 market/signal → 盘中信号 turn（/adjudicate）；市场钟推到
+    // 收盘后 tick 状态机发复盘 turn（/review：portfolio/trades/save_memory）。
+    // 三个 turn 全部 wake 驱动——无用户 chat 输入，编排即产品形态。
+    needsLog: true,
+    setup: () => {},
+    runs: [{ watchProbe: true }],
+    turns: [
+      { tools: [{ name: "get_signals", input: {} }] },
+      { text: "今日盯盘计划：关注 sh600000 异动，风控位 -3%。" },
+      { tools: [{ name: "skill", input: { skill_name: "adjudicate", args: "sh600000" } }] },
+      { text: '{"verdicts":[{"code":"sh600000","action":"watch","confidence":0.4,"reasons":["纯技术形态"],"risks":["无消息佐证"]}]}\n\n裁决为研究输出，非投资建议。' },
+      { tools: [
+          { name: "get_portfolio", input: {} },
+          { name: "get_trades", input: {} },
+          { name: "save_memory", input: { type: "project", name: "模拟盘持仓 2026-10-19", description: "收盘持仓快照", content: "空仓，现金 100 万。今日无成交。" } },
+      ] },
+      { text: "复盘：今日无成交，信号一条（sh600000），保持空仓观察。复盘为研究输出，非投资建议。" },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("six main requests (patrol/signal/review turns ×2)", reqs.length === 6);
+      check("patrol wake text rides first request (with skill catalog)",
+        typeof reqs[0]?.firstUserText === "string" && reqs[0].firstUserText.includes("开盘巡检")
+          && reqs[0].firstUserText.includes("- **/review**:"));
+      check("patrol turn reads signals",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("信号 0 条")));
+      // 唤醒文本锚 lastUserText（本轮新 user 消息）——firstUserText 永远是
+      // 巡检首条：reqs[2] 必然假阴；reqs[4] 更险——技能目录里 "**/review**:
+      // 收盘复盘"字样会让 firstUserText 检查假阳串门（S4 泛锚教训复发）
+      check("signal wake text names the stock",
+        typeof reqs[2]?.lastUserText === "string" && reqs[2].lastUserText.includes("盘中信号")
+          && reqs[2].lastUserText.includes("sh600000"));
+      check("signal turn activates adjudicate",
+        (reqs[3]?.toolResults || []).some((t) => t.content.includes('[Skill "adjudicate" activated]')));
+      check("close wake text asks for /review",
+        typeof reqs[4]?.lastUserText === "string" && reqs[4].lastUserText.includes("收盘")
+          && reqs[4].lastUserText.includes("/review"));
+      check("review turn pulls portfolio/trades and saves memory",
+        (reqs[5]?.toolResults || []).some((t) => t.content.includes("现金 1000000 元")
+          && t.content.includes("当日已实现 +0 元"))
+        && (reqs[5]?.toolResults || []).some((t) => t.content.includes("2026-10-19 无成交记录"))
+        && (reqs[5]?.toolResults || []).some((t) => t.content.includes("Memory saved: project_")));
+      // memory 落盘（沙箱 HOME）——持仓快照真实存在，明早 /brief 可召回
+      let memoryOk = false;
+      try {
+        const projDir = join(homedir(), ".mini-claude", "projects");
+        for (const p of readdirSync(projDir)) {
+          const memDir = join(projDir, p, "memory");
+          if (!existsSync(memDir)) continue;
+          for (const f of readdirSync(memDir)) {
+            if (f.startsWith("project_") && readFileSync(join(memDir, f), "utf-8").includes("空仓，现金 100 万")) memoryOk = true;
+          }
+        }
+      } catch { /* 落盘缺失由断言报 */ }
+      check("position snapshot persisted under sandbox HOME", memoryOk);
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -2139,6 +2203,61 @@ if (s.runs) {
         await agent.chat("Run the guard checks.");
         if (agent.close) await agent.close();
         writeFileSync(join(workdir, "confirms.txt"), String(confirms));
+      } else if (r.watchProbe !== undefined) {
+        // S9：盯盘探针——profile stock 原生装配（watch 行带 host.wake 桥，不
+        // 覆盖）；market 两态 mock（平静→spike）+ 可变市场钟（broker/guard
+        // 同钟）；news 禁用零网络。tick 加速走 MINI_WATCH_TICK_MS 旋钮。
+        // 三个 turn 全部 wake 驱动：巡检→信号→复盘，无用户输入。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const q = (price) => ({
+          code: "sh600000", name: "平平稳稳", price, change: 0, changePercent: 4.5,
+          open: price, high: price, low: price, preClose: price / 1.045,
+          volume: 1000, amount: price * 1000 * 100, turnoverRate: 1, volumeRatio: 0,
+          marketCap: 0, floatCap: 0, pb: 0,
+        });
+        let fetchCount = 0;
+        let t = Date.UTC(2026, 9, 19, 2, 0, 0); // 周一 10:00 CST
+        const src = {
+          async fetchMarketSnapshot() { fetchCount++; return fetchCount === 1 ? [q(10)] : [q(10.35)]; },
+          async fetchQuotes() { return []; },
+        };
+        const now = () => new Date(t);
+        process.env.MINI_WATCH_TICK_MS = "10";
+        const agent = new agentMod.Agent({
+          profile: "stock",
+          extraRows: [
+            { id: "news", name: "news-feed", disabled: true },
+            { id: "market", name: "market-data", config: { source: src, now, pollIntervalMs: 60_000 } },
+            { id: "broker", name: "paper-broker", config: { now } },
+            { id: "guard", name: "trade-guard", config: { now } },
+          ],
+        });
+        const waitUntil = async (fn, ms = 5000) => {
+          const t0 = Date.now();
+          while (!fn()) {
+            if (Date.now() - t0 > ms) return false;
+            await new Promise((res) => setTimeout(res, 25));
+          }
+          return true;
+        };
+        try {
+          await new Promise((res) => setTimeout(res, 50)); // 首轮快照（平静）落定
+          const market = agent.cordis.get("market");
+          const watch = agent.cordis.get("watch");
+          watch.start();                                   // ① 开盘巡检 turn
+          await waitUntil(() => !agent.busy && watch.snapshot.patrolled);
+          await market.refresh();                          // ② spike → market/signal → 盘中信号 turn
+          await waitUntil(() => !agent.busy);
+          t = Date.UTC(2026, 9, 19, 7, 30, 0);             // 15:30 CST——tick 状态机观察收盘
+          await waitUntil(() => watch.snapshot.reviewed);   // ③ 复盘 turn
+          await waitUntil(() => !agent.busy);
+        } finally {
+          delete process.env.MINI_WATCH_TICK_MS;
+          // watch tick 链挂 schedule 裸 setTimeout（非 unref）——探针手动
+          // start 的，finally 必须手动 stop，否则进程挂着不退出
+          watch.stop();
+          if (agent.close) await agent.close();
+        }
       } else {
         await mod.runCli(r.argv);
       }

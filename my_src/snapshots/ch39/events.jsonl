@@ -24,8 +24,8 @@
 {"type":"assistant/message","content":[{"type":"tool_use","id":"toolu_mock_3_0","name":"get_portfolio","input":{}}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"tool-use"}
 {"type":"tool/call","id":"toolu_mock_3_0","name":"get_portfolio","input":{}}
-{"type":"tool/result","callId":"toolu_mock_3_0","content":"现金 899974 元 | 持仓市值 100000 元 | 总资产 999974 元 | 已实现盈亏 +0 元\nsh600000  浦发银行  持10000股 可卖0  成本100026  市值100000  浮盈-0.03%"}
-{"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_3_0","content":"现金 899974 元 | 持仓市值 100000 元 | 总资产 999974 元 | 已实现盈亏 +0 元\nsh600000  浦发银行  持10000股 可卖0  成本100026  市值100000  浮盈-0.03%"}]}
+{"type":"tool/result","callId":"toolu_mock_3_0","content":"现金 899974 元 | 持仓市值 100000 元 | 总资产 999974 元 | 已实现盈亏 +0 元 | 当日已实现 +0 元\nsh600000  浦发银行  持10000股 可卖0  成本100026  市值100000  浮盈-0.03%"}
+{"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_3_0","content":"现金 899974 元 | 持仓市值 100000 元 | 总资产 999974 元 | 已实现盈亏 +0 元 | 当日已实现 +0 元\nsh600000  浦发银行  持10000股 可卖0  成本100026  市值100000  浮盈-0.03%"}]}
 {"type":"turn/start"}
 {"type":"assistant/message","content":[{"type":"text","text":"paper trading checked."}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"end-turn"}
