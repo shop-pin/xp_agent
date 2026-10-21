@@ -28,7 +28,7 @@ import type { UiService } from "../services/ui-service.js";
 import type { SessionLog } from "../services/session-log.js";
 import type { ScheduleService } from "../services/schedule.js";
 import { marketPhase, type MarketDataService } from "./market-data.js";
-import { cnDay } from "./paper-broker.js";
+import { cnDay, type PaperBroker } from "./paper-broker.js";
 import type { Signal } from "./signal-engine.js";
 import type { TradeGuardService } from "./trade-guard.js";
 import { loadStrategy, type StrategyConfig } from "./strategy.js";
@@ -42,10 +42,25 @@ function cnHm(ts: number): string {
     return `${parts.hour}:${parts.minute}`;
 }
 
+/** 破止损线的持仓快照（drawdown 与 /portfolio 浮盈同口径：对含费总成本）。 */
+export interface RiskHit {
+    code: string;
+    qty: number;
+    availQty: number;
+    /** 含费总成本（元）。 */
+    cost: number;
+    /** 现价（元）。 */
+    price: number;
+    /** 相对含费总成本的浮动盈亏比例（负数，如 -0.0602）。 */
+    drawdown: number;
+}
+
 export interface WatchPrompts {
     open(date: string): string;
     /** sigs 新→旧；冷却窗内多笔合并成一个 digest turn（Day 1 P1 攒批）。 */
     signal(sigs: Signal[], time: string): string;
+    /** 破止损线的持仓（S14 离场节：watch 唤醒裁决，不自动卖）。 */
+    risk(hits: RiskHit[], time: string): string;
     close(date: string): string;
 }
 
@@ -63,6 +78,14 @@ export const defaultPrompts: WatchPrompts = {
     close: (date) =>
         `[盯盘 ${date} 收盘] 请运行 /review 做今日复盘（持仓与当日盈亏、当日成交、`
         + `信号与消息对照、memory 更新持仓与偏好、明日计划）。`,
+    risk: (hits, time) => {
+        const lines = hits.map((h) =>
+            `${h.code}：含费成本 ${h.cost} 元（${h.qty} 股，可卖 ${h.availQty}），`
+            + `现价 ${h.price}，浮亏 ${(h.drawdown * 100).toFixed(1)}%`);
+        return `[盯盘 持仓风控 ${time}] ${hits.length} 笔持仓破止损线：${lines.join("；")}。`
+            + `止损不自动卖：请逐笔 /adjudicate 裁决，确认破位的直接 place_order 卖出可卖部分`
+            + `（guard 会拦超限单）；若判为瞬时插针可暂持，但须给出理由与认错位。`;
+    },
 };
 
 export interface WatchConfig {
@@ -76,6 +99,8 @@ export interface WatchConfig {
     maxSignalAgeMs?: number;
     /** 同 code 每日最大唤醒次数（缺省走策略 watch.perCodeWakeCap）。 */
     perCodeWakeCap?: number;
+    /** 止损线（缺省走策略 exit.stopLossPct；0 = 关）。 */
+    stopLossPct?: number;
     /** 提示词覆盖（测试锚定）。 */
     prompts?: Partial<WatchPrompts>;
 }
@@ -93,10 +118,13 @@ export class WatchService extends Service {
     /** 信箱：同 code 留最新（冷却内的信号不再裸丢——Day 1 中恒集团被槽位饿死）。 */
     private pending = new Map<string, { sig: Signal; at: number }>();
     private wakeCounts = new Map<string, { day: string; count: number }>();
+    /** 风控已唤醒日：code → day（破线是持续状态，同 code 每日至多一次）。 */
+    private riskWoke = new Map<string, string>();
     private wake: ((text: string) => Promise<void>) | undefined;
     private cooldown: number;
     private maxSignalAgeMs: number;
     private perCodeWakeCap: number;
+    private stopLossPct: number;
     private prompts: WatchPrompts;
     private tickMs: number;
 
@@ -106,6 +134,7 @@ export class WatchService extends Service {
         this.cooldown = config.signalCooldownMs ?? 180_000;
         this.maxSignalAgeMs = config.maxSignalAgeMs ?? this.cooldown * 2;
         this.perCodeWakeCap = config.perCodeWakeCap ?? 2;
+        this.stopLossPct = config.stopLossPct ?? 0.05;
         this.prompts = { ...defaultPrompts, ...config.prompts };
         // 测试/演示加速旋钮（对齐 MINI_WEB_PORT 的 env 传参先例）
         this.tickMs = Number(process.env.MINI_WATCH_TICK_MS) || 30_000;
@@ -164,7 +193,37 @@ export class WatchService extends Service {
             this.reviewed = true;
             void this.fire(this.prompts.close(today), "close", today);
         }
-        if (phase === "open") this.flush(); // 冷却到期由 tick 兜底出账，不靠下一发信号
+        if (phase === "open") {
+            this.flush(); // 冷却到期由 tick 兜底出账，不靠下一发信号
+            this.checkStops();
+        }
+    }
+
+    /** 持仓风控（S14 离场节）：现价市值破含费成本止损线 → 唤醒裁决（不自动卖）。
+     *  破线是持续状态、没有新鲜度——同 code 每日至多唤醒一次（Day 1 教训：
+     *  重复唤醒没有新信息）；T+1 当日买入不可卖——无可卖部分不叫（叫了也执行不了）。 */
+    private checkStops(): void {
+        if (this.stopLossPct <= 0) return;
+        const market = this.ctx.get<MarketDataService>("market");
+        const broker = this.ctx.get<PaperBroker>("broker");
+        if (!market || !broker || !market.latest) return;
+        if (this.ctx.get<TradeGuardService>("guard")?.isHalted()) return;
+        const now = market.clock();
+        const day = cnDay(now.getTime());
+        const hits: RiskHit[] = [];
+        for (const p of broker.getPositions()) {
+            if (p.availQty <= 0 || p.qty <= 0 || p.cost <= 0) continue;
+            if (this.riskWoke.get(p.code) === day) continue;
+            const q = market.latest.byCode.get(p.code);
+            if (!q) continue;
+            const drawdown = (q.price * p.qty - p.cost) / p.cost;
+            if (drawdown > -this.stopLossPct) continue;
+            this.riskWoke.set(p.code, day);
+            hits.push({ code: p.code, qty: p.qty, availQty: p.availQty, cost: p.cost, price: q.price, drawdown });
+        }
+        if (hits.length > 0) {
+            void this.fire(this.prompts.risk(hits, cnHm(now.getTime())), "risk", day);
+        }
     }
 
     /** market/signal 监听：armed + 开盘中 + 未熔断才进信箱——冷却窗内不裸丢。 */
@@ -232,6 +291,7 @@ export const marketWatchPlugin: Plugin = {
             signalCooldownMs: config.signalCooldownMs ?? strategy.watch.signalCooldownMs,
             maxSignalAgeMs: config.maxSignalAgeMs ?? strategy.watch.maxSignalAgeMs,
             perCodeWakeCap: config.perCodeWakeCap ?? strategy.watch.perCodeWakeCap,
+            stopLossPct: config.stopLossPct ?? strategy.exit.stopLossPct,
         });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));
         ctx.effect(() => () => {

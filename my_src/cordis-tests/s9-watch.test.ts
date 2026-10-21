@@ -42,32 +42,42 @@ function mkSignal(ts: number): Signal {
 
 interface Mount {
     ctx: Context; watch: WatchService; wakes: string[]; tick: (ms: number) => void;
-    schedule: ScheduleService; cleanup: () => void;
+    schedule: ScheduleService; quotes: Quote[]; cleanup: () => void;
 }
 
-function mountWatch(cooldownMs = 180_000, at = MON_OPEN): Mount {
+function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: { broker?: boolean; stopLossPct?: number } = {}): Mount {
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
     new SessionLog(ctx, 'session-log')
     new CommandService(ctx, 'commands')
     const schedule = new ScheduleService(ctx, 'schedule')
+    const quotes: Quote[] = QUOTES.map((q) => ({ ...q })) // 止损场景要盘中改价
     const src: QuoteSource = {
-        async fetchMarketSnapshot() { return QUOTES },
+        async fetchMarketSnapshot() { return quotes },
         async fetchQuotes() { return [] },
     }
     let clock = at
     ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(clock), pollIntervalMs: 60_000 })
     ctx.plugin(tradeGuardPlugin, { now: () => new Date(clock), strategy: DEFAULT_STRATEGY })
+    let ledgerDir: string | undefined
+    if (opts.broker) {
+        ledgerDir = mkdtempSync(join(tmpdir(), 's9-stop-'))
+        ctx.plugin(paperBrokerPlugin, { ledgerPath: join(ledgerDir, 'paper.jsonl'), now: () => new Date(clock) })
+    }
     const wakes: string[] = []
     ctx.plugin(marketWatchPlugin, {
         wake: async (text: string) => { wakes.push(text) },
         signalCooldownMs: cooldownMs,
+        stopLossPct: opts.stopLossPct,
         strategy: DEFAULT_STRATEGY,
     })
     return {
-        ctx, watch: ctx.watch!, wakes, schedule,
+        ctx, watch: ctx.watch!, wakes, schedule, quotes,
         tick: (ms) => { clock += ms },
-        cleanup: () => { ctx.watch?.stop() },
+        cleanup: () => {
+            ctx.watch?.stop()
+            if (ledgerDir) rmSync(ledgerDir, { recursive: true, force: true })
+        },
     }
 }
 
@@ -271,6 +281,84 @@ test('tick 链：env 旋钮加速下，真实定时器走完 开盘→收盘 全
         m.cleanup()
     } finally {
         delete process.env.MINI_WATCH_TICK_MS
+    }
+})
+
+// ---------- 持仓风控（S14 离场节：止损唤醒裁决，不自动卖） ----------
+
+test('止损唤醒：T+1 可卖破线叫一次，同日不重复，跨日再叫', async () => {
+    const m = mountWatch(180_000, MON_OPEN, { broker: true })
+    try {
+        await m.ctx.market!.refresh()
+        // 周一买 10000@10：含费成本 = 100_000 + 26 = 100_026
+        await m.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m.quotes[0].price = 9.4 // 市值 94_000 → 浮亏 −6_026/100_026 = −6.0%，破 −5% 线
+        await m.ctx.market!.refresh()
+        m.watch.start()
+        assert.equal(m.wakes.filter((w) => w.includes('持仓风控')).length, 0,
+            'T+1：当日买入全部不可卖，破线也不叫（叫了执行不了）')
+        m.tick(TUE_OPEN - MON_OPEN)
+        await m.ctx.market!.refresh()
+        m.watch.evaluate()
+        assert.match(m.wakes.at(-1)!, /持仓风控/)
+        assert.match(m.wakes.at(-1)!, /sh600000：含费成本 100026 元（10000 股，可卖 10000），现价 9\.4，浮亏 -6\.0%/)
+        m.watch.evaluate()
+        assert.equal(m.wakes.filter((w) => w.includes('持仓风控')).length, 1, '破线是持续状态：同 code 当日只叫一次')
+        m.tick(86_400_000) // 周三，价格未回线
+        await m.ctx.market!.refresh()
+        m.watch.evaluate()
+        assert.equal(m.wakes.filter((w) => w.includes('持仓风控')).length, 2, '跨日重置：新的一天再叫')
+    } finally {
+        m.cleanup()
+    }
+})
+
+test('止损静默面：未破线不叫；stopLossPct=0 关；熔断中不叫', async () => {
+    // 未破线：−0.5% 在 −5% 线上
+    const m1 = mountWatch(180_000, MON_OPEN, { broker: true })
+    try {
+        await m1.ctx.market!.refresh()
+        await m1.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m1.tick(86_400_000)
+        m1.quotes[0].price = 9.95 // 市值 99_500 → −0.5%，未破线
+        await m1.ctx.market!.refresh()
+        m1.watch.start()
+        m1.watch.evaluate()
+        assert.equal(m1.wakes.filter((w) => w.includes('持仓风控')).length, 0)
+    } finally {
+        m1.cleanup()
+    }
+
+    // stopLossPct = 0 = 关：破线也不叫
+    const m2 = mountWatch(180_000, MON_OPEN, { broker: true, stopLossPct: 0 })
+    try {
+        await m2.ctx.market!.refresh()
+        await m2.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m2.tick(86_400_000)
+        m2.quotes[0].price = 9.4
+        await m2.ctx.market!.refresh()
+        m2.watch.start()
+        m2.watch.evaluate()
+        assert.equal(m2.wakes.filter((w) => w.includes('持仓风控')).length, 0, '0 = 关')
+    } finally {
+        m2.cleanup()
+    }
+
+    // 熔断：与信号唤醒同一静默面（guard 拒单期间叫醒裁决 = 白烧 turn）
+    const m3 = mountWatch(180_000, MON_OPEN, { broker: true })
+    try {
+        await m3.ctx.market!.refresh()
+        await m3.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m3.tick(86_400_000)
+        m3.quotes[0].price = 9.4
+        await m3.ctx.market!.refresh()
+        const commands = m3.ctx.require<CommandService>('commands')
+        await commands.dispatch('/halt 演练')
+        m3.watch.start()
+        m3.watch.evaluate()
+        assert.equal(m3.wakes.filter((w) => w.includes('持仓风控')).length, 0, '熔断中不叫')
+    } finally {
+        m3.cleanup()
     }
 })
 

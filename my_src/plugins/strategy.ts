@@ -58,8 +58,14 @@ export interface WatchConfig {
 export interface RiskConfig {
     /** 单票市值占净资产上限（guard ⑤）。 */
     maxPositionPct: number;
-    /** 单日已实现亏损上限（元，guard ④）。 */
+    /** 单日已实现亏损上限（元，guard ④）——15,000 = 300k 账户的 5%/日（挂账 #2 已收紧）。 */
     maxDailyLoss: number;
+}
+
+export interface ExitConfig {
+    /** 止损线（2026-10-22 用户定 −5%）：相对含费成本，只对 T+1 可卖部分生效；
+     *  触发 = watch 持仓风控唤醒裁决，不自动卖。0 = 关。 */
+    stopLossPct: number;
 }
 
 export interface PoolConfig {
@@ -83,6 +89,7 @@ export interface StrategyConfig {
     signals: SignalsConfig;
     watch: WatchConfig;
     risk: RiskConfig;
+    exit: ExitConfig;
     pool: PoolConfig;
     backtest: BacktestConfig;
 }
@@ -99,7 +106,8 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
         cooldownMs: 300_000, dailyFireCap: 2, refireGrowth: 1.5, flipGrowth: 2,
     },
     watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2 },
-    risk: { maxPositionPct: 0.2, maxDailyLoss: 50_000 },
+    risk: { maxPositionPct: 0.2, maxDailyLoss: 15_000 },
+    exit: { stopLossPct: 0.05 },
     pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, pbMin: 0, recentDays: 365 },
     backtest: { slippage: 0.002, initialCash: 1_000_000 },
 };
@@ -124,6 +132,7 @@ export function loadStrategy(userPath?: string): StrategyConfig {
         signals: { ...DEFAULT_STRATEGY.signals, ...user.signals },
         watch: { ...DEFAULT_STRATEGY.watch, ...user.watch },
         risk: { ...DEFAULT_STRATEGY.risk, ...user.risk },
+        exit: { ...DEFAULT_STRATEGY.exit, ...user.exit },
         pool: { ...DEFAULT_STRATEGY.pool, ...user.pool },
         backtest: { ...DEFAULT_STRATEGY.backtest, ...user.backtest },
     };
