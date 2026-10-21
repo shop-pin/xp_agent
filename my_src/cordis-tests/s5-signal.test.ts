@@ -98,17 +98,26 @@ test('limit-approach：距板 ≤0.5% 触发（分板 + 双向）', () => {
     assert.equal(rule.evaluate({ quote: quote({ name: 'ST 测', changePercent: 4.9 }), series: [] })?.direction, 'up')
     assert.equal(rule.evaluate({ quote: quote({ changePercent: -9.8 }), series: [] })?.direction, 'down')
     assert.equal(rule.evaluate({ quote: quote({ changePercent: 9.2 }), series: [] }), null)
+    // N 前缀首日无板位（Day 1：N文峰 +267% 被按 30% 算出"距涨停 −237%"）
+    assert.equal(rule.evaluate({ quote: quote({ name: 'N文峰', changePercent: 267 }), series: [] }), null)
 })
 
 test('volume-surge / breakout：量能确认门槛', () => {
     const surgeRule = defaultRules().find((r) => r.name === 'volume-surge')!
     const brkRule = defaultRules().find((r) => r.name === 'breakout')!
     // 放量上涨序列：surge 6.4 + 5min +1.5% → volume-surge 触发
+    // （amount = 手×100股×价：probe 窗口分钟成交额 96 万 ≥ 30 万，绝对量检验过）
     const s: Point[] = []
     let v = 1000
-    for (let i = 0; i < 10; i++) { s.push(P(T0 + i * MIN, 10 + i * 0.001, v)); v += 60 }
-    s.push(P(T0 + 10 * MIN, 10.15, 2500))
+    for (let i = 0; i < 10; i++) { s.push(P(T0 + i * MIN, 10 + i * 0.001, v, v * 1000)); v += 60 }
+    s.push(P(T0 + 10 * MIN, 10.15, 2500, 2_500_000))
     assert.equal(surgeRule.evaluate({ quote: quote({}), series: s })?.rule, 'volume-surge')
+    // 绝对量检验（Day 1 P1）：同型序列但分钟成交额 9,600 元 < 30 万且无换手
+    // → 假比率（surge 依旧 6.4）在源头拦下
+    const thin = s.map((p) => ({ ...p, amount: p.amount / 100 }))
+    assert.equal(surgeRule.evaluate({ quote: quote({}), series: thin }), null)
+    // 换手腿兜底：同地量但当日累计换手 ≥ 0.5% → 放行
+    assert.equal(surgeRule.evaluate({ quote: quote({ turnoverRate: 0.6 }), series: thin })?.rule, 'volume-surge')
     // 零量 + 突破形态 → breakout 被量能硬门槛拦下（surge null 不放行）
     const flatBrk = [P(T0, 10), P(T0 + MIN, 10.1), P(T0 + 2 * MIN, 10.2), P(T0 + 3 * MIN, 10.15), P(T0 + 4 * MIN, 10.3), P(T0 + 5 * MIN, 10.45)]
     assert.equal(brkRule.evaluate({ quote: quote({}), series: flatBrk }), null)
@@ -119,6 +128,32 @@ test('volume-surge / breakout：量能确认门槛', () => {
         amount: p.price * [1000, 1060, 1120, 1180, 1240, 2000][i] * 100,
     }))
     assert.equal(brkRule.evaluate({ quote: quote({}), series: volBrk })?.direction, 'up')
+})
+
+test('breakout 双门槛 + 幅度腿 tick 归一（Day 1 P1）', () => {
+    const brk = defaultRules().find((r) => r.name === 'breakout')!
+    // 形态：窗内高点 10 → 末价 10.072（+0.72% tick 级）；量 surge ≈ 1.875（1.5–2.5 之间）
+    const series = [10, 9.95, 10, 9.98, 10, 10.072].map(
+        (p, i) => P(T0 + i * MIN, p, [1000, 1333, 1666, 2000, 2000, 2600][i]),
+    )
+    // 普价股：0.72% ≥ 幅度下限 0.5% → 幅度腿过线，发
+    assert.equal(brk.evaluate({ quote: quote({ price: 10.072 }), series })?.direction, 'up')
+    // 低价股：幅度下限 = 2tick/价 = 0.02/1.40 = 1.43%——同一个 0.72% 只是两个 tick
+    // （*ST田野 1.38 元一跳 0.72% 的 Day 1 样本）
+    const penny = [1.39, 1.38, 1.39, 1.385, 1.39, 1.4].map(
+        (p, i) => P(T0 + i * MIN, p, [1000, 1333, 1666, 2000, 2000, 2600][i]),
+    )
+    assert.equal(brk.evaluate({ quote: quote({ price: 1.4 }), series: penny }), null)
+    // 双门槛 OR：幅度 0.3% 不足但 surge 5.0 ≥ 2.5 → 量率腿单独放行
+    const surgey = [10, 9.95, 10, 9.98, 10, 10.03].map(
+        (p, i) => P(T0 + i * MIN, p, [1000, 1000, 1000, 1000, 1000, 3000][i]),
+    )
+    assert.equal(brk.evaluate({ quote: quote({ price: 10.03 }), series: surgey })?.direction, 'up')
+    // 两头都不沾（Day 1 主噪音形态）：0.29% + surge 1.875 → 拦
+    const weak = [10, 9.95, 10, 9.98, 10, 10.029].map(
+        (p, i) => P(T0 + i * MIN, p, [1000, 1333, 1666, 2000, 2000, 2600][i]),
+    )
+    assert.equal(brk.evaluate({ quote: quote({ price: 10.029 }), series: weak }), null)
 })
 
 // ---------- 引擎接线：事件驱动 + 冷却 + 工具 ----------

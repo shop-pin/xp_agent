@@ -3,8 +3,9 @@
 // 编排思想（总纲 §一"数据面/模型面分离"的 turn 侧推论）：巡检是代码的
 // 事（market-data 已在轮询），LLM turn 只在有内容时发生——三个 turn 来源：
 //   ① 开盘巡检：进入 open 后的第一个 tick 唤醒一次（/brief + 信号 + 计划）
-//   ② 盘中信号：market/signal 事件唤醒（节流 + 熔断时静默——halt 了就
-//      没必要叫醒裁决）
+//   ② 盘中信号：market/signal 事件唤醒（信箱攒批——冷却窗内同 code 留最新
+//      不裸丢，出账时超龄丢弃 + 同 code 日上限 + digest 合并一个 turn。
+//      Day 1 复盘 P1：80 个 turn 全在裁噪音，真信号还被槽位饿死）
 //   ③ 收盘复盘：当日巡检过且转入 closed 后唤醒一次（/review）
 //
 // 状态机（tick 驱动，不描墙钟目标）：schedule 键控 tick 每 tickMs 评估
@@ -42,7 +43,8 @@ function cnHm(ts: number): string {
 
 export interface WatchPrompts {
     open(date: string): string;
-    signal(sig: Signal, time: string): string;
+    /** sigs 新→旧；冷却窗内多笔合并成一个 digest turn（Day 1 P1 攒批）。 */
+    signal(sigs: Signal[], time: string): string;
     close(date: string): string;
 }
 
@@ -50,10 +52,13 @@ export const defaultPrompts: WatchPrompts = {
     open: (date) =>
         `[盯盘 ${date} 开盘巡检] 请依次：/brief（自选股要闻与行情概览）→ get_signals（早盘信号）→`
         + ` 若有信号跑 /adjudicate。最后给出今日盯盘计划（关注位与风控位）。`,
-    signal: (sig, time) =>
-        `[盯盘 盘中信号 ${time}] ${sig.code} ${sig.name}：${sig.note}（${sig.rule}/${sig.direction}，`
-        + `strength ${sig.strength}）。请 /adjudicate ${sig.code}；若 verdict 为 buy-candidate`
-        + ` 且信心充足，可 place_order 小仓位模拟（自动过风控与审批）。`,
+    signal: (sigs, time) => {
+        const lines = sigs.map((s) =>
+            `${s.code} ${s.name}：${s.note}（${s.rule}/${s.direction}，strength ${s.strength}）`);
+        return `[盯盘 盘中信号 ${time}] ${sigs.length} 笔待裁：${lines.join("；")}。`
+            + `请逐笔 /adjudicate；若某笔 verdict 为 buy-candidate 且信心充足，`
+            + `可 place_order 小仓位模拟（自动过风控与审批）。`;
+    },
     close: (date) =>
         `[盯盘 ${date} 收盘] 请运行 /review 做今日复盘（持仓与当日盈亏、当日成交、`
         + `信号与消息对照、memory 更新持仓与偏好、明日计划）。`,
@@ -64,6 +69,12 @@ export interface WatchConfig {
     wake?: (text: string) => Promise<void>;
     /** 信号唤醒最小间隔 ms（默认 3 分钟——turn 经济性）。 */
     signalCooldownMs?: number;
+    /** 单信号最大待醒年龄 ms（flush 时超龄丢弃；默认 2×冷却窗——Day 1：
+     *  5 小时前的信号照常醒来。攒批需要余量，取 1×冷却窗会让冷却早期进
+     *  信箱的信号到出账时必然超龄）。 */
+    maxSignalAgeMs?: number;
+    /** 同 code 每日最大唤醒次数（默认 2——"已裁决码静音"的机械代理）。 */
+    perCodeWakeCap?: number;
     /** 提示词覆盖（测试锚定）。 */
     prompts?: Partial<WatchPrompts>;
 }
@@ -78,8 +89,13 @@ export class WatchService extends Service {
     private patrolled = false;
     private reviewed = false;
     private lastSignalWake = 0;
+    /** 信箱：同 code 留最新（冷却内的信号不再裸丢——Day 1 中恒集团被槽位饿死）。 */
+    private pending = new Map<string, { sig: Signal; at: number }>();
+    private wakeCounts = new Map<string, { day: string; count: number }>();
     private wake: ((text: string) => Promise<void>) | undefined;
     private cooldown: number;
+    private maxSignalAgeMs: number;
+    private perCodeWakeCap: number;
     private prompts: WatchPrompts;
     private tickMs: number;
 
@@ -87,6 +103,8 @@ export class WatchService extends Service {
         super(ctx, name);
         this.wake = config.wake;
         this.cooldown = config.signalCooldownMs ?? 180_000;
+        this.maxSignalAgeMs = config.maxSignalAgeMs ?? this.cooldown * 2;
+        this.perCodeWakeCap = config.perCodeWakeCap ?? 2;
         this.prompts = { ...defaultPrompts, ...config.prompts };
         // 测试/演示加速旋钮（对齐 MINI_WEB_PORT 的 env 传参先例）
         this.tickMs = Number(process.env.MINI_WATCH_TICK_MS) || 30_000;
@@ -145,9 +163,10 @@ export class WatchService extends Service {
             this.reviewed = true;
             void this.fire(this.prompts.close(today), "close", today);
         }
+        if (phase === "open") this.flush(); // 冷却到期由 tick 兜底出账，不靠下一发信号
     }
 
-    /** market/signal 监听：armed + 开盘中 + 未熔断 + 冷却外才唤醒。 */
+    /** market/signal 监听：armed + 开盘中 + 未熔断才进信箱——冷却窗内不裸丢。 */
     onSignal(sig: Signal): void {
         if (!this.armed) return;
         const market = this.ctx.get<MarketDataService>("market");
@@ -155,10 +174,36 @@ export class WatchService extends Service {
         const now = market.clock();
         if (marketPhase(now) !== "open") return;
         if (this.ctx.get<TradeGuardService>("guard")?.isHalted()) return;
+        this.pending.set(sig.code, { sig, at: now.getTime() });
+        this.flush();
+    }
+
+    /** 信箱出账：冷却窗外取一批（新→旧），超龄丢弃、同 code 超日上限丢弃——
+     *  落选者翻篇不欠 wake（引擎重发纪律会带新值再来）。 */
+    private flush(): void {
+        if (this.pending.size === 0) return;
+        const market = this.ctx.get<MarketDataService>("market");
+        if (!market) return;
+        const now = market.clock();
+        if (marketPhase(now) !== "open") return;
         const ts = now.getTime();
         if (ts - this.lastSignalWake < this.cooldown) return;
+        const day = cnDay(ts);
+        const eligible = [...this.pending.values()]
+            .filter((p) => ts - p.at <= this.maxSignalAgeMs)
+            .filter((p) => {
+                const c = this.wakeCounts.get(p.sig.code);
+                return !(c && c.day === day && c.count >= this.perCodeWakeCap);
+            })
+            .sort((a, b) => b.at - a.at);
+        this.pending.clear();
+        if (eligible.length === 0) return;
+        for (const p of eligible) {
+            const c = this.wakeCounts.get(p.sig.code);
+            this.wakeCounts.set(p.sig.code, { day, count: c && c.day === day ? c.count + 1 : 1 });
+        }
         this.lastSignalWake = ts;
-        void this.fire(this.prompts.signal(sig, cnHm(ts)), "signal", this.day || cnDay(ts));
+        void this.fire(this.prompts.signal(eligible.map((p) => p.sig), cnHm(ts)), "signal", this.day || day);
     }
 
     private async fire(text: string, kind: string, day: string): Promise<void> {

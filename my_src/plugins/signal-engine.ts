@@ -67,6 +67,20 @@ export function windowChange(series: Point[], windowMs: number): number | null {
     return ((last.price - base.price) / base.price) * 100;
 }
 
+/** probe 窗口基准点（volumeSurge 与绝对量检验共用同一选点口径）——序列 <3 点
+ *  返回 null。 */
+function probePoint(series: Point[], probeMs: number): Point | null {
+    if (series.length < 3) return null;
+    const last = series[series.length - 1];
+    const from = last.at - probeMs;
+    let probe = series[series.length - 1];
+    for (let i = series.length - 1; i >= 0; i--) {
+        if (series[i].at <= from) { probe = series[i]; break; }
+        probe = series[i];
+    }
+    return probe;
+}
+
 /** 日内量比近似：近 probeMs 量率 / 自观测起点平均量率（倍）。
  *  量是当日累计值，区间增量 = 差分。**基线分母用 (末-首) 增量**——观测起点
  *  之前已积累的当日存量不是我们观测到的流量（盘中启动时若不剔除，平均量率
@@ -75,12 +89,8 @@ export function volumeSurge(series: Point[], probeMs: number): number | null {
     if (series.length < 3) return null;
     const first = series[0];
     const last = series[series.length - 1];
-    let probe = series[series.length - 1];
-    const from = last.at - probeMs;
-    for (let i = series.length - 1; i >= 0; i--) {
-        if (series[i].at <= from) { probe = series[i]; break; }
-        probe = series[i];
-    }
+    const probe = probePoint(series, probeMs);
+    if (!probe) return null;
     const totalSpan = last.at - first.at;
     const probeSpan = last.at - probe.at;
     if (totalSpan <= 0 || probeSpan <= 0) return null;
@@ -88,6 +98,18 @@ export function volumeSurge(series: Point[], probeMs: number): number | null {
     const probeRate = (last.volume - probe.volume) / probeSpan;
     if (avgRate <= 0) return null;
     return probeRate / avgRate;
+}
+
+/** probe 窗口内的分钟成交额（元/分钟）——量率腿的绝对量检验（Day 1：4.9-6.6
+ *  倍的假比率全建立在每分钟几十手上，分母趋零时比率必然爆表）。序列不足/零窗 → null。 */
+export function probeAmountPerMin(series: Point[], probeMs: number): number | null {
+    if (series.length < 3) return null;
+    const last = series[series.length - 1];
+    const probe = probePoint(series, probeMs);
+    if (!probe || probe === last) return null;
+    const span = last.at - probe.at;
+    if (span <= 0) return null;
+    return Math.max(0, ((last.amount - probe.amount) / span) * 60_000);
 }
 
 /** 价格对当日均价（VWAP）的偏离 %。amount/volume 是累计值 → VWAP 只需末点：
@@ -170,6 +192,11 @@ export function defaultRules(): SignalRule[] {
                 const surge = volumeSurge(series, 60_000);
                 const chg = windowChange(series, 5 * 60_000);
                 if (surge === null || surge < 2.5 || chg === null || Math.abs(chg) < 1) return null;
+                // 绝对量检验（Day 1）：量率腿必须建立在真流量上——probe 窗口
+                // 分钟成交额 ≥ 30 万，或当日累计换手 ≥ 0.5%；两者皆无 = 零基线
+                // 假比率（方正阀门 6.6 倍 = 4 分钟零基线 ÷ 20 手）
+                const perMin = probeAmountPerMin(series, 60_000);
+                if ((perMin === null || perMin < 3e5) && quote.turnoverRate < 0.5) return null;
                 return {
                     code: quote.code, name: quote.name, rule: "volume-surge",
                     direction: chg > 0 ? "up" : "down",
@@ -183,12 +210,18 @@ export function defaultRules(): SignalRule[] {
             name: "breakout",
             evaluate({ quote, series }) {
                 const surge = volumeSurge(series, 60_000);
+                // 幅度腿按 tick 归一（Day 1）：低价股一个 tick 就冒充突破
+                // （*ST田野 1.38 元一跳 0.72%）——幅度下限 = max(0.5%, 2tick/价)
+                const minPct = Math.max(0.5, ((2 * 0.01) / quote.price) * 100);
                 for (const direction of ["up", "down"] as const) {
                     const pct = breakout(series, 5 * 60_000, 30_000, direction);
                     if (pct === null) continue;
                     // 量能确认是硬门槛：无量数据（surge null）同样不认——
                     // 否则零量序列的形态突破会裸奔（S5 翻车记档）
                     if (surge === null || surge < 1.5) continue;
+                    // 双门槛（Day 1）：幅度或量率至少一项过线——80 信号里
+                    // ~25 笔 tick 级（0.03%~0.46%）两头都不沾
+                    if (Math.abs(pct) < minPct && surge < 2.5) continue;
                     return {
                         code: quote.code, name: quote.name, rule: "breakout",
                         direction, strength: Math.round(pct * 100) / 100,
@@ -203,6 +236,9 @@ export function defaultRules(): SignalRule[] {
             name: "limit-approach",
             evaluate({ quote, series }) {
                 if (quote.price <= 0 || quote.preClose <= 0) return null;
+                // N 前缀首日无涨跌幅限制（Day 1：N文峰 +267% 被按 30% 板位
+                // 算出"距涨停 −237%"）——板位规则整条跳过
+                if (/^N/.test(quote.name)) return null;
                 const tier = limitTier(quote.code, quote.name);
                 const toLimit = tier - quote.changePercent;
                 const toLimitDown = -tier - quote.changePercent;

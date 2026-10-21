@@ -171,6 +171,62 @@ test('信号唤醒的静默条件：休市信号不响；熔断时不叫醒裁�
     }
 })
 
+test('信箱：冷却内信号不裸丢，tick 兜底出账（Day 1 中恒集团饿死修复）', async () => {
+    const m = mountWatch(180_000)
+    m.watch.start()
+    m.watch.onSignal(mkSignal(MON_OPEN)) // 第一发立即醒（信箱空转直出）
+    assert.equal(m.wakes.length, 2)
+    m.tick(10_000)
+    m.watch.onSignal({ ...SIG, code: 'sz000001', name: '安安稳稳', at: MON_OPEN + 10_000 })
+    assert.equal(m.wakes.length, 2, '冷却内进信箱不叫醒')
+    m.tick(180_000)
+    m.watch.evaluate() // 冷却到期由 tick 出账，不靠下一发信号
+    assert.equal(m.wakes.length, 3)
+    assert.match(m.wakes[2], /盘中信号/)
+    assert.match(m.wakes[2], /sz000001 安安稳稳/)
+    m.cleanup()
+})
+
+test('digest 攒批：冷却窗内多码留最新，到期合并一个 turn', async () => {
+    const m = mountWatch(180_000)
+    m.watch.start()
+    m.watch.onSignal(mkSignal(MON_OPEN)) // 醒①，消耗冷却窗
+    m.tick(10_000)
+    m.watch.onSignal({ ...SIG, code: 'sz000001', name: '安安稳稳', at: MON_OPEN + 10_000 })
+    m.tick(10_000)
+    m.watch.onSignal({ ...SIG, code: 'sz000002', name: '不咸不淡', at: MON_OPEN + 20_000 })
+    assert.equal(m.wakes.length, 2, '冷却内两发进信箱')
+    m.tick(180_000)
+    m.watch.evaluate()
+    assert.equal(m.wakes.length, 3)
+    assert.match(m.wakes[2], /2 笔待裁/)
+    assert.match(m.wakes[2], /sz000001 安安稳稳/)
+    assert.match(m.wakes[2], /sz000002 不咸不淡/)
+    m.cleanup()
+})
+
+test('信箱超龄丢弃 + 同 code 日上限（默认 2）', async () => {
+    const m = mountWatch(180_000)
+    m.watch.start()
+    m.watch.onSignal(mkSignal(MON_OPEN))          // 醒①
+    m.tick(10_000)
+    m.watch.onSignal(mkSignal(MON_OPEN + 10_000)) // 进信箱
+    m.tick(400_000)                               // 出账时信号已 400s > maxAge 2×180s
+    m.watch.evaluate()
+    assert.equal(m.wakes.filter((w) => w.includes('盘中信号')).length, 1, '超龄信号：旧闻丢弃')
+    m.cleanup()
+
+    const m2 = mountWatch(180_000)
+    m2.watch.start()
+    m2.watch.onSignal(mkSignal(MON_OPEN))                   // 醒①
+    m2.tick(181_000)
+    m2.watch.onSignal(mkSignal(MON_OPEN + 181_000))         // 醒②
+    m2.tick(181_000)
+    m2.watch.onSignal(mkSignal(MON_OPEN + 362_000))         // 同 code 第 3 发
+    assert.equal(m2.wakes.filter((w) => w.includes('盘中信号')).length, 2, '日上限：第 3 发静默')
+    m2.cleanup()
+})
+
 test('未武装（/watch 前）信号与评估都不唤醒；唤醒桥缺失只留注记不炸', async () => {
     const m = mountWatch()
     try {

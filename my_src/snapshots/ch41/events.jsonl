@@ -10,8 +10,8 @@
 {"type":"turn/start"}
 {"type":"assistant/message","content":[{"type":"text","text":"今日盯盘计划：关注 sh600000 异动，风控位 -3%。"}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"end-turn"}
-{"type":"meta/note","key":"watch","value":{"kind":"signal","day":"2026-10-19","text":"[盯盘 盘中信号 10:00] sh600000 平平稳稳：5分钟涨 3.5%（rapid-move/up，strength 3.5）。请 /adjudicate sh600000；若 verdict 为 buy-candidate 且信心"}}
-{"type":"user/message","content":"[盯盘 盘中信号 10:00] sh600000 平平稳稳：5分钟涨 3.5%（rapid-move/up，strength 3.5）。请 /adjudicate sh600000；若 verdict 为 buy-candidate 且信心充足，可 place_order 小仓位模拟（自动过风控与审批）。"}
+{"type":"meta/note","key":"watch","value":{"kind":"signal","day":"2026-10-19","text":"[盯盘 盘中信号 10:00] 1 笔待裁：sh600000 平平稳稳：5分钟涨 3.5%（rapid-move/up，strength 3.5）。请逐笔 /adjudicate；若某笔 verdict 为 buy-candidate 且信"}}
+{"type":"user/message","content":"[盯盘 盘中信号 10:00] 1 笔待裁：sh600000 平平稳稳：5分钟涨 3.5%（rapid-move/up，strength 3.5）。请逐笔 /adjudicate；若某笔 verdict 为 buy-candidate 且信心充足，可 place_order 小仓位模拟（自动过风控与审批）。"}
 {"type":"turn/start"}
 {"type":"assistant/message","content":[{"type":"tool_use","id":"toolu_mock_2_0","name":"skill","input":{"skill_name":"adjudicate","args":"sh600000"}}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"tool-use"}
