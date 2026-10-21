@@ -52,7 +52,15 @@ export interface Quote {
     pb: number;
     /** 快照时间（新浪明细才有：日期+时间）。 */
     quotedAt?: string;
+    /** 五档盘口（仅单票明细 hq 接口带；量=股——买卖压力是比值，量纲自消）。 */
+    book?: Book;
 }
+
+/** 盘口一档：价 p（元）+ 量 v（股）。 */
+export interface Level { p: number; v: number }
+
+/** 五档盘口（决策 #9：只进关注面，L2/逐笔不接）。 */
+export interface Book { bids: Level[]; asks: Level[] }
 
 /** 数据源接缝：换源 = 换实现，服务与工具零改。 */
 export interface QuoteSource {
@@ -144,6 +152,20 @@ async function emFetchPage(pageNo: number): Promise<EmPage> {
     return { total: json.data?.total ?? 0, diff: json.data?.diff ?? [] };
 }
 
+/** 五档盘口解析（S11）：hq 行 f[10..29] = 买一量,买一价,…,买五量,买五价,
+ *  卖一量,卖一价,…,卖五量,卖五价（量=股）。字段不足（指数等短行）→ undefined。 */
+function parseBook(f: string[]): Book | undefined {
+    if (f.length < 30) return undefined;
+    const level = (v: string, p: string): Level => ({ v: Math.round(num(v)), p: num(p) });
+    const bids: Level[] = [];
+    const asks: Level[] = [];
+    for (let i = 0; i < 5; i++) {
+        bids.push(level(f[10 + i * 2]!, f[11 + i * 2]!));
+        asks.push(level(f[20 + i * 2]!, f[21 + i * 2]!));
+    }
+    return { bids, asks };
+}
+
 /** 新浪响应 → Quote[]（纯函数；输入为 GBK 解码后的文本）。 */
 export function parseSinaResponse(text: string): Quote[] {
     const out: Quote[] = [];
@@ -165,6 +187,7 @@ export function parseSinaResponse(text: string): Quote[] {
             amount: Number(f[9]),
             turnoverRate: 0, volumeRatio: 0, marketCap: 0, floatCap: 0, pb: 0,
             quotedAt: `${f[30]} ${f[31]}`,
+            book: parseBook(f),
         });
     }
     return out;
@@ -484,7 +507,7 @@ export class MarketDataService extends Service {
         });
         tools.register({
             name: "get_quote",
-            description: "获取 A 股个股实时行情明细（价格/涨跌/成交量额/买卖五档快照来源：新浪）。"
+            description: "获取 A 股个股实时行情明细（价格/涨跌/成交量额/买卖五档盘口，来源：新浪）。"
                 + "code 带交易所前缀：sh600000（沪）/ sz000001（深）/ bj920196（北交所）。一次最多 30 只。",
             parameters: {
                 type: "object",
@@ -503,10 +526,12 @@ export class MarketDataService extends Service {
                 try {
                     const quotes = await this.detailQuotes(codes);
                     if (quotes.length === 0) return `No quotes found for: ${(input.codes as string[]).join(", ")}`;
+                    const fmtLevels = (ls: Level[]) => ls.map((l) => `${l.p.toFixed(2)}×${l.v}`).join("/");
                     return quotes.map((q) => {
                         const head = formatQuoteRow(q);
                         const detail = q.quotedAt ? `  [${q.quotedAt}]` : "";
-                        return head + detail;
+                        const book = q.book ? `\n  盘口 买[${fmtLevels(q.book.bids)}] 卖[${fmtLevels(q.book.asks)}]（量=股）` : "";
+                        return head + detail + book;
                     }).join("\n");
                 } catch (err) {
                     return `Error fetching quotes: ${(err as Error).message}`;

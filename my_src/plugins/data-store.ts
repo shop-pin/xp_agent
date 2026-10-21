@@ -23,7 +23,7 @@ import type { UiService } from "../services/ui-service.js";
 import { existsSync, mkdirSync, readFileSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { marketPhase, parseWatchlist, watchlistPath, type MarketDataService, type Quote, type Snapshot } from "./market-data.js";
+import { marketPhase, parseWatchlist, watchlistPath, type Book, type MarketDataService, type Quote, type Snapshot } from "./market-data.js";
 import { cnDay, type PaperBroker } from "./paper-broker.js";
 import type { Signal } from "./signal-engine.js";
 
@@ -108,6 +108,8 @@ export class DataStoreService extends Service {
     private universeCap: number;
     private timer: NodeJS.Timeout | null = null;
     private dailyWrittenDay = "";
+    /** 盘口轮询防重入（detailQuotes 异步——上一轮没回来不叠发）。 */
+    private bookBusy = false;
     /** 当日出现过信号的码——关注面宇宙的第三只腿（S11 盘口轮询共用口径）。 */
     private signalCodes = new Set<string>();
 
@@ -127,11 +129,13 @@ export class DataStoreService extends Service {
         this.ctx.on("market/signal", (sig) => this.onSignal(sig));
     }
 
-    /** 10s 小步巡检 phase——收盘是"观察到的迁移"不是"算出来的时刻"（watch 同款）。 */
+    /** 10s 小步巡检 phase——收盘是"观察到的迁移"不是"算出来的时刻"（watch 同款）；
+     *  同一心跳顺带关注面盘口轮询（S11，≤50 只/批——决策 #9 范围纪律）。 */
     start(): void {
         if (this.timer) return;
         this.timer = setInterval(() => {
             try { this.checkClose(); } catch { /* 收口失败下轮再试，不炸 */ }
+            void this.pollBooks();
         }, 10_000);
         this.timer.unref?.();
         this.checkClose(); // 晚间/收盘重启：首轮快照已落 → 立即补收口
@@ -223,6 +227,35 @@ export class DataStoreService extends Service {
         return [...codes].slice(0, this.universeCap);
     }
 
+    /** 关注面盘口轮询（S11）：universe 前 50 只批量拉 hq（自带五档）→ 广播
+     *  market/book（引擎压力因子的口粮）+ 盘口行追加进关注面明细层。
+     *  公共：测试不等 10s 心跳，直接调。 */
+    async pollBooks(): Promise<void> {
+        if (this.bookBusy) return;
+        const market = this.market();
+        if (!market || marketPhase(market.clock()) !== "open") return;
+        const codes = this.universeCodes().slice(0, 50);
+        if (codes.length === 0) return;
+        this.bookBusy = true;
+        try {
+            const quotes = await market.detailQuotes(codes);
+            const books = new Map<string, Book>();
+            const rows: string[] = [];
+            const at = market.clock().getTime();
+            for (const q of quotes) {
+                if (!q.book) continue;
+                books.set(q.code, q.book);
+                rows.push(JSON.stringify({ at, code: q.code, bid: q.book.bids, ask: q.book.asks }));
+            }
+            if (books.size === 0) return;
+            this.ctx.emit("market/book", { at, books });
+            const day = cnDay(at);
+            this.appendWithHeader(detailPath(this.root, day), SCHEMA_DETAIL, { day, startedAt: at }, rows);
+        } catch { /* 盘口轮询失败下一轮再试——尽力而为面 */ } finally {
+            this.bookBusy = false;
+        }
+    }
+
     private appendWithHeader(path: string, schema: string, headerExtra: Record<string, unknown>, rows: string[]): void {
         this.appendLines(path, [
             ...(existsSync(path) ? [] : [schemaHeader(schema, headerExtra)]),
@@ -312,6 +345,13 @@ function dirName(p: string): string {
 declare module "../cordis/context.js" {
     interface Context {
         dataStore?: DataStoreService;
+    }
+}
+
+declare module "../cordis/events.js" {
+    interface Events {
+        /** 关注面五档盘口（data-store 轮询广播——引擎压力因子/裁决上下文的口粮）。 */
+        "market/book"(b: { at: number; books: Map<string, Book> }): void;
     }
 }
 

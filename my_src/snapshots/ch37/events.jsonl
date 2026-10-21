@@ -5,8 +5,8 @@
 {"type":"assistant/message","content":[{"type":"tool_use","id":"toolu_mock_0_0","name":"get_signals","input":{"live":true}}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"tool-use"}
 {"type":"tool/call","id":"toolu_mock_0_0","name":"get_signals","input":{"live":true}}
-{"type":"tool/result","callId":"toolu_mock_0_0","content":"信号 1 条（规则 rapid-move/volume-surge/breakout/limit-approach，冷却 300s）\n[10:00] sh600000 平平稳稳 rapid-move ↑ 强度3.5 5分钟涨 3.5%"}
-{"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_0_0","content":"信号 1 条（规则 rapid-move/volume-surge/breakout/limit-approach，冷却 300s）\n[10:00] sh600000 平平稳稳 rapid-move ↑ 强度3.5 5分钟涨 3.5%"}]}
+{"type":"tool/result","callId":"toolu_mock_0_0","content":"信号 1 条（规则 rapid-move/volume-surge/breakout/limit-approach/book-pressure/volume-divergence，冷却 300s）\n[10:00] sh600000 平平稳稳 rapid-move ↑ 强度3.5 5分钟涨 3.5%"}
+{"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_0_0","content":"信号 1 条（规则 rapid-move/volume-surge/breakout/limit-approach/book-pressure/volume-divergence，冷却 300s）\n[10:00] sh600000 平平稳稳 rapid-move ↑ 强度3.5 5分钟涨 3.5%"}]}
 {"type":"turn/start"}
 {"type":"assistant/message","content":[{"type":"text","text":"signals checked."}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"end-turn"}

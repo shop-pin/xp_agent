@@ -28,7 +28,7 @@ import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
 import type { ToolsService } from "../services/tools.js";
-import { isExcludedStock, type MarketDataService, type HistoryRound, type Quote } from "./market-data.js";
+import { isExcludedStock, type MarketDataService, type HistoryRound, type Quote, type Book } from "./market-data.js";
 import { cnDay } from "./paper-broker.js";
 
 // ---------- 序列提取（纯函数） ----------
@@ -147,6 +147,16 @@ export function limitTier(code: string, name: string): number {
     return 10;
 }
 
+/** 买卖压力（S11）：(买五量−卖五量)/(买五量+卖五量) ∈ [−1,1]，>0 买方强。
+ *  无盘口/总量为零 → null（比值量纲自消，挂单量单位不影响）。 */
+export function bookPressure(book?: Book): number | null {
+    if (!book || book.bids.length === 0 || book.asks.length === 0) return null;
+    const bid = book.bids.reduce((s, l) => s + l.v, 0);
+    const ask = book.asks.reduce((s, l) => s + l.v, 0);
+    const total = bid + ask;
+    return total > 0 ? (bid - ask) / total : null;
+}
+
 // ---------- 规则注册表 ----------
 
 export interface Signal {
@@ -163,6 +173,8 @@ export interface Signal {
 export interface RuleContext {
     quote: Quote;
     series: Point[];
+    /** 五档盘口（关注面轮询才有的码才有——盘口类规则判 null 自行让路）。 */
+    book?: Book;
 }
 
 export interface SignalRule {
@@ -262,6 +274,52 @@ export function defaultRules(): SignalRule[] {
                 return null;
             },
         },
+        {
+            name: "book-pressure",
+            evaluate({ quote, series, book }) {
+                const pr = bookPressure(book);
+                if (pr === null || Math.abs(pr) < 0.6) return null;
+                const chg = windowChange(series, 5 * 60_000);
+                if (chg === null || Math.abs(chg) < 1) return null;
+                // 压力与价格同向才算数：价格没动/反向的挂单墙是托单压单把戏，
+                // 单看比值会被主动做出来（Day 1 纪律：机械门槛两条腿）
+                if (Math.sign(chg) !== Math.sign(pr)) return null;
+                return {
+                    code: quote.code, name: quote.name, rule: "book-pressure",
+                    direction: pr > 0 ? "up" : "down", strength: Math.round(pr * 100) / 100,
+                    note: `买卖压力 ${pr.toFixed(2)} + 5分钟${chg > 0 ? "涨" : "跌"}${Math.abs(chg).toFixed(1)}%`,
+                    at: series[series.length - 1].at,
+                };
+            },
+        },
+        {
+            name: "volume-divergence",
+            evaluate({ quote, series }) {
+                const chg = windowChange(series, 5 * 60_000);
+                const surge = volumeSurge(series, 60_000);
+                if (chg === null || surge === null) return null;
+                // 量价背离：价走出 1.5%+ 而量率趴在 0.8 倍以下——上涨无量=顶背离，
+                // 下跌无量=底背离（方向取背离语义）。strength = 背离段涨速（带符号，
+                // 与 rapid-move/breakout down 同约定）。
+                if (chg >= 1.5 && surge < 0.8) {
+                    return {
+                        code: quote.code, name: quote.name, rule: "volume-divergence",
+                        direction: "down", strength: Math.round(chg * 100) / 100,
+                        note: `顶背离：5分钟涨${chg.toFixed(1)}% 而量率仅 ${surge.toFixed(1)} 倍`,
+                        at: series[series.length - 1].at,
+                    };
+                }
+                if (chg <= -1.5 && surge < 0.8) {
+                    return {
+                        code: quote.code, name: quote.name, rule: "volume-divergence",
+                        direction: "up", strength: Math.round(chg * 100) / 100,
+                        note: `底背离：5分钟跌${Math.abs(chg).toFixed(1)}% 而量率仅 ${surge.toFixed(1)} 倍`,
+                        at: series[series.length - 1].at,
+                    };
+                }
+                return null;
+            },
+        },
     ];
 }
 
@@ -302,6 +360,8 @@ export class SignalEngine extends Service {
     private flipGrowth: number;
     /** 重发纪律账本：key -> { 日键, 当日发射数, 末次强度/方向 }——跨日惰性重置。 */
     private fireStats = new Map<string, { day: string; count: number; strength: number; direction: string }>();
+    /** 关注面盘口缓存（market/book 事件喂——data-store 轮询，决策 #9 只进关注面）。 */
+    private books = new Map<string, Book>();
 
     /** 新→旧。 */
     recent: Signal[] = [];
@@ -325,10 +385,13 @@ export class SignalEngine extends Service {
         }
     }
 
-    /** 挂到行情面：订阅 market/snapshot，逐轮评估。 */
+    /** 挂到行情面：订阅 market/snapshot 逐轮评估 + market/book 盘口缓存。 */
     attach(market: MarketDataService): void {
         this.market = market;
         this.ctx.on("market/snapshot", (snap) => this.evaluateSnapshot(snap));
+        this.ctx.on("market/book", (b) => {
+            for (const [code, book] of b.books) this.books.set(code, book);
+        });
     }
 
     /** 单轮评估：宇宙闸过滤后逐码跑规则注册表（纯函数，同步完成）。 */
@@ -345,7 +408,7 @@ export class SignalEngine extends Service {
             for (const rule of rules) {
                 let signal: Signal | null = null;
                 try {
-                    signal = rule.evaluate({ quote, series });
+                    signal = rule.evaluate({ quote, series, book: this.books.get(quote.code) });
                 } catch { /* 单规则单码抛错不炸整轮 */ }
                 if (!signal) continue;
                 const key = `${signal.code}#${rule.name}`;

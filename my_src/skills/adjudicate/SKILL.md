@@ -2,7 +2,7 @@
 name: adjudicate
 description: 信号裁决——对规则引擎的信号短名单结合最新消息逐条评估，输出结构化 verdict（action/confidence/reasons/risks）
 when-to-use: 用户问"这信号能不能跟""帮我看看这些异动"、或需要把 get_signals 的短名单变成可解释的判断时
-allowed-tools: [get_signals, latest_news, record_verdicts]
+allowed-tools: [get_signals, latest_news, record_verdicts, get_quote]
 context: inline
 ---
 
@@ -16,9 +16,12 @@ context: inline
 ## 裁决维度（逐信号过一遍）
 
 - **信号质量**：strength 多大？规则语义（突破=动能，涨停逼近=情绪极端，急涨=事件驱动？）
+- **盘口佐证（book-pressure/贴线票可看）**：`get_quote` 拉五档——买卖压力（买五量 vs 卖五量）与信号方向共振加信心，挂单墙与价格反向时点破（托单/压单把戏）
 - **消息面佐证或反驳**：有无对应利好/利空？共振加信心，矛盾降信心并点破
 - **真假摔判别**：信号与新闻方向矛盾时（如放量上攻 + 负面公告），confidence 必须压低并写明矛盾点
+- **量价背离**：volume-divergence 信号本身就是警示语义——顶背离的 up 追价、底背离的 down 杀跌都要降信心
 - **无消息**：纯技术形态，reasons 里明说"无消息面佐证"，不编造关联
+- **T+1 纪律（显式存在）**：当日买入的股票当日不可卖——buy-candidate 的离场窗口在**次日**；对已有持仓裁决时，区分"当日买入部分（不可卖）"与"昨日及以前买入部分（可卖）"，规避动作只对可卖部分成立
 
 ## verdict 契约（每信号一个对象，JSON 数组输出）
 

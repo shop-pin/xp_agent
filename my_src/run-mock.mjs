@@ -1781,6 +1781,31 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "43": {
+    // S11：盘口探针——get_quote 返回五档（列表源无盘口、明细源有——决策 #9
+    // 只进关注面）；盘口行文本钉格式（量=股）。
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-claude", "stocks"), { recursive: true });
+      writeFileSync(join(dir, ".mini-claude", "stocks", "watchlist.txt"), "sh600000  # 浦发银行\n");
+    },
+    runs: [{ bookProbe: true }],
+    turns: [
+      { tools: [{ name: "get_quote", input: { codes: ["sh600000"] } }] },
+      { text: "浦发银行买五档合计强于卖五档，盘口偏多。复盘为研究输出，非投资建议。" },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("two main requests (get_quote turn -> answer)", reqs.length === 2);
+      check("get_quote returns five-level book (量=股)",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("盘口 买[10.19×700/10.18×500/10.17×300/10.16×200/10.15×100]")
+          && t.content.includes("卖[10.21×100/10.22×200/10.23×300/10.24×400/10.25×500]（量=股）")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -2321,6 +2346,37 @@ if (s.runs) {
         });
         await new Promise((r2) => setTimeout(r2, 50)); // 首轮快照落定（明细层第一行）
         await agent.chat("把今天浦发银行的裁决入档，然后导出成交流水 CSV。");
+        if (agent.close) await agent.close();
+      } else if (r.bookProbe !== undefined) {
+        // S11：盘口探针——列表源无盘口、明细源带五档（同真实两接口分工）。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const snapQ = {
+          code: "sh600000", name: "浦发银行", price: 10, change: 0.1, changePercent: 1.01,
+          open: 9.8, high: 10.2, low: 9.7, preClose: 9.9, volume: 1000, amount: 1e7,
+          turnoverRate: 0.3, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0,
+        };
+        const detailQ = {
+          ...snapQ,
+          book: {
+            bids: [{ p: 10.19, v: 700 }, { p: 10.18, v: 500 }, { p: 10.17, v: 300 }, { p: 10.16, v: 200 }, { p: 10.15, v: 100 }],
+            asks: [{ p: 10.21, v: 100 }, { p: 10.22, v: 200 }, { p: 10.23, v: 300 }, { p: 10.24, v: 400 }, { p: 10.25, v: 500 }],
+          },
+        };
+        const src = {
+          async fetchMarketSnapshot() { return [snapQ]; },
+          async fetchQuotes() { return [detailQ]; },
+        };
+        const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const agent = new agentMod.Agent({
+          profile: "stock",
+          extraRows: [
+            { id: "news", name: "news-feed", disabled: true },
+            { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
+            { id: "datastore", name: "data-store", config: { rootDir: join(workdir, "data") } },
+          ],
+        });
+        await new Promise((r2) => setTimeout(r2, 50));
+        await agent.chat("看看浦发银行的五档盘口。");
         if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);
