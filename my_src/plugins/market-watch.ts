@@ -28,19 +28,10 @@ import type { UiService } from "../services/ui-service.js";
 import type { SessionLog } from "../services/session-log.js";
 import type { ScheduleService } from "../services/schedule.js";
 import { marketPhase, type MarketDataService } from "./market-data.js";
-import { cnDay, type PaperBroker } from "./paper-broker.js";
+import { cnDay, cnHm, type PaperBroker } from "./paper-broker.js";
 import type { Signal } from "./signal-engine.js";
 import type { TradeGuardService } from "./trade-guard.js";
 import { loadStrategy, type StrategyConfig } from "./strategy.js";
-
-/** 盘中信号的时:分（CN）——唤醒文本里给人看的时间戳。 */
-function cnHm(ts: number): string {
-    const parts: Record<string, string> = {};
-    for (const p of new Intl.DateTimeFormat("en-GB", {
-        timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false,
-    }).formatToParts(new Date(ts))) parts[p.type] = p.value;
-    return `${parts.hour}:${parts.minute}`;
-}
 
 /** 破止损线的持仓快照（drawdown 与 /portfolio 浮盈同口径：对含费总成本）。 */
 export interface RiskHit {

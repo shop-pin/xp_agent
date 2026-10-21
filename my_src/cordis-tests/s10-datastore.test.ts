@@ -4,7 +4,7 @@
 // 运行：npm run cordis
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'fs'
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Context } from '../cordis/context.js'
@@ -101,6 +101,21 @@ test('三层留存：收盘日K收口 + 关注面明细逐轮追加 + 信号事�
         // 收口幂等：再 checkClose 不重写
         m.store.checkClose()
         assert.equal(readText(dailyKPath(m.root, '2026-10-19')).length, 2, '头 + 1 行，无重复')
+    } finally {
+        m.cleanup()
+    }
+})
+
+test('凌晨补收口门槛：09:30 前的快照（昨收数据、cnDay 已翻次日）不写——次日真收口不被幂等遮蔽', async () => {
+    const m = mountStore()
+    try {
+        // 10-20 00:30 CST 重启（10-19 周一收盘后的次日凌晨）：拉到的是昨收数据
+        m.tick(Date.UTC(2026, 9, 19, 16, 30, 0) - MON_OPEN)
+        await m.market.refresh()
+        m.store.checkClose()
+        assert.equal(existsSync(dailyKPath(m.root, '2026-10-20')), false,
+            '凌晨快照不收当天日K（2026-10-22 冒烟实录：误写次日文件会遮蔽真收口）')
+        assert.equal(existsSync(dailyKPath(m.root, '2026-10-19')), false, '也不该写到前一日键（快照不是昨日的）')
     } finally {
         m.cleanup()
     }

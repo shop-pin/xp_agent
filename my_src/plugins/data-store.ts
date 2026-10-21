@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, readFileSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { marketPhase, parseWatchlist, watchlistPath, type Book, type MarketDataService, type Quote, type Snapshot } from "./market-data.js";
-import { cnDay, type PaperBroker } from "./paper-broker.js";
+import { cnDay, cnHm, type PaperBroker } from "./paper-broker.js";
 import type { Signal } from "./signal-engine.js";
 
 // ---------- Schema 词汇表 ----------
@@ -151,12 +151,16 @@ export class DataStoreService extends Service {
     }
 
     /** 日 K 收口：closed + 最新快照与同日 + 未写过 → 一次写全市场（公共：测试与
-     *  晚间重启补写走同一条路径，不等 10s 定时器）。 */
+     *  晚间重启补写走同一条路径，不等 10s 定时器）。
+     *  快照须为当天 09:30 后——凌晨重启时拉到的仍是昨收数据，而 cnDay(凌晨)
+     *  已翻到次日：不加这道门会把昨收 K 写进次日文件，次日真收口被 existsSync
+     *  幂等挡掉（2026-10-22 冒烟实录）。 */
     checkClose(): void {
         const market = this.market();
         if (!market || marketPhase(market.clock()) !== "closed") return;
         const latest = market.latest;
         if (!latest) return;
+        if (cnHm(latest.at) < "09:30") return;
         const day = cnDay(latest.at);
         if (this.dailyWrittenDay === day) return;
         this.dailyWrittenDay = day;
@@ -329,12 +333,6 @@ function dailyKRow(q: Quote): DailyKRow {
         code: q.code, name: q.name, o: q.open, h: q.high, l: q.low, c: q.price,
         chg: q.changePercent, vol: q.volume, amt: q.amount, to: q.turnoverRate,
     };
-}
-
-/** 固定 UTC+8 的 HH:mm（输出进文件必须确定，不经本机时区）。 */
-function cnHm(ts: number): string {
-    const d = new Date(ts + 8 * 3600_000);
-    return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
 }
 
 function dirName(p: string): string {

@@ -100,6 +100,11 @@ export function cnDay(at: number): string {
     return new Date(at + 8 * 3600_000).toISOString().slice(0, 10);
 }
 
+/** 北京时间时:分 "HH:MM"（字典序即时间序——日K收口的 09:30 盘前门槛用）。 */
+export function cnHm(at: number): string {
+    return new Date(at + 8 * 3600_000).toISOString().slice(11, 16);
+}
+
 // ---------- 服务 ----------
 
 interface PositionState {
