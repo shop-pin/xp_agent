@@ -15,12 +15,21 @@
 //
 // 冷却（cooldown）：同 code+规则 在冷却窗内不重发——5s 一轮的快照流里，
 // 同一个异动会被连续评估出几十次，信号面只留第一次。
+//
+// 宇宙闸 + 重发纪律（2026-10-21 跟踪 Day 1 复盘，参数权威 = my_docs/trading-rules.md）：
+//   - 宇宙闸：北交所前缀 / ST·退市名称 / 日成交额下限——评估入口直接跳过
+//     （Day 1：80 信号里 ~30 笔 BJ 僵尸票 + *ST田野 + 地量票全从裸跑进来，
+//     每个裁决 turn 都白烧）
+//   - 重发纪律：冷却只是节流，上限在日维度——同 code+规则 每日最多
+//     dailyFireCap 次，且重发须强度创新值（同向 |strength| > 上次×refireGrowth，
+//     方向翻转 ×flipGrowth）——蘅东光×5、万达轴承×4 那类零新信息重发
 
 import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
 import type { ToolsService } from "../services/tools.js";
-import type { MarketDataService, HistoryRound, Quote } from "./market-data.js";
+import { isExcludedStock, type MarketDataService, type HistoryRound, type Quote } from "./market-data.js";
+import { cnDay } from "./paper-broker.js";
 
 // ---------- 序列提取（纯函数） ----------
 
@@ -229,6 +238,18 @@ export interface SignalConfig {
     keepSignals?: number;
     /** 追加规则（同名后写胜——覆盖默认规则即自定义）。 */
     rules?: SignalRule[];
+    /** 北交所排除（默认 true——trading-rules.md 规则 1-2）。 */
+    excludeBJ?: boolean;
+    /** ST/退市名称排除（默认 true——规则 1-3 红线；测试 fixture 可关）。 */
+    excludeST?: boolean;
+    /** 日累计成交额下限（元，默认 1e7 = 1,000 万流动性闸；0 = 关）。 */
+    amountMin?: number;
+    /** 同 code+规则 每日最大发射次数（默认 2——重发纪律）。 */
+    dailyFireCap?: number;
+    /** 同向重发的强度增长门槛：|strength| 须超上次 ×此值（默认 1.5）。 */
+    refireGrowth?: number;
+    /** 方向翻转的强度增长门槛（默认 2——翻转是新信息，但要求更强）。 */
+    flipGrowth?: number;
 }
 
 export class SignalEngine extends Service {
@@ -237,6 +258,14 @@ export class SignalEngine extends Service {
     private keepSignals: number;
     private rules = new Map<string, SignalRule>();
     private lastFired = new Map<string, number>();
+    private excludeBJ: boolean;
+    private excludeST: boolean;
+    private amountMin: number;
+    private dailyFireCap: number;
+    private refireGrowth: number;
+    private flipGrowth: number;
+    /** 重发纪律账本：key -> { 日键, 当日发射数, 末次强度/方向 }——跨日惰性重置。 */
+    private fireStats = new Map<string, { day: string; count: number; strength: number; direction: string }>();
 
     /** 新→旧。 */
     recent: Signal[] = [];
@@ -249,6 +278,12 @@ export class SignalEngine extends Service {
         super(ctx, name);
         this.cooldownMs = config.cooldownMs ?? 300_000;
         this.keepSignals = config.keepSignals ?? 200;
+        this.excludeBJ = config.excludeBJ ?? true;
+        this.excludeST = config.excludeST ?? true;
+        this.amountMin = config.amountMin ?? 1e7;
+        this.dailyFireCap = config.dailyFireCap ?? 2;
+        this.refireGrowth = config.refireGrowth ?? 1.5;
+        this.flipGrowth = config.flipGrowth ?? 2;
         for (const rule of [...defaultRules(), ...(config.rules ?? [])]) {
             this.rules.set(rule.name, rule); // 同名后写胜
         }
@@ -260,12 +295,16 @@ export class SignalEngine extends Service {
         this.ctx.on("market/snapshot", (snap) => this.evaluateSnapshot(snap));
     }
 
-    /** 单轮评估：全市场逐码跑规则注册表（纯函数，同步完成）。 */
+    /** 单轮评估：宇宙闸过滤后逐码跑规则注册表（纯函数，同步完成）。 */
     evaluateSnapshot(snap: { at: number; quotes: Quote[] }): void {
         this.evaluateCount++;
         const rules = [...this.rules.values()];
+        const day = cnDay(snap.at);
         for (const quote of snap.quotes) {
             if (quote.price <= 0) continue;
+            // 宇宙闸：北交所/ST/退市名称（与 screen_market 共用谓词）+ 流动性下限
+            if (isExcludedStock(quote, this.excludeST, this.excludeBJ)) continue;
+            if (quote.amount < this.amountMin) continue;
             const series = seriesFor(this.market?.history ?? [], quote.code);
             for (const rule of rules) {
                 let signal: Signal | null = null;
@@ -279,6 +318,27 @@ export class SignalEngine extends Service {
                     this.suppressCount++;
                     continue;
                 }
+                // 重发纪律：冷却只是节流，上限在日维度。强度检验在前（内沿）、
+                // 日上限在后（外沿）；跨日惰性重置——日键来自快照时刻，不引新钟。
+                const prev = this.fireStats.get(key);
+                const stats = prev && prev.day === day
+                    ? prev
+                    : { day, count: 0, strength: 0, direction: signal.direction };
+                if (stats.count > 0) {
+                    const growth = stats.direction === signal.direction ? this.refireGrowth : this.flipGrowth;
+                    if (Math.abs(signal.strength) <= Math.abs(stats.strength) * growth) {
+                        this.suppressCount++;
+                        continue;
+                    }
+                }
+                if (stats.count >= this.dailyFireCap) {
+                    this.suppressCount++;
+                    continue;
+                }
+                stats.count++;
+                stats.strength = signal.strength;
+                stats.direction = signal.direction;
+                this.fireStats.set(key, stats);
                 this.lastFired.set(key, signal.at);
                 this.recent = [signal, ...this.recent].slice(0, this.keepSignals);
                 this.ctx.emit("market/signal", signal);

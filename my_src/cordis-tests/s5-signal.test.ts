@@ -124,7 +124,9 @@ test('volume-surge / breakout：量能确认门槛', () => {
 // ---------- 引擎接线：事件驱动 + 冷却 + 工具 ----------
 
 function makeQuote(code: string, name: string, price: number, changePercent: number): Quote {
-    return quote({ code, name, price, changePercent, preClose: price / (1 + changePercent / 100) })
+    // amount 给足 2,000 万：引擎宇宙闸默认日成交额下限 1,000 万（Day 1 复盘 P0），
+    // 地量样本在用例里单独覆盖
+    return quote({ code, name, price, changePercent, preClose: price / (1 + changePercent / 100), amount: 2e7 })
 }
 
 test('引擎：snapshot 事件驱动评估 → market/signal 广播 → 冷却压重复', async () => {
@@ -171,4 +173,110 @@ test('引擎：snapshot 事件驱动评估 → market/signal 广播 → 冷却�
     const down = await tool.execute({ direction: 'down' }, {})
     assert.match(down, /信号 0 条/)
     assert.match(out, /\[10:00\]/) // 固定 UTC+8 格式化
+})
+
+// ---------- 宇宙闸 + 重发纪律（2026-10-21 跟踪 Day 1 复盘 P0） ----------
+
+test('引擎：宇宙闸——bj 前缀/ST 名称/成交额下限三道排除（默认开）', async () => {
+    const ctx = new Context()
+    new ToolsService(ctx, 'tools')
+    // 四只同形态异动：干净 sh / bj 前缀 / ST 名称 / sh 地量（amount 100 万 < 闸 1,000 万）
+    const calm = [
+        makeQuote('sh600000', '平平稳稳', 10, 1.0),
+        makeQuote('bj920001', '北交噪', 10, 1.0),
+        makeQuote('sh600999', 'ST麻烦', 10, 1.0),
+        { ...makeQuote('sh600001', '地量票', 10, 1.0), amount: 1e6 },
+    ]
+    const spike = [
+        makeQuote('sh600000', '平平稳稳', 10.35, 4.5),
+        makeQuote('bj920001', '北交噪', 10.35, 4.5),
+        makeQuote('sh600999', 'ST麻烦', 10.35, 4.5),
+        { ...makeQuote('sh600001', '地量票', 10.35, 4.5), amount: 1e6 },
+    ]
+    let n = 0
+    const src: QuoteSource = {
+        async fetchMarketSnapshot() { n++; return n === 1 ? calm : spike },
+        async fetchQuotes() { return [] },
+    }
+    ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(T0), pollIntervalMs: 60_000 })
+    const fired: Signal[] = []
+    ctx.on('market/signal', (s) => { fired.push(s) })
+    ctx.plugin(signalEnginePlugin, {})
+    const market = ctx.market!
+    await market.refresh()
+    await market.refresh()
+    // Day 1 那类 *ST田野 / BJ 僵尸信号在源头死掉，不烧裁决 turn
+    assert.equal(fired.length, 1)
+    assert.equal(fired[0].code, 'sh600000')
+})
+
+test('引擎：重发纪律——同向重发须强度×1.5，日上限 2 次，跨日重置', async () => {
+    const ctx = new Context()
+    new ToolsService(ctx, 'tools')
+    // 五轮异动（rapid-move，窗内基点恒为首轮 10 元）：
+    //   +3.5 发① → +5.5（>1.5×3.5=5.25）发② → +6.0（≤8.25）强度压 →
+    //   +9.0（>8.25 但日限 2）上限压 → 次日首轮 5min 窗只剩单点（隔夜缺口，
+    //   窗类指标 null）→ 次日第二轮起窗重建：+3.92 日键翻篇计数清零 → 发③
+    const prices = [10, 10.35, 10.55, 10.6, 10.9, 10.2, 10.6]
+    let round = 0
+    let clock = T0
+    const src: QuoteSource = {
+        async fetchMarketSnapshot() {
+            const p = prices[Math.min(round, prices.length - 1)]
+            return [makeQuote('sh600000', '平平稳稳', p, (p / 10 - 1) * 100)]
+        },
+        async fetchQuotes() { return [] },
+    }
+    const now = () => new Date(clock)
+    ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000 })
+    const fired: Signal[] = []
+    ctx.on('market/signal', (s) => { fired.push(s) })
+    ctx.plugin(signalEnginePlugin, { cooldownMs: 0 })
+    const market = ctx.market!
+    for (let i = 0; i < 5; i++) {
+        round = i
+        clock = T0 + i * MIN
+        await market.refresh()
+    }
+    assert.equal(fired.length, 2, '发①②后 +6.0 与 +9.0 都被压（强度不足 / 日上限）')
+    round = 5
+    clock = T0 + 24 * 60 * MIN // 跨日：fireStats 惰性重置，不引新钟
+    await market.refresh()
+    round = 6
+    clock = T0 + 24 * 60 * MIN + MIN
+    await market.refresh()
+    assert.equal(fired.length, 3)
+    assert.ok(Math.abs(fired[2].strength - 3.92) < 1e-9,
+        `次日首发强度 = (10.6-10.2)/10.2 = 3.92，实际 ${fired[2].strength}`)
+})
+
+test('引擎：重发纪律——方向翻转须强度×2', async () => {
+    const ctx = new Context()
+    new ToolsService(ctx, 'tools')
+    // down −3.5 发① → up +3.5 翻转（3.5 ≤ 2×3.5=7）压 → up +8.0（>7）发②
+    const prices = [10, 9.65, 10.35, 10.8]
+    let round = 0
+    let clock = T0
+    const src: QuoteSource = {
+        async fetchMarketSnapshot() {
+            const p = prices[Math.min(round, prices.length - 1)]
+            return [makeQuote('sh600000', '平平稳稳', p, (p / 10 - 1) * 100)]
+        },
+        async fetchQuotes() { return [] },
+    }
+    const now = () => new Date(clock)
+    ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000 })
+    const fired: Signal[] = []
+    ctx.on('market/signal', (s) => { fired.push(s) })
+    ctx.plugin(signalEnginePlugin, { cooldownMs: 0 })
+    const market = ctx.market!
+    for (let i = 0; i < 4; i++) {
+        round = i
+        clock = T0 + i * MIN
+        await market.refresh()
+    }
+    assert.equal(fired.length, 2)
+    assert.equal(fired[0].direction, 'down')
+    assert.equal(fired[1].direction, 'up')
+    assert.equal(fired[1].strength, 8)
 })

@@ -292,6 +292,15 @@ export function parseWatchlist(text: string): WatchlistEntry[] {
 
 // ---------- 筛选（纯函数，测试可见） ----------
 
+/** 宇宙排除判定（纯函数）：北交所前缀 + ST/退市名称——screen_market 筛选与
+ *  S5 信号引擎宇宙闸共用（trading-rules.md 规则 1-2/1-3 的代码面）。Day 1
+ *  复盘教训：筛选只长在 screen_market 上、引擎裸跑全市场，三处筛点必须
+ *  同一口径；ST 是名称状态（戴帽/摘帽），逐轮现场判，不存静态名单。 */
+export function isExcludedStock(q: Pick<Quote, "code" | "name">, excludeST: boolean, excludeBJ: boolean): boolean {
+    return (excludeBJ && q.code.startsWith("bj"))
+        || (excludeST && (/ST/i.test(q.name) || q.name.includes("退")));
+}
+
 export interface ScreenFilter {
     changePercentMin?: number;
     changePercentMax?: number;
@@ -322,8 +331,7 @@ export function screenQuotes(quotes: Quote[], f: ScreenFilter): Quote[] {
     const limit = Math.min(Math.max(f.limit ?? 20, 1), 50);
     const kept = quotes.filter((q) => {
         if (q.price <= 0) return false;
-        if (excludeST && (/ST/i.test(q.name) || q.name.includes("退"))) return false;
-        if (excludeBJ && q.code.startsWith("bj")) return false;
+        if (isExcludedStock(q, excludeST, excludeBJ)) return false;
         if (f.changePercentMin !== undefined && q.changePercent < f.changePercentMin) return false;
         if (f.changePercentMax !== undefined && q.changePercent > f.changePercentMax) return false;
         if (f.volumeRatioMin !== undefined && q.volumeRatio < f.volumeRatioMin) return false;

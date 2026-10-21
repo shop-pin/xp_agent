@@ -2092,7 +2092,7 @@ if (s.runs) {
         const q = (code, name, price, chgPct) => ({
           code, name, price, change: 0, changePercent: chgPct,
           open: price, high: price, low: price, preClose: price / (1 + chgPct / 100),
-          volume: 1000, amount: price * 1000 * 100, turnoverRate: 1, volumeRatio: 0,
+          volume: 200_000, amount: price * 200_000 * 100, turnoverRate: 1, volumeRatio: 0, // 量抬上宇宙闸（默认日成交额下限 1,000 万——Day 1 复盘 P0）
           marketCap: 0, floatCap: 0, pb: 0,
         });
         const calm = [q("sh600000", "平平稳稳", 10, 1.0), q("sz000001", "安安稳稳", 20, -0.5)];
@@ -2119,7 +2119,7 @@ if (s.runs) {
         const q = (code, name, price, chgPct) => ({
           code, name, price, change: 0, changePercent: chgPct,
           open: price, high: price, low: price, preClose: price / (1 + chgPct / 100),
-          volume: 1000, amount: price * 1000 * 100, turnoverRate: 1, volumeRatio: 0,
+          volume: 200_000, amount: price * 200_000 * 100, turnoverRate: 1, volumeRatio: 0, // 量抬上宇宙闸（默认日成交额下限 1,000 万——Day 1 复盘 P0）
           marketCap: 0, floatCap: 0, pb: 0,
         });
         const calm = [q("sh600000", "平平稳稳", 10, 1.0)];
@@ -2212,7 +2212,7 @@ if (s.runs) {
         const q = (price) => ({
           code: "sh600000", name: "平平稳稳", price, change: 0, changePercent: 4.5,
           open: price, high: price, low: price, preClose: price / 1.045,
-          volume: 1000, amount: price * 1000 * 100, turnoverRate: 1, volumeRatio: 0,
+          volume: 200_000, amount: price * 200_000 * 100, turnoverRate: 1, volumeRatio: 0, // 量抬上宇宙闸（默认日成交额下限 1,000 万——Day 1 复盘 P0）
           marketCap: 0, floatCap: 0, pb: 0,
         });
         let fetchCount = 0;

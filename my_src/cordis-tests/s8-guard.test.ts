@@ -25,6 +25,7 @@ const QUOTES: Quote[] = [
     { code: 'sh600000', name: '浦发银行', price: 10, change: 0, changePercent: 0, open: 10, high: 10, low: 10, preClose: 10, volume: 1000, amount: 1e7, turnoverRate: 0.3, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
     { code: 'sh600999', name: 'ST贵人', price: 5, change: 0, changePercent: 0, open: 5, high: 5, low: 5, preClose: 5, volume: 1000, amount: 5e6, turnoverRate: 0.2, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
     { code: 'sz000999', name: '退市海润', price: 2, change: 0, changePercent: 0, open: 2, high: 2, low: 2, preClose: 2, volume: 1000, amount: 2e6, turnoverRate: 0.1, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
+    { code: 'bj920999', name: '北交样本', price: 3, change: 0, changePercent: 0, open: 3, high: 3, low: 3, preClose: 3, volume: 1000, amount: 3e6, turnoverRate: 0.1, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
 ]
 
 interface Mount { ctx: Context; guard: TradeGuardService; broker: PaperBroker; tick: (ms: number) => void; cleanup: () => void }
@@ -112,6 +113,19 @@ test('标的排除：ST 与退市名称拒单', async () => {
     const delisted = await place(m, { code: 'sz000999', side: 'buy', price: 2, qty: 100 })
     assert.match(delisted.kind === 'denied' && delisted.content || '', /风控排除标的：退市海润/)
     m.cleanup()
+})
+
+test('标的排除：北交所前缀拒单（规则 1-2 的交易面兜底——引擎不产信号 ≠ 不交易）', async () => {
+    const m = await mountGuard()
+    const bj = await place(m, { code: 'bj920999', side: 'buy', price: 3, qty: 100 })
+    assert.match(bj.kind === 'denied' && bj.content || '', /北交所 北交样本（bj920999）不在交易范围/)
+    m.cleanup()
+
+    // excludeBJ:false = 手册放开北交所时的通道（ Day 1 复盘 P0 配套）
+    const m2 = await mountGuard({ excludeBJ: false })
+    const ok = await place(m2, { code: 'bj920999', side: 'buy', price: 3, qty: 100 }, 'auto')
+    assert.equal(ok.kind, 'result')
+    m2.cleanup()
 })
 
 test('涨跌停触板拒单：guard 拒触板（>=hi/<=lo），比 broker 的出界拒更严', async () => {

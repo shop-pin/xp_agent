@@ -11,7 +11,7 @@
 //   ① /halt 熔断：人工一键，拦一切订单
 //   ② 时段闸门：marketPhase 非 open 拒单（config.tradingHours:false 可关——
 //      休市手测/回放用；S10 实盘前置校验这个开关必须为 true）
-//   ③ 标的排除：ST/退市名称拒单；委托价触及涨跌停板拒单（追板/杀跌单）
+//   ③ 标的排除：北交所前缀/ST/退市名称拒单；委托价触及涨跌停板拒单（追板/杀跌单）
 //   ④ 单日亏损上限：当日已实现盈亏 ≤ -maxDailyLoss 拦一切新单
 //   ⑤ 单票仓位上限：买入后该票市值占比 ≤ maxPositionPct（LLM 说"全仓"
 //      也拦得住的那条）
@@ -37,6 +37,9 @@ export interface GuardConfig {
     tradingHours?: boolean;
     /** ST/退市标的排除（默认 true）。 */
     excludeST?: boolean;
+    /** 北交所标的排除（默认 true——trading-rules.md 规则 1-2 的交易面兜底：
+     *  引擎不产信号 ≠ 不交易，LLM 手动 place_order 也要拦）。 */
+    excludeBJ?: boolean;
     /** 单票市值占净资产上限（默认 0.2 = 20%）。 */
     maxPositionPct?: number;
     /** 单日已实现亏损上限（元，默认 50,000）。 */
@@ -51,7 +54,7 @@ interface HaltState {
 }
 
 export class TradeGuardService extends Service {
-    private cfg: Required<Pick<GuardConfig, "tradingHours" | "excludeST" | "maxPositionPct" | "maxDailyLoss">>;
+    private cfg: Required<Pick<GuardConfig, "tradingHours" | "excludeST" | "excludeBJ" | "maxPositionPct" | "maxDailyLoss">>;
     private now: () => Date;
     private state: HaltState = { halted: false, reason: "" };
 
@@ -60,6 +63,7 @@ export class TradeGuardService extends Service {
         this.cfg = {
             tradingHours: config.tradingHours ?? true,
             excludeST: config.excludeST ?? true,
+            excludeBJ: config.excludeBJ ?? true,
             maxPositionPct: config.maxPositionPct ?? 0.2,
             maxDailyLoss: config.maxDailyLoss ?? 50_000,
         };
@@ -103,6 +107,9 @@ export class TradeGuardService extends Service {
         const quote = market?.latest?.byCode.get(code);
         if (!market || !quote) {
             return { type: "deny", reason: `无 ${code} 实时行情，无法执行风控校验（fail-closed）` };
+        }
+        if (this.cfg.excludeBJ && quote.code.startsWith("bj")) {
+            return { type: "deny", reason: `风控排除标的：北交所 ${quote.name}（${code}）不在交易范围` };
         }
         if (this.cfg.excludeST && (/ST/i.test(quote.name) || quote.name.includes("退"))) {
             return { type: "deny", reason: `风控排除标的：${quote.name}` };
