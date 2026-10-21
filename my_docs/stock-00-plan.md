@@ -117,7 +117,7 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 
 1. **模拟盘成交建模两补丁**（治 stale-price fill 乐观偏差）：滑点成交——按下单时刻最新快照价 ± 冲击成本成交，替代"带内按委托价"；价格漂移拒单——委托价与执行时最新价偏离 >1% 拒单（fail-closed 同族）。→ 随 S10/S13
 2. guard 单日亏损上限缺省 5 万，对 300k 账户偏松（16.7%/天）——随 my-patch.mjs 收紧（如 1.5 万 = 5%）
-3. 账本 CSV/Excel 导出小工具 → S10 顺手
+3. ✅ 账本 CSV/Excel 导出小工具（S10 已落地：`get_trades_csv` 工具，CSV 逐字段 echo 账本）
 4. 场景 29（S2 stockProbe）挂 news 即真网络轮询（失败静默吞）→ S8 记档遗留
 5. snapshot runner record 模式尾行判定误报（找 "✓" 打的是 "⚑"）→ S9 记档遗留
 6. host 仅实现 GET，HEAD 请求落 API 404 → S9 手测发现
@@ -158,6 +158,7 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 | S7 | ✅ 完成（2026-10-18） | `stock-S7.md`；PaperBroker（**BrokerAdapter 缝第二次兑现**——S10 QmtBroker 同接口；费用三科目手算锚/T+1 北京日历日切/整手/**价带拒单不钳价**（往窄倒第三效）/加权成本按比例结转；留痕三轨：账本 JSONL 重放=真相、SessionLog trade 注记=F6 侧栏 fold、broker/fill 事件=S8/S9 面；place_order hint=exec 走既有 confirm=S8 换瀑布的预留位）+ **web-stock 组合 profile**（F6 投影手测通路）+ 投影 trade fold；cordis 233/233、mock 34、snapshot 34/34×2（ch39 新录）、vite 246.74KB；翻车记档：费用科目漏项×2、测试自删账本；建议 commit：`add paper broker with fee t1 modeling and ledger replay` |
 | S8 | ✅ 完成（2026-10-19） | `stock-S8.md`；trade-guard 五件套（halt 熔断/时段闸门/ST+退市与**触板**拒单（比 broker 出界拒严一档）/单日亏损上限（broker todayPnl 惰性日切口粮）/单票仓位上限——**"全仓"指令拦死**）+ **fail-closed 不变量**（无行情=拒单，翻车#1 抓获的 fail-open 缺陷）+ **审批卡补齐**（exec hint 在 C2 判定序无 ask 分支——S7"走 confirm"说法证伪；guard 通过后 default 模式自 ask，auto 弃权给分类器=弃审批不弃风控）+ 行位两件套（baseRows 占位行钉 approval 外圈 + inject 只 commands 即时激活/依赖惰性取）+ mock 场景 40（**confirm 计数锚定 deny 短路**：三单一确认）；cordis 242/242、mock 35、snapshot 35/35×2（ch40 新录）；翻车记档：fail-open 修复、摩擦要计数验证、ch9/10 负载偶发、场景 29 真网络记档；建议 commit：`add trade guard with five hard limits and order approval gate` |
 | S9 | ✅ 完成（2026-10-20，P3 收官） | `stock-S9.md`；market-watch 插件（**三 wake 源**：开盘巡检/盘中信号（冷却 3min+halt 静默）/收盘复盘——"LLM 不在没事件时醒"；**tick 状态机观察迁移不描墙钟**——注入钟/时钟跳变天然稳健，cnDay 跨日重置连盯多日；watch 无自己的钟=market.clock() 单一来源；/watch 显式武装非挂载即盯）+ /review 技能（五段复盘、事实先于评价、持仓快照同名覆盖）+ **save_memory 写口**（writeTool config 门控、索引纪律 saveMemory 维护）+ get_trades/当日盈亏行 + memory 行整行替换（同 skills 行纪律）+ mock 场景 41（**三 turn 全 wake 驱动零用户输入**——编排即产品形态）；S6 fork 缺口未消费未修续挂账；cordis 252/252、mock 36、snapshot 36/36×2（ch41 新录；34/36/38/39/40 目录+工具演进重录）；翻车记档：inject 升级炸最小树（负向断言空过）、firstUserText 假阳/假阴对（泛锚复发）、schedule 裸 setTimeout 挂进程（手动 start 必手动 stop）；建议 commit：`add watch orchestration with day cycle and review skill` |
+| S10 | ✅ 完成（2026-10-21，P4 开章） | `stock-S10.md`；data-store 插件（**三层留存**：日K收口=观察 open→closed 迁移后一次写全市场 10s 小步巡检/watch-detail=watchlist∪持仓∪信号股 三腿宇宙上限 100 码/events=signals+verdicts 独立 JSONL）+ **schema 版本头**（首行 {"v":1,"schema":...}，读侧 `readSchemaJsonl` 不符明确拒读——§五"不静默错解"首次落地通用读口）+ 账本纪律沿用（追加/坏行跳过/落盘失败吞不炸）+ 断电重启幂等（内存日键+existsSync 双闸，晚间重启补收口）+ env `MINI_STOCKS_DATA_DIR` 根目录可配 + **record_verdicts 工具 + adjudicate 入档条款**（裁决事件层=P2 记忆回流的代码半边）+ get_trades_csv（挂账#3 ✅）+ paper-broker `allFills()` 访问器 + mock 场景 42；翻车记档：服务名必须=ctx 严格读键（档案名可带连字符服务名不行）、s6 契约测试红得对（改模板先锚契约）；体量估算 16+0.8MB/日，一周实测待跟踪期替换；跟踪期修复轮 P0+P1 同日落地（宇宙闸/重发纪律/watch 信箱 digest，详见 stock-tracking-20261021-review.md）；cordis 265/265、mock 38、snapshot 37/37（ch41/38 重录、ch42 新录）；建议 commit：`add data store with three layer retention and verdict events` |
 | S10 | ⬜ 未开始 | 数据留存与历史落地（日 K 收口 / 关注面明细 / 事件层，P4 起） |
 | S11 | ⬜ 未开始 | 盘口数据与买卖压力因子（五档解析 + 关注面轮询） |
 | S12 | ⬜ 未开始 | 选股池工具（微盘轮动·上，七道过滤 + IPO 源调研） |

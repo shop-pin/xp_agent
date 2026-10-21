@@ -51,6 +51,7 @@ import { signalEnginePlugin } from "./plugins/signal-engine.js";
 import { paperBrokerPlugin } from "./plugins/paper-broker.js";
 import { tradeGuardPlugin } from "./plugins/trade-guard.js";
 import { marketWatchPlugin } from "./plugins/market-watch.js";
+import { dataStorePlugin } from "./plugins/data-store.js";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -83,6 +84,7 @@ export const plugins: Record<string, Plugin> = {
     "paper-broker": paperBrokerPlugin,
     "trade-guard": tradeGuardPlugin,
     "market-watch": marketWatchPlugin,
+    "data-store": dataStorePlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -137,6 +139,8 @@ export const baseRows: Row[] = [
     { id: "broker", name: "paper-broker", disabled: true },
     // S9：盯盘编排——同上（不参与瀑布，行位无约束；唤醒桥由 profile 工厂注入）
     { id: "watch", name: "market-watch", disabled: true },
+    // S10：数据留存——同上（三层 JSONL；根目录 config/env 可配）
+    { id: "datastore", name: "data-store", disabled: true },
 ]
 
 /**
@@ -253,6 +257,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
         { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
         // S9：盯盘编排——唤醒桥从宿主接（C5 loop 同款 inbox next-turn）
         { id: "watch", name: "market-watch", config: { wake: host.wake } },
+        { id: "datastore", name: "data-store" },
     ] : [
         { id: "skills", name: "skills-registry", config: { productSkills: true } },
         { id: "guard", name: "trade-guard" },
@@ -262,6 +267,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
         { id: "broker", name: "paper-broker" },
         { id: "memory", name: "memory-prefetch", config: { writeTool: true } },
         { id: "watch", name: "market-watch" },
+        { id: "datastore", name: "data-store" },
     ],
     // S7：web + stock 组合——F6 投影侧栏要看 trade 流水，得同时有 host 行和
     // broker 行。profile 是单选的，组合形态就显式做成第四个名字（不加多层
@@ -277,6 +283,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
             { id: "broker", name: "paper-broker" },
             { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
             { id: "watch", name: "market-watch", config: { wake: host.wake } },
+            { id: "datastore", name: "data-store" },
         ]
         : [
             { id: "host", name: "host-webserver", disabled: true },
@@ -288,6 +295,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
             { id: "broker", name: "paper-broker" },
             { id: "memory", name: "memory-prefetch", config: { writeTool: true } },
             { id: "watch", name: "market-watch" },
+            { id: "datastore", name: "data-store" },
         ],
 }
 

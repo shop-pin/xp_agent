@@ -150,6 +150,22 @@ export class PaperBroker extends Service {
         return [...this.positions.values()].map((p) => this.snapshotPosition(p, today));
     }
 
+    /** 全账本成交（坏行跳过——S10 get_trades_csv 的数据面）。 */
+    allFills(): Fill[] {
+        const fills: Fill[] = [];
+        try {
+            if (existsSync(this.ledgerPath)) {
+                for (const line of readFileSync(this.ledgerPath, "utf-8").split("\n").filter(Boolean)) {
+                    try {
+                        const e = JSON.parse(line);
+                        if (e.type === "fill") fills.push(e as Fill);
+                    } catch { /* 跳过坏行——账本以可解析行为准 */ }
+                }
+            }
+        } catch { /* 读不了当空账处理 */ }
+        return fills;
+    }
+
     private snapshotPosition(p: PositionState, today: string): Position {
         this.rollDay(p, today);
         return { code: p.code, qty: p.qty, availQty: p.qty - p.boughtToday, cost: round2(p.cost) };
@@ -383,17 +399,7 @@ export class PaperBroker extends Service {
                 const day = typeof input.day === "string" && /^\d{4}-\d{2}-\d{2}$/.test(input.day)
                     ? input.day
                     : cnDay(this.now().getTime());
-                const fills: any[] = [];
-                try {
-                    if (existsSync(this.ledgerPath)) {
-                        for (const line of readFileSync(this.ledgerPath, "utf-8").split("\n").filter(Boolean)) {
-                            try {
-                                const e = JSON.parse(line);
-                                if (e.type === "fill" && cnDay(e.at) === day) fills.push(e);
-                            } catch { /* 跳过坏行——账本以可解析行为准 */ }
-                        }
-                    }
-                } catch { /* 读不了当空账处理 */ }
+                const fills: any[] = this.allFills().filter((f) => cnDay(f.at) === day);
                 if (fills.length === 0) return `${day} 无成交记录`;
                 const rows = fills.map((f) => {
                     const pnl = f.realizedPnl !== null && f.realizedPnl !== undefined

@@ -24,8 +24,9 @@ test('product 技能层随产品发货 adjudicate，verdict 契约条款完整',
         '真假摔',                        // 矛盾判别条款
         '两次 news 调用',                // token 纪律
         '非投资建议',
+        'record_verdicts',               // S10 裁决事件层：入档条款
     ]) {
         assert.ok(t.includes(clause), `契约条款「${clause}」应在模板中`)
     }
-    assert.deepEqual(skill!.allowedTools, ['get_signals', 'latest_news'])
+    assert.deepEqual(skill!.allowedTools, ['get_signals', 'latest_news', 'record_verdicts'])
 })

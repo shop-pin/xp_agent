@@ -2,7 +2,7 @@
 name: adjudicate
 description: 信号裁决——对规则引擎的信号短名单结合最新消息逐条评估，输出结构化 verdict（action/confidence/reasons/risks）
 when-to-use: 用户问"这信号能不能跟""帮我看看这些异动"、或需要把 get_signals 的短名单变成可解释的判断时
-allowed-tools: [get_signals, latest_news]
+allowed-tools: [get_signals, latest_news, record_verdicts]
 context: inline
 ---
 
@@ -38,6 +38,10 @@ context: inline
 - `news_refs` 引用真实拉到的条目（带时间戳），没拉到就空数组
 
 JSON 之后跟 ≤5 行人话解读（每信号一句：结论 + 最关键理由）。
+
+## 入档（裁决事件层）
+
+输出解读之前，把本批 verdicts 原样调一次 `record_verdicts` 入档（事件层独立于会话日志，复盘与规则晋升的原料面；字段同 verdict 契约，一天多批照常追加）。
 
 ## 边界
 

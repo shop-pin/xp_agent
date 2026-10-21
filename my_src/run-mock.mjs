@@ -1743,6 +1743,44 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "42": {
+    // S10：数据留存探针——profile stock 原生装配，datastore 根目录指 workdir/data。
+    // record_verdicts 入档事件层 + get_trades_csv 导出预置账本；盘中不产日K
+    // （收口幂等与三层写位在 s10 单测钉）。HOME 沙箱=workdir，清单/账本均隔离。
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-claude", "stocks"), { recursive: true });
+      writeFileSync(
+        join(dir, ".mini-claude", "stocks", "paper-ledger.jsonl"),
+        JSON.stringify({ type: "account", startingCash: 1_000_000 }) + "\n"
+          + JSON.stringify({ type: "fill", orderId: "P0001", code: "sh600000", side: "buy", price: 10, qty: 100, fee: 5.01, realizedPnl: null, at: Date.UTC(2026, 9, 19, 2, 0, 0) }) + "\n",
+      );
+    },
+    runs: [{ datastoreProbe: true }],
+    turns: [
+      { tools: [
+          { name: "record_verdicts", input: { verdicts: [{ code: "sh600000", action: "watch", confidence: 0.4, reasons: ["纯技术形态"] }] } },
+          { name: "get_trades_csv", input: {} },
+      ] },
+      { text: "已入档 1 条裁决记录，成交流水导出 1 行。复盘为研究输出，非投资建议。" },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("two main requests (verdict+csv turn -> answer)", reqs.length === 2);
+      check("verdicts land in event layer",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("已入档 1 条裁决记录")));
+      check("csv export echoes seeded ledger fill",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("P0001,2026-10-19,10:00,sh600000,buy,10,100,5.01,")));
+      const vp = join(dir, "data", "events", "verdicts.jsonl");
+      check("verdicts.jsonl on disk with schema header",
+        existsSync(vp) && readFileSync(vp, "utf-8").startsWith('{"v":1,"schema":"stocks.verdicts"'));
+      check("no daily-k during open phase (close is a observed migration)", !existsSync(join(dir, "data", "daily-k")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -2258,6 +2296,32 @@ if (s.runs) {
           watch.stop();
           if (agent.close) await agent.close();
         }
+      } else if (r.datastoreProbe !== undefined) {
+        // S10：数据留存探针——profile stock 原生装配，datastore 根目录指
+        // workdir/data；市场钟固定开盘（盘中不产日K——收口语义在 s10 单测钉）。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const q = {
+          code: "sh600000", name: "浦发银行", price: 10, change: 0.1, changePercent: 1.01,
+          open: 9.8, high: 10.2, low: 9.7, preClose: 9.9, volume: 1000, amount: 1e7,
+          turnoverRate: 0.3, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0,
+        };
+        const src = {
+          async fetchMarketSnapshot() { return [q]; },
+          async fetchQuotes() { return []; },
+        };
+        const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0)); // 周一 10:00 CST
+        const agent = new agentMod.Agent({
+          profile: "stock",
+          extraRows: [
+            { id: "news", name: "news-feed", disabled: true },
+            { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
+            { id: "broker", name: "paper-broker", config: { ledgerPath: join(workdir, ".mini-claude", "stocks", "paper-ledger.jsonl"), now: () => fixed } },
+            { id: "datastore", name: "data-store", config: { rootDir: join(workdir, "data") } },
+          ],
+        });
+        await new Promise((r2) => setTimeout(r2, 50)); // 首轮快照落定（明细层第一行）
+        await agent.chat("把今天浦发银行的裁决入档，然后导出成交流水 CSV。");
+        if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);
       }
