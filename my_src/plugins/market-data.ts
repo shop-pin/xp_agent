@@ -50,6 +50,8 @@ export interface Quote {
     floatCap: number;
     /** 市净率（新浪明细 0）。 */
     pb: number;
+    /** 市盈率（新浪列表 per / 东财 f9；明细 hq 无 → 0=未知）。 */
+    pe?: number;
     /** 快照时间（新浪明细才有：日期+时间）。 */
     quotedAt?: string;
     /** 五档盘口（仅单票明细 hq 接口带；量=股——买卖压力是比值，量纲自消）。 */
@@ -68,6 +70,10 @@ export interface QuoteSource {
     fetchMarketSnapshot(): Promise<Quote[]>;
     /** 单票/少量明细（实时性优于快照轮询间隔）。 */
     fetchQuotes(codes: string[]): Promise<Quote[]>;
+    /** IPO 日期表（码 → YYYY-MM-DD）——可选能力：东财 clist f26（新浪列表无
+     *  此字段，2026-10-21 真机探测记档：Node fetch 已可达，2026-10-18 的 WAF
+     *  RST 不复现）。源不可用 → 调用方退化为 N/C 前缀次新过滤。 */
+    fetchIpoDays?(): Promise<Map<string, string>>;
 }
 
 // ---------- 交易时段（纯函数，测试可见） ----------
@@ -104,7 +110,7 @@ export function isPollingActive(phase: MarketPhase): boolean {
 // 依赖。东财实现保留为备源（换个网络环境可能就能用），parser 各自 fixture 钉住。
 
 const EM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-const EM_FIELDS = "f2,f3,f4,f5,f6,f8,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23";
+const EM_FIELDS = "f2,f3,f4,f5,f6,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23";
 // 沪深主板+创业板+科创板+北交所的全 A 股市场过滤器
 const EM_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048";
 const EM_PAGE = 100;      // 服务端单页硬上限（pz>100 也只回 100）
@@ -135,14 +141,15 @@ export function parseEastmoneyDiff(diff: Record<string, unknown>[]): Quote[] {
         open: num(d.f17), high: num(d.f15), low: num(d.f16), preClose: num(d.f18),
         volume: num(d.f5), amount: num(d.f6), turnoverRate: num(d.f8),
         volumeRatio: num(d.f10), marketCap: num(d.f20), floatCap: num(d.f21), pb: num(d.f23),
+        pe: num(d.f9),
     }));
 }
 
 interface EmPage { total: number; diff: Record<string, unknown>[] }
 
-async function emFetchPage(pageNo: number): Promise<EmPage> {
+async function emFetchPage(pageNo: number, fields: string = EM_FIELDS): Promise<EmPage> {
     const url = "https://push2.eastmoney.com/api/qt/clist/get"
-        + `?pn=${pageNo}&pz=${EM_PAGE}&po=1&np=1&fltt=2&invt=2&fid=f12&fs=${EM_FS}&fields=${EM_FIELDS}`;
+        + `?pn=${pageNo}&pz=${EM_PAGE}&po=1&np=1&fltt=2&invt=2&fid=f12&fs=${EM_FS}&fields=${fields}`;
     const res = await fetch(url, {
         headers: { "User-Agent": EM_UA },
         signal: AbortSignal.timeout(10_000),
@@ -227,6 +234,7 @@ export function parseSinaList(rows: Record<string, unknown>[]): Quote[] {
         marketCap: num(r.mktcap) * 1e4,
         floatCap: num(r.nmc) * 1e4,
         pb: num(r.pb),
+        pe: num(r.per),
     }));
 }
 
@@ -276,13 +284,37 @@ export const eastmoneySource: QuoteSource = {
         for (let start = 2; start <= pages; start += EM_CONCURRENCY) {
             const group: number[] = [];
             for (let pn = start; pn < Math.min(start + EM_CONCURRENCY, pages + 1); pn++) group.push(pn);
-            const results = await Promise.all(group.map(emFetchPage));
+            const results = await Promise.all(group.map((pn) => emFetchPage(pn)));
             for (const r of results) rest.push(...r.diff);
         }
         return parseEastmoneyDiff([...first.diff, ...rest]);
     },
     fetchQuotes(codes: string[]): Promise<Quote[]> {
         return sinaFetch(codes);
+    },
+    /** IPO 日期表（S12 真机探测：clist f26=YYYYMMDD 整数，Node 可达）。
+     *  轻字段全市场分页——池过滤的次新腿口粮。 */
+    async fetchIpoDays(): Promise<Map<string, string>> {
+        const out = new Map<string, string>();
+        for (let start = 1; start <= 200; start += EM_CONCURRENCY) {
+            const group: number[] = [];
+            for (let pn = start; pn < start + EM_CONCURRENCY; pn++) group.push(pn);
+            const results = await Promise.all(group.map((pn) => emFetchPage(pn, "f12,f13,f26")));
+            let done = false;
+            for (const r of results) {
+                for (const d of r.diff) {
+                    const raw = d.f26;
+                    if (typeof raw === "number" && raw >= 19900101) {
+                        const t = String(raw);
+                        out.set(emCode(String(d.f12 ?? ""), num(d.f13)),
+                            `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}`);
+                    }
+                }
+                if (r.diff.length < EM_PAGE) { done = true; break; }
+            }
+            if (done) break;
+        }
+        return out;
     },
 };
 
@@ -366,6 +398,65 @@ export function screenQuotes(quotes: Quote[], f: ScreenFilter): Quote[] {
     });
     kept.sort((a, b) => (order === "desc" ? b[sortBy] - a[sortBy] : a[sortBy] - b[sortBy]));
     return kept.slice(0, limit);
+}
+
+// ---------- 微盘候选池（S12：微盘轮动·上——文章体检法的代码面） ----------
+
+export interface PickPoolFilter {
+    /** 流通市值最小的前 N（默认 20——文章的轮动容量）。 */
+    topN?: number;
+    /** 日成交额下限（元；默认 3e7——三大死穴之流动性）。 */
+    amountMin?: number;
+    /** 股价下限（元；默认 2——低价/面值退市死穴）。 */
+    priceMin?: number;
+    /** PE 区间（默认 [0, 300]：亏损与爆表剔除；未知 PE 剔除——保守口径）。 */
+    peMin?: number;
+    peMax?: number;
+    /** PB 下限（默认 >0：负净资产剔除）。 */
+    pbMin?: number;
+    /** IPO 日期表（fetchIpoDays 口粮）——次新硬过滤；缺表退化为 N/C 前缀。 */
+    ipoDays?: Map<string, string>;
+    /** 次新宽限天数（默认 365——波动无参考 + 解禁压力）。 */
+    recentDays?: number;
+    /** 次新判定的今天（YYYY-MM-DD；缺省真实钟——纯函数传入保确定）。 */
+    today?: string;
+}
+
+/** 微盘候选池（纯函数）：停牌 → ST/退/北交所（红线）→ 流动性 → 低价 →
+ *  PE 区间 → PB>0 → 次新 → 流通市值升序 head(topN)。过滤次序固定（便宜的在
+ *  前、排序最后），每道阈值的文章依据记档在 PickPoolFilter 字段注释。 */
+export function pickPool(quotes: Quote[], f: PickPoolFilter = {}): Quote[] {
+    const topN = f.topN ?? 20;
+    const amountMin = f.amountMin ?? 3e7;
+    const priceMin = f.priceMin ?? 2;
+    const peMin = f.peMin ?? 0;
+    const peMax = f.peMax ?? 300;
+    const pbMin = f.pbMin ?? 0;
+    const recentDays = f.recentDays ?? 365;
+    const today = f.today ?? cnDayStr(Date.now());
+    const kept = quotes.filter((q) => {
+        if (q.price <= 0) return false;                                   // 停牌/无效行
+        if (isExcludedStock(q, true, true)) return false;                 // ST/退 + 北交所（规则 1-2/1-3 红线）
+        if (q.amount < amountMin) return false;                           // 流动性死穴
+        if (q.price < priceMin) return false;                             // 低价/面值退市死穴
+        if (!(q.pe !== undefined && q.pe > peMin && q.pe <= peMax)) return false; // PE 区间（未知=剔除）
+        if (!(q.pb > pbMin)) return false;                                // 负净资产剔除
+        if (/^[NC]/.test(q.name)) return false;                           // N/C 前缀（首日/上市 2-5 日）
+        const ipo = f.ipoDays?.get(q.code);
+        if (ipo) {
+            const days = (Date.parse(`${today}T00:00:00+08:00`) - Date.parse(`${ipo}T00:00:00+08:00`)) / 86_400_000;
+            if (days < recentDays) return false;                          // 次新（有表才硬过滤）
+        }
+        return q.floatCap > 0;
+    });
+    kept.sort((a, b) => a.floatCap - b.floatCap);
+    return kept.slice(0, topN);
+}
+
+/** 固定 UTC+8 的 YYYY-MM-DD（不经本机时区——输出必须确定）。 */
+function cnDayStr(ts: number): string {
+    const d = new Date(ts + 8 * 3600_000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
 // ---------- 服务 ----------
@@ -582,6 +673,49 @@ export class MarketDataService extends Service {
                     + `（快照 ${new Date(snap.at).toLocaleString("zh-CN")}，当前时段 ${phase}${phase === "closed" ? "=收盘快照" : ""}）`;
                 if (rows.length === 0) return header + "\n（无命中——放宽条件试试）";
                 return [header, ...rows.map(formatQuoteRow)].join("\n");
+            },
+        });
+        tools.register({
+            name: "get_stock_pool",
+            description: "微盘轮动候选池：流通市值最小的 N 只，七道过滤（停牌/ST·退·北交所红线/流动性/低价/PE 区间/PB>0/次新）。"
+                + "数据源：全市场快照 + 东财 IPO 日期表（源不可用退化为 N/C 前缀次新过滤）。研究面工具——产出是候选名单，不是买点。",
+            parameters: {
+                type: "object",
+                properties: {
+                    topN: { type: "number", description: "候选数量（默认 20）" },
+                    amountMin: { type: "number", description: "日成交额下限（元，默认 3e7）" },
+                    priceMin: { type: "number", description: "股价下限（元，默认 2）" },
+                    peMax: { type: "number", description: "PE 上限（默认 300）" },
+                    recentDays: { type: "number", description: "次新宽限天数（默认 365）" },
+                },
+            },
+            permissionHint: "read",
+            execute: async (input) => {
+                const snap = await this.ensureFresh(15_000);
+                let ipoDays: Map<string, string> | undefined;
+                let ipoNote = "IPO源不可用→退化N/C前缀";
+                if (this.source.fetchIpoDays) {
+                    try {
+                        ipoDays = await this.source.fetchIpoDays();
+                        ipoNote = `IPO源东财f26 ${ipoDays.size} 只`;
+                    } catch { /* 退化路径 */ }
+                }
+                const filter = {
+                    topN: input.topN as number | undefined,
+                    amountMin: input.amountMin as number | undefined,
+                    priceMin: input.priceMin as number | undefined,
+                    peMax: input.peMax as number | undefined,
+                    recentDays: input.recentDays as number | undefined,
+                    ipoDays,
+                    today: cnDayStr(this.now().getTime()),
+                };
+                const pool = pickPool(snap.quotes, filter);
+                const header = `候选 ${pool.length} 只（全市场 ${snap.quotes.length}，${ipoNote}，快照 ${new Date(snap.at).toLocaleString("zh-CN")}）`
+                    + "——流通市值升序";
+                if (pool.length === 0) return header + "\n（空池——放宽流动性/PE 条件试试）";
+                const rows = pool.map((q) => `${q.code}  ${q.name}\t${q.price.toFixed(2)}  流通${(q.floatCap / 1e8).toFixed(2)}亿`
+                    + `  PE${q.pe !== undefined ? q.pe.toFixed(1) : "?"}  PB${q.pb.toFixed(2)}  额${(q.amount / 1e8).toFixed(2)}亿  换手${q.turnoverRate.toFixed(2)}%`);
+                return [header, ...rows].join("\n");
             },
         });
     }

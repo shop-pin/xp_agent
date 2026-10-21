@@ -1806,6 +1806,35 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "44": {
+    // S12：选股池探针——get_stock_pool 七道过滤（违规样本剔除 + 流通市值升序
+    // + IPO 源注记）；fixture 手算：候选 = 甲/丙（乙次新剔、ST/地量剔）。
+    needsLog: true,
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-claude", "stocks"), { recursive: true });
+      writeFileSync(join(dir, ".mini-claude", "stocks", "watchlist.txt"), "sh600000  # 浦发银行\n");
+    },
+    runs: [{ poolProbe: true }],
+    turns: [
+      { tools: [{ name: "get_stock_pool", input: { topN: 10 } }] },
+      { text: "候选池甲/丙两只，乙为次新剔除。复盘为研究输出，非投资建议。" },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request" && e.track === "main");
+      check("two main requests (pool turn -> answer)", reqs.length === 2);
+      check("pool header counts filtered over market (with IPO note)",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("候选 2 只（全市场 5，IPO源东财f26 1 只")));
+      check("pool keeps 甲/丙 sorted by floatCap, drops ST and 次新乙",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("sh600010  甲")
+          && t.content.includes("sh600012  丙")
+          && t.content.indexOf("sh600010") < t.content.indexOf("sh600012"))
+        && !(reqs[1]?.toolResults || []).some((t) => t.content.includes("ST麻烦") && t.content.includes("sh600011")));
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];
@@ -2377,6 +2406,34 @@ if (s.runs) {
         });
         await new Promise((r2) => setTimeout(r2, 50));
         await agent.chat("看看浦发银行的五档盘口。");
+        if (agent.close) await agent.close();
+      } else if (r.poolProbe !== undefined) {
+        // S12：选股池探针——违规样本（ST/地量/次新）+ 三个合法票按流通市值排序。
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const base = { price: 10, change: 0.1, changePercent: 1.01, open: 9.8, high: 10.2, low: 9.7, preClose: 9.9, volume: 1000, turnoverRate: 2, volumeRatio: 1, marketCap: 0, pb: 2 };
+        const FIX = [
+          { ...base, code: "sh600001", name: "ST麻烦", amount: 5e7, floatCap: 6e8, pe: 30 },
+          { ...base, code: "sh600002", name: "地量票", amount: 5e5, floatCap: 5e8, pe: 30 },
+          { ...base, code: "sh600010", name: "甲", amount: 5e7, floatCap: 5e8, pe: 30 },
+          { ...base, code: "sh600011", name: "乙", amount: 5e7, floatCap: 9e8, pe: 30 },
+          { ...base, code: "sh600012", name: "丙", amount: 5e7, floatCap: 7e8, pe: 30 },
+        ];
+        const src = {
+          async fetchMarketSnapshot() { return FIX; },
+          async fetchQuotes() { return []; },
+          async fetchIpoDays() { return new Map([["sh600011", "2026-09-01"]]); },
+        };
+        const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const agent = new agentMod.Agent({
+          profile: "stock",
+          extraRows: [
+            { id: "news", name: "news-feed", disabled: true },
+            { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
+            { id: "datastore", name: "data-store", config: { rootDir: join(workdir, "data") } },
+          ],
+        });
+        await new Promise((r2) => setTimeout(r2, 50));
+        await agent.chat("跑一下今天的微盘候选池。");
         if (agent.close) await agent.close();
       } else {
         await mod.runCli(r.argv);
