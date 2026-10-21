@@ -16,6 +16,7 @@ import { CommandService } from '../services/commands.js'
 import { marketDataPlugin, type Quote, type QuoteSource } from '../plugins/market-data.js'
 import { paperBrokerPlugin, type PaperBroker } from '../plugins/paper-broker.js'
 import { tradeGuardPlugin, type GuardConfig, type TradeGuardService } from '../plugins/trade-guard.js'
+import { DEFAULT_STRATEGY } from '../plugins/strategy.js'
 
 // 周一 10:00 CST = open；12:00 CST = lunch（时段闸门用例的两口钟）
 const T_OPEN = Date.UTC(2026, 9, 19, 2, 0, 0)
@@ -44,7 +45,7 @@ async function mountGuard(config: GuardConfig = {}, at: number = T_OPEN): Promis
     ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000 })
     const ledger = join(mkdtempSync(join(tmpdir(), 's8-ledger-')), 'paper.jsonl')
     ctx.plugin(paperBrokerPlugin, { ledgerPath: ledger, now })
-    ctx.plugin(tradeGuardPlugin, { ...config, now })
+    ctx.plugin(tradeGuardPlugin, { ...config, now, strategy: DEFAULT_STRATEGY })
     await ctx.market!.refresh() // 首轮快照落进 latest（guard 的 fail-closed 需要）
     return {
         ctx, guard: ctx.guard!, broker: ctx.broker!,

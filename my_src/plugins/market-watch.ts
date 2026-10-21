@@ -31,6 +31,7 @@ import { marketPhase, type MarketDataService } from "./market-data.js";
 import { cnDay } from "./paper-broker.js";
 import type { Signal } from "./signal-engine.js";
 import type { TradeGuardService } from "./trade-guard.js";
+import { loadStrategy, type StrategyConfig } from "./strategy.js";
 
 /** 盘中信号的时:分（CN）——唤醒文本里给人看的时间戳。 */
 function cnHm(ts: number): string {
@@ -65,15 +66,15 @@ export const defaultPrompts: WatchPrompts = {
 };
 
 export interface WatchConfig {
+    /** 策略配置（缺省 loadStrategy()——watch 节参数源）。 */
+    strategy?: StrategyConfig;
     /** 唤醒桥（AppHost.wake——profile 工厂注入）。 */
     wake?: (text: string) => Promise<void>;
-    /** 信号唤醒最小间隔 ms（默认 3 分钟——turn 经济性）。 */
+    /** 信号唤醒最小间隔 ms（缺省走策略 watch.signalCooldownMs）。 */
     signalCooldownMs?: number;
-    /** 单信号最大待醒年龄 ms（flush 时超龄丢弃；默认 2×冷却窗——Day 1：
-     *  5 小时前的信号照常醒来。攒批需要余量，取 1×冷却窗会让冷却早期进
-     *  信箱的信号到出账时必然超龄）。 */
+    /** 单信号最大待醒年龄 ms（缺省走策略 watch.maxSignalAgeMs）。 */
     maxSignalAgeMs?: number;
-    /** 同 code 每日最大唤醒次数（默认 2——"已裁决码静音"的机械代理）。 */
+    /** 同 code 每日最大唤醒次数（缺省走策略 watch.perCodeWakeCap）。 */
     perCodeWakeCap?: number;
     /** 提示词覆盖（测试锚定）。 */
     prompts?: Partial<WatchPrompts>;
@@ -225,7 +226,13 @@ export const marketWatchPlugin: Plugin = {
     // 只 inject commands（行位早）——/watch 即时注册；market/guard/schedule 惰性取
     inject: ["commands"],
     apply(ctx: Context, config: WatchConfig = {}) {
-        const watch = new WatchService(ctx, "watch", config);
+        const strategy = config.strategy ?? loadStrategy();
+        const watch = new WatchService(ctx, "watch", {
+            ...config,
+            signalCooldownMs: config.signalCooldownMs ?? strategy.watch.signalCooldownMs,
+            maxSignalAgeMs: config.maxSignalAgeMs ?? strategy.watch.maxSignalAgeMs,
+            perCodeWakeCap: config.perCodeWakeCap ?? strategy.watch.perCodeWakeCap,
+        });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));
         ctx.effect(() => () => {
             if (watch.armed) watch.stop();

@@ -18,6 +18,7 @@ import {
     dailyKPath, detailPath, signalsPath, verdictsPath,
     SCHEMA_DAILY_K, SCHEMA_DETAIL, SCHEMA_SIGNALS, SCHEMA_VERDICTS,
 } from '../plugins/data-store.js'
+import { DEFAULT_STRATEGY } from '../plugins/strategy.js'
 
 // 2026-10-19 周一：10:00 CST 开盘中；15:30 CST 已收盘
 const MON_OPEN = Date.UTC(2026, 9, 19, 2, 0, 0)
@@ -54,7 +55,7 @@ function mountStore(): Mount {
     let clock = MON_OPEN
     const src: QuoteSource = { async fetchMarketSnapshot() { return QUOTES }, async fetchQuotes() { return [] } }
     const now = () => new Date(clock)
-    ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000 })
+    ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000, strategy: DEFAULT_STRATEGY })
     ctx.plugin(paperBrokerPlugin, { ledgerPath: join(home, 'paper.jsonl'), now })
     ctx.plugin(dataStorePlugin, { rootDir: root })
     return {
@@ -121,7 +122,7 @@ test('断电重启：同根新实例续写事件层不重发 schema 头；日K�
         new CommandService(ctx2, 'commands')
         let clock = MON_CLOSED
         const src: QuoteSource = { async fetchMarketSnapshot() { return QUOTES }, async fetchQuotes() { return [] } }
-        ctx2.plugin(marketDataPlugin, { source: src, now: () => new Date(clock), pollIntervalMs: 60_000 })
+        ctx2.plugin(marketDataPlugin, { source: src, now: () => new Date(clock), pollIntervalMs: 60_000, strategy: DEFAULT_STRATEGY })
         ctx2.plugin(paperBrokerPlugin, { ledgerPath: join(m.home, 'paper.jsonl'), now: () => new Date(clock) })
         ctx2.plugin(dataStorePlugin, { rootDir: m.root })
         await ctx2.market!.refresh()

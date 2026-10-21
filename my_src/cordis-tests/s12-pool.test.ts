@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import { Context } from '../cordis/context.js'
 import { ToolsService } from '../services/tools.js'
 import { marketDataPlugin, parseSinaList, pickPool, type Quote, type QuoteSource } from '../plugins/market-data.js'
+import { DEFAULT_STRATEGY } from '../plugins/strategy.js'
 
 const q = (over: Partial<Quote>): Quote => ({
     code: 'sh600000', name: '测试股', price: 10, change: 0, changePercent: 1,
@@ -75,7 +76,7 @@ test('get_stock_pool 工具：候选名单 + 过滤前后计数 + IPO 源注记'
         async fetchQuotes() { return [] },
         async fetchIpoDays() { return new Map([['sh600011', '2026-09-01']]) }, // 乙次新
     }
-    ctx.plugin(marketDataPlugin, { source: src })
+    ctx.plugin(marketDataPlugin, { source: src, strategy: DEFAULT_STRATEGY })
     const out = await ctx.require<ToolsService>('tools').get('get_stock_pool')!.execute({}, {})
     const text = out as string
     assert.match(text, /候选 2 只（全市场 5，IPO源东财f26 1 只/)
@@ -92,7 +93,7 @@ test('get_stock_pool 工具：候选名单 + 过滤前后计数 + IPO 源注记'
     }
     const ctx2 = new Context()
     new ToolsService(ctx2, 'tools')
-    ctx2.plugin(marketDataPlugin, { source: src2 })
+    ctx2.plugin(marketDataPlugin, { source: src2, strategy: DEFAULT_STRATEGY })
     const out2 = await ctx2.require<ToolsService>('tools').get('get_stock_pool')!.execute({}, {})
     assert.match(out2 as string, /退化N\/C前缀/)
     assert.match(out2 as string, /sh600010  甲/)

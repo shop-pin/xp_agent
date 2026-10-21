@@ -15,6 +15,7 @@ import { CommandService } from '../services/commands.js'
 import { marketDataPlugin, parseSinaResponse, type Book, type MarketDataService, type Quote, type QuoteSource } from '../plugins/market-data.js'
 import { signalEnginePlugin, bookPressure, defaultRules, type Point } from '../plugins/signal-engine.js'
 import { dataStorePlugin, readSchemaJsonl, detailPath, SCHEMA_DETAIL, type DataStoreService } from '../plugins/data-store.js'
+import { DEFAULT_STRATEGY } from '../plugins/strategy.js'
 
 // 2026-10-19 周一 10:00 CST 开盘中
 const T0 = Date.UTC(2026, 9, 19, 2, 0, 0)
@@ -132,8 +133,8 @@ function mountBook(): {
         },
     }
     const now = () => new Date(clock)
-    ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000 })
-    ctx.plugin(signalEnginePlugin, {})
+    ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000, strategy: DEFAULT_STRATEGY })
+    ctx.plugin(signalEnginePlugin, { strategy: DEFAULT_STRATEGY })
     ctx.plugin(dataStorePlugin, { rootDir: root })
     return {
         ctx, store: ctx.dataStore!, market: ctx.market!, tools, root,

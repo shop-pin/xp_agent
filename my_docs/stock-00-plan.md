@@ -107,7 +107,7 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 
 **S13 历史日 K 与回测引擎（微盘轮动·下）** — 历史 K 线数据源调研与接入（新浪/腾讯/东财 hist，Node 可达性逐一探测，fixture 照录）+ 按日重放引擎（选股规则逐日重放 → 订单流 → 净值序列，费用复用 computeFee）+ 绩效计算（年化/最大回撤/回撤持续与修复/分层）。验收：手算小样本对拍（10 个交易日）+ 微盘 20 轮动跑通近三年 + 净值/回撤文本曲线输出；**回测结果只进研究面，不直接驱动下单**。
 
-### 阶段 P5：交易系统与实盘（独立开关）
+### 阶段 P5：交易系统与实盘（独立开关——2026-10-21 用户定：暂无实盘资格，S14 止步，S15 等券商门槛与达标清单）
 
 **S14 交易系统成型** — 复盘/回测反馈环：S10 留存数据 + S13 回测 → 参数固化（规则阈值/仓位上限/轮动节奏）→ 策略文档化（一页纸：入场/离场/仓位/风控四节）+ 参数进配置可调。验收：同一策略文档能让回测器与盯盘系统产出一致行为（策略即配置，不散落在提示词里）。
 
@@ -163,6 +163,7 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 | S11 | ✅ 完成（2026-10-21） | `stock-S11.md`；五档盘口（market-data `Level`/`Book` + `parseBook` 解析 hq f[10..29] 量=股、Quote.book 可选、get_quote 五档行）+ `bookPressure` 纯函数 + **book-pressure 规则**（\|压力\|≥0.6 且与 5min 涨速同向且 \|chg\|≥1 三腿——单看比值会被托压单做出来）+ **volume-divergence 量价背离**（\|chg\|≥1.5 而 surge<0.8，方向取背离语义=警示）+ 引擎盘口缓存（market/book 事件，RuleContext.book 可选注入非关注面 null 让路）+ data-store 关注面盘口轮询（10s 心跳顺带、universe 前 50 只/批、盘口行进明细层）+ adjudicate 技能盘口佐证维度 + **T+1 显式条款**（当日买入不可卖，s6 契约锚定）+ mock 场景 43；翻车记档：背离用例手算错误被实现逮住（数字对不上先查自己推导）、verify 锚"单档形"假阴（锚真实产出形状）；cordis 270/270、mock 39、snapshot 38/38（ch37/38/41 重录、ch43 新录）；建议 commit：`add order book parsing with pressure factor and divergence rule` |
 | S12 | ✅ 完成（2026-10-21） | `stock-S12.md`；`pickPool` 七道过滤纯函数（停牌/ST·退·北交所红线/流动性 3000 万/低价 2 元/PE 区间 0-300 未知剔除/PB>0/次新 365 天退化 N/C 前缀——阈值全部可调，默认=保守起点）+ `get_stock_pool` 只读工具（候选数/全市场数/IPO 源注记 + 流通市值升序）+ `Quote.pe`（parseSinaList 补 per=第五批判定兑现；东财补 f9）+ **`fetchIpoDays?` 可选能力**（东财 clist f26=YYYYMMDD，**2026-10-21 真机实测 Node 可达——2026-10-18 的 WAF RST 不复现，记档更新：东财对 Node 可用性时变，依赖前先探**；源失败退化 N/C 前缀且输出注记明说）+ mock 场景 44；板块口径=北交所红线剔（创/科在池内，20 候选中占 9 席，调试期按需加开关挂账）；真机冒烟：5,575 只/4.4s + IPO 5,922 只/0.7s → 候选 20（流通 8.3-13 亿）；翻车记档：map 直接引用带可选参函数签名隐雷、记档知识自带时效；cordis 274/274、mock 40、snapshot 39/39（ch44 新录，旧章零重录）；建议 commit：`add stock pool picker with seven filters and ipo dates` |
 | S13 | ✅ 完成（2026-10-21，P4 收官） | `stock-S13.md`；backtest/ 研究面四模块（kline/replay/metrics/run CLI）+ **微盘 20 轮动近三年跑通**（866 交易日、5,920 笔调仓、总收益 −28.8%/回撤 −51.1%/2024 −25.4%=微盘流动性危机显形；缓存 hist-k/ 后重放 6.4s）+ 手算对拍（10 交易日 4 笔调仓净值逐日到分）+ 文本曲线；**源探测更正**：东财 IP 级间歇封锁当日实测（上午通/午后 curl+Node 双 000）——日K主源改腾讯 ifzq qfq（全天候稳定），东财 fetchIpoDays 保留供封锁窗；近似口径四条记档（静态缩放/收盘成交/滑点 ±0.2%/amount≈close×vol×100）；费用 computeFee 单源复用；挂账#1 实盘侧双补丁仍在账（回测侧滑点已内置）；翻车记档：手算名次错被引擎逮住（第三次同族）、metrics 恢复判定写反、Number("")=0 残行、初始资金 replace("_") 只换首个、"1_000_000"教训；回测=研究面不进插件树（零快照变化）；cordis 278/278、mock 40、snapshot 39/39；建议 commit：`add backtest engine with daily rotation replay and metrics` |
+| S14 | ✅ 完成（2026-10-21，P4/P5 分界——实盘前最后一章） | `stock-S14.md` + `strategy-one-pager.md`（一页纸：入场/离场/仓位/风控四节+缺口清单，**离场=无自动止损标为调试期第一优先**）；`plugins/strategy.ts` 六节策略配置（DEFAULT_STRATEGY=历史硬编码零漂移搬家）+ `loadStrategy()` 用户覆盖（~/.mini-claude/stocks/strategy.json 节级深合并、坏配置明确拒读）+ 五处消费端接线（engine 阈值参数化 defaultRules(strategy)/watch/guard/池工具/回测 run+replay slippage）；**一致行为锚测试**（用户覆盖 pool.topN → 池工具生效，回测 CLI 同源）；翻车记档：spread 后显式赋 undefined 顶掉策略默认（池入参覆盖 S12 起就失效，一致锚首个战果）、阈值敏感测试挂 DEFAULT_STRATEGY 保浸入式；默认零漂移证明=cordis 282/282、mock 40、snapshot 39/39 全部零重录；建议 commit：`add strategy config with one page policy and parameter wiring` |
 | S10 | ⬜ 未开始 | 数据留存与历史落地（日 K 收口 / 关注面明细 / 事件层，P4 起） |
 | S11 | ⬜ 未开始 | 盘口数据与买卖压力因子（五档解析 + 关注面轮询） |
 | S12 | ⬜ 未开始 | 选股池工具（微盘轮动·上，七道过滤 + IPO 源调研） |

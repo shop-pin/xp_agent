@@ -30,6 +30,7 @@ import { Service } from "../cordis/service.js";
 import type { ToolsService } from "../services/tools.js";
 import { isExcludedStock, type MarketDataService, type HistoryRound, type Quote, type Book } from "./market-data.js";
 import { cnDay } from "./paper-broker.js";
+import { DEFAULT_STRATEGY, loadStrategy, type SignalsConfig, type StrategyConfig } from "./strategy.js";
 
 // ---------- 序列提取（纯函数） ----------
 
@@ -182,14 +183,15 @@ export interface SignalRule {
     evaluate(ctx: RuleContext): Signal | null;
 }
 
-/** 默认规则四件（参数在闭包里，注册时可被同名规则覆盖）。 */
-export function defaultRules(): SignalRule[] {
+/** 默认规则集（阈值来自策略配置——S14 策略即配置；默认 = DEFAULT_STRATEGY，
+ *  注册时可被同名规则覆盖）。 */
+export function defaultRules(s: SignalsConfig = DEFAULT_STRATEGY.signals): SignalRule[] {
     return [
         {
             name: "rapid-move",
             evaluate({ quote, series }) {
                 const chg = windowChange(series, 5 * 60_000);
-                if (chg === null || Math.abs(chg) < 3) return null;
+                if (chg === null || Math.abs(chg) < s.rapidMovePct) return null;
                 return {
                     code: quote.code, name: quote.name, rule: "rapid-move",
                     direction: chg > 0 ? "up" : "down", strength: Math.round(chg * 100) / 100,
@@ -203,12 +205,12 @@ export function defaultRules(): SignalRule[] {
             evaluate({ quote, series }) {
                 const surge = volumeSurge(series, 60_000);
                 const chg = windowChange(series, 5 * 60_000);
-                if (surge === null || surge < 2.5 || chg === null || Math.abs(chg) < 1) return null;
+                if (surge === null || surge < s.volumeSurgeX || chg === null || Math.abs(chg) < s.volumeSurgeChgPct) return null;
                 // 绝对量检验（Day 1）：量率腿必须建立在真流量上——probe 窗口
-                // 分钟成交额 ≥ 30 万，或当日累计换手 ≥ 0.5%；两者皆无 = 零基线
-                // 假比率（方正阀门 6.6 倍 = 4 分钟零基线 ÷ 20 手）
+                // 分钟成交额或当日累计换手；两者皆无 = 零基线假比率
+                // （方正阀门 6.6 倍 = 4 分钟零基线 ÷ 20 手）
                 const perMin = probeAmountPerMin(series, 60_000);
-                if ((perMin === null || perMin < 3e5) && quote.turnoverRate < 0.5) return null;
+                if ((perMin === null || perMin < s.volumeSurgeAmountPerMin) && quote.turnoverRate < s.volumeSurgeTurnover) return null;
                 return {
                     code: quote.code, name: quote.name, rule: "volume-surge",
                     direction: chg > 0 ? "up" : "down",
@@ -223,17 +225,16 @@ export function defaultRules(): SignalRule[] {
             evaluate({ quote, series }) {
                 const surge = volumeSurge(series, 60_000);
                 // 幅度腿按 tick 归一（Day 1）：低价股一个 tick 就冒充突破
-                // （*ST田野 1.38 元一跳 0.72%）——幅度下限 = max(0.5%, 2tick/价)
-                const minPct = Math.max(0.5, ((2 * 0.01) / quote.price) * 100);
+                // （*ST田野 1.38 元一跳 0.72%）——幅度下限 = max(下限%, Ntick/价)
+                const minPct = Math.max(s.breakoutMinPct, ((s.breakoutTicks * 0.01) / quote.price) * 100);
                 for (const direction of ["up", "down"] as const) {
                     const pct = breakout(series, 5 * 60_000, 30_000, direction);
                     if (pct === null) continue;
                     // 量能确认是硬门槛：无量数据（surge null）同样不认——
                     // 否则零量序列的形态突破会裸奔（S5 翻车记档）
-                    if (surge === null || surge < 1.5) continue;
-                    // 双门槛（Day 1）：幅度或量率至少一项过线——80 信号里
-                    // ~25 笔 tick 级（0.03%~0.46%）两头都不沾
-                    if (Math.abs(pct) < minPct && surge < 2.5) continue;
+                    if (surge === null || surge < s.breakoutBaseSurgeX) continue;
+                    // 双门槛（Day 1）：幅度或量率至少一项过线
+                    if (Math.abs(pct) < minPct && surge < s.breakoutSurgeX) continue;
                     return {
                         code: quote.code, name: quote.name, rule: "breakout",
                         direction, strength: Math.round(pct * 100) / 100,
@@ -278,9 +279,9 @@ export function defaultRules(): SignalRule[] {
             name: "book-pressure",
             evaluate({ quote, series, book }) {
                 const pr = bookPressure(book);
-                if (pr === null || Math.abs(pr) < 0.6) return null;
+                if (pr === null || Math.abs(pr) < s.bookPressure) return null;
                 const chg = windowChange(series, 5 * 60_000);
-                if (chg === null || Math.abs(chg) < 1) return null;
+                if (chg === null || Math.abs(chg) < s.bookPressureChgPct) return null;
                 // 压力与价格同向才算数：价格没动/反向的挂单墙是托单压单把戏，
                 // 单看比值会被主动做出来（Day 1 纪律：机械门槛两条腿）
                 if (Math.sign(chg) !== Math.sign(pr)) return null;
@@ -298,10 +299,10 @@ export function defaultRules(): SignalRule[] {
                 const chg = windowChange(series, 5 * 60_000);
                 const surge = volumeSurge(series, 60_000);
                 if (chg === null || surge === null) return null;
-                // 量价背离：价走出 1.5%+ 而量率趴在 0.8 倍以下——上涨无量=顶背离，
+                // 量价背离：价走出阈值+ 而量率趴在上限倍数以下——上涨无量=顶背离，
                 // 下跌无量=底背离（方向取背离语义）。strength = 背离段涨速（带符号，
                 // 与 rapid-move/breakout down 同约定）。
-                if (chg >= 1.5 && surge < 0.8) {
+                if (chg >= s.divergenceChgPct && surge < s.divergenceSurgeX) {
                     return {
                         code: quote.code, name: quote.name, rule: "volume-divergence",
                         direction: "down", strength: Math.round(chg * 100) / 100,
@@ -309,7 +310,7 @@ export function defaultRules(): SignalRule[] {
                         at: series[series.length - 1].at,
                     };
                 }
-                if (chg <= -1.5 && surge < 0.8) {
+                if (chg <= -s.divergenceChgPct && surge < s.divergenceSurgeX) {
                     return {
                         code: quote.code, name: quote.name, rule: "volume-divergence",
                         direction: "up", strength: Math.round(chg * 100) / 100,
@@ -326,23 +327,25 @@ export function defaultRules(): SignalRule[] {
 // ---------- 服务 ----------
 
 export interface SignalConfig {
-    /** 同 code+规则 的重发冷却 ms（默认 300,000 = 5 分钟）。 */
+    /** 策略配置（缺省 loadStrategy()——用户覆盖文件 > DEFAULT_STRATEGY）。 */
+    strategy?: StrategyConfig;
+    /** 同 code+规则 的重发冷却 ms（缺省走策略 signals.cooldownMs）。 */
     cooldownMs?: number;
     /** 信号内存环容量（默认 200，新→旧）。 */
     keepSignals?: number;
     /** 追加规则（同名后写胜——覆盖默认规则即自定义）。 */
     rules?: SignalRule[];
-    /** 北交所排除（默认 true——trading-rules.md 规则 1-2）。 */
+    /** 北交所排除（缺省走策略 universe.excludeBJ）。 */
     excludeBJ?: boolean;
-    /** ST/退市名称排除（默认 true——规则 1-3 红线；测试 fixture 可关）。 */
+    /** ST/退市名称排除（缺省走策略 universe.excludeST）。 */
     excludeST?: boolean;
-    /** 日累计成交额下限（元，默认 1e7 = 1,000 万流动性闸；0 = 关）。 */
+    /** 日累计成交额下限（缺省走策略 universe.amountMin）。 */
     amountMin?: number;
-    /** 同 code+规则 每日最大发射次数（默认 2——重发纪律）。 */
+    /** 同 code+规则 每日最大发射次数（缺省走策略 signals.dailyFireCap）。 */
     dailyFireCap?: number;
-    /** 同向重发的强度增长门槛：|strength| 须超上次 ×此值（默认 1.5）。 */
+    /** 同向重发强度增长门槛（缺省走策略 signals.refireGrowth）。 */
     refireGrowth?: number;
-    /** 方向翻转的强度增长门槛（默认 2——翻转是新信息，但要求更强）。 */
+    /** 方向翻转强度增长门槛（缺省走策略 signals.flipGrowth）。 */
     flipGrowth?: number;
 }
 
@@ -372,15 +375,16 @@ export class SignalEngine extends Service {
 
     constructor(ctx: Context, name: string, config: SignalConfig = {}) {
         super(ctx, name);
-        this.cooldownMs = config.cooldownMs ?? 300_000;
+        const strategy = config.strategy ?? loadStrategy();
+        this.cooldownMs = config.cooldownMs ?? strategy.signals.cooldownMs;
         this.keepSignals = config.keepSignals ?? 200;
-        this.excludeBJ = config.excludeBJ ?? true;
-        this.excludeST = config.excludeST ?? true;
-        this.amountMin = config.amountMin ?? 1e7;
-        this.dailyFireCap = config.dailyFireCap ?? 2;
-        this.refireGrowth = config.refireGrowth ?? 1.5;
-        this.flipGrowth = config.flipGrowth ?? 2;
-        for (const rule of [...defaultRules(), ...(config.rules ?? [])]) {
+        this.excludeBJ = config.excludeBJ ?? strategy.universe.excludeBJ;
+        this.excludeST = config.excludeST ?? strategy.universe.excludeST;
+        this.amountMin = config.amountMin ?? strategy.universe.amountMin;
+        this.dailyFireCap = config.dailyFireCap ?? strategy.signals.dailyFireCap;
+        this.refireGrowth = config.refireGrowth ?? strategy.signals.refireGrowth;
+        this.flipGrowth = config.flipGrowth ?? strategy.signals.flipGrowth;
+        for (const rule of [...defaultRules(strategy.signals), ...(config.rules ?? [])]) {
             this.rules.set(rule.name, rule); // 同名后写胜
         }
     }
@@ -507,7 +511,18 @@ export const signalEnginePlugin: Plugin = {
     inject: ["tools", "market"],
     apply(ctx: Context, config: SignalConfig = {}) {
         const market = ctx.require<MarketDataService>("market");
-        const engine = new SignalEngine(ctx, "signals", config);
+        const strategy = config.strategy ?? loadStrategy();
+        const engine = new SignalEngine(ctx, "signals", {
+            ...config,
+            cooldownMs: config.cooldownMs ?? strategy.signals.cooldownMs,
+            dailyFireCap: config.dailyFireCap ?? strategy.signals.dailyFireCap,
+            refireGrowth: config.refireGrowth ?? strategy.signals.refireGrowth,
+            flipGrowth: config.flipGrowth ?? strategy.signals.flipGrowth,
+            amountMin: config.amountMin ?? strategy.universe.amountMin,
+            excludeBJ: config.excludeBJ ?? strategy.universe.excludeBJ,
+            excludeST: config.excludeST ?? strategy.universe.excludeST,
+            strategy,
+        });
         engine.attach(market);
         engine.attachTools();
         // 卸载清冷却表（监听器经 B3 effect 自动摘除，无需手动）

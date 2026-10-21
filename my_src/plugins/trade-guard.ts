@@ -31,6 +31,7 @@ import type { SessionLog } from "../services/session-log.js";
 import type { PreExecDecision } from "../services/tools.js";
 import { marketPhase, type MarketDataService } from "./market-data.js";
 import { priceBand, type PaperBroker } from "./paper-broker.js";
+import { loadStrategy } from "./strategy.js";
 
 export interface GuardConfig {
     /** 交易时段闸门（默认 true；测试/回放可关）。 */
@@ -147,7 +148,14 @@ export const tradeGuardPlugin: Plugin = {
     // 只 inject commands（行位早）——即时挂载保瀑布最外层；market/broker 惰性取
     inject: ["commands"],
     apply(ctx: Context, config: GuardConfig = {}) {
-        const guard = new TradeGuardService(ctx, "guard", config);
+        const strategy = loadStrategy();
+        const guard = new TradeGuardService(ctx, "guard", {
+            ...config,
+            maxPositionPct: config.maxPositionPct ?? strategy.risk.maxPositionPct,
+            maxDailyLoss: config.maxDailyLoss ?? strategy.risk.maxDailyLoss,
+            excludeST: config.excludeST ?? strategy.universe.excludeST,
+            excludeBJ: config.excludeBJ ?? strategy.universe.excludeBJ,
+        });
         ctx.on("tools/pre-execute", (call, next) => {
             if (call.name !== "place_order") return next();
             const decision = guard.checkOrder(call.input);

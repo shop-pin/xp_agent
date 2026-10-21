@@ -22,6 +22,7 @@ import type { ToolsService } from "../services/tools.js";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { loadStrategy } from "./strategy.js";
 
 // ---------- 数据词汇表 ----------
 
@@ -700,15 +701,13 @@ export class MarketDataService extends Service {
                         ipoNote = `IPO源东财f26 ${ipoDays.size} 只`;
                     } catch { /* 退化路径 */ }
                 }
-                const filter = {
-                    topN: input.topN as number | undefined,
-                    amountMin: input.amountMin as number | undefined,
-                    priceMin: input.priceMin as number | undefined,
-                    peMax: input.peMax as number | undefined,
-                    recentDays: input.recentDays as number | undefined,
-                    ipoDays,
-                    today: cnDayStr(this.now().getTime()),
-                };
+                // 池参数 = 策略配置（S14 策略即配置）< 工具入参覆盖（仅覆写有值的键——
+                // spread 后赋 undefined 会把策略默认顶掉）
+                const filter = { ...loadStrategy().pool, ipoDays, today: cnDayStr(this.now().getTime()) };
+                for (const key of ["topN", "amountMin", "priceMin", "peMax", "recentDays"] as const) {
+                    const v = input[key];
+                    if (v !== undefined) (filter as Record<string, unknown>)[key] = v;
+                }
                 const pool = pickPool(snap.quotes, filter);
                 const header = `候选 ${pool.length} 只（全市场 ${snap.quotes.length}，${ipoNote}，快照 ${new Date(snap.at).toLocaleString("zh-CN")}）`
                     + "——流通市值升序";

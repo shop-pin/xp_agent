@@ -11,6 +11,7 @@ import {
     signalEnginePlugin, seriesFor, windowChange, volumeSurge, vwapDeviation,
     breakout, limitTier, defaultRules, type Point, type Signal,
 } from '../plugins/signal-engine.js'
+import { DEFAULT_STRATEGY } from '../plugins/strategy.js'
 
 const P = (at: number, price: number, volume = 0, amount = 0): Point => ({ at, price, volume, amount })
 const MIN = 60_000
@@ -184,7 +185,7 @@ test('引擎：snapshot 事件驱动评估 → market/signal 广播 → 冷却�
     ctx.on('market/signal', (s) => { fired.push(s) })
     let snapCount = 0
     ctx.on('market/snapshot', () => { snapCount++ })
-    ctx.plugin(signalEnginePlugin, {})
+    ctx.plugin(signalEnginePlugin, { strategy: DEFAULT_STRATEGY })
     const eng = ctx.signals!
 
     const market = ctx.market!
@@ -236,7 +237,7 @@ test('引擎：宇宙闸——bj 前缀/ST 名称/成交额下限三道排除（
     ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(T0), pollIntervalMs: 60_000 })
     const fired: Signal[] = []
     ctx.on('market/signal', (s) => { fired.push(s) })
-    ctx.plugin(signalEnginePlugin, {})
+    ctx.plugin(signalEnginePlugin, { strategy: DEFAULT_STRATEGY })
     const market = ctx.market!
     await market.refresh()
     await market.refresh()

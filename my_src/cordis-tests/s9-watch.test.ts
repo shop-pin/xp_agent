@@ -16,6 +16,7 @@ import { marketDataPlugin, type Quote, type QuoteSource } from '../plugins/marke
 import { paperBrokerPlugin, type Fill } from '../plugins/paper-broker.js'
 import { tradeGuardPlugin } from '../plugins/trade-guard.js'
 import { marketWatchPlugin, type WatchService } from '../plugins/market-watch.js'
+import { DEFAULT_STRATEGY } from '../plugins/strategy.js'
 import { memoryPlugin } from '../plugins/memory.js'
 import { getMemoryDir } from '../memory.js'
 import type { Signal } from '../plugins/signal-engine.js'
@@ -56,11 +57,12 @@ function mountWatch(cooldownMs = 180_000, at = MON_OPEN): Mount {
     }
     let clock = at
     ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(clock), pollIntervalMs: 60_000 })
-    ctx.plugin(tradeGuardPlugin, { now: () => new Date(clock) })
+    ctx.plugin(tradeGuardPlugin, { now: () => new Date(clock), strategy: DEFAULT_STRATEGY })
     const wakes: string[] = []
     ctx.plugin(marketWatchPlugin, {
         wake: async (text: string) => { wakes.push(text) },
         signalCooldownMs: cooldownMs,
+        strategy: DEFAULT_STRATEGY,
     })
     return {
         ctx, watch: ctx.watch!, wakes, schedule,

@@ -37,19 +37,22 @@ export interface ReplayResult {
     trades: ReplayTrade[];
 }
 
-const SLIPPAGE = 0.002;
+const SLIPPAGE = 0.002; // 缺省单边滑点（策略 backtest.slippage 同值——opts 可覆盖）
 
 export interface ReplayOptions {
     topN?: number;
     cash?: number;
     ipoDays?: Map<string, string>;
     recentDays?: number;
+    /** 单边滑点（缺省 0.002 = ±0.2%——策略 backtest.slippage 的缺省同值）。 */
+    slippage?: number;
 }
 
 /** 逐日重放：每日用该日伪快照跑 pickPool（同一选股函数——回测与盯盘产出
  *  一致行为的 S14 前置），成员变化即调仓。 */
 export function replayRotation(stocks: ReplayStock[], opts: ReplayOptions = {}): ReplayResult {
     const topN = opts.topN ?? 20;
+    const slippage = opts.slippage ?? SLIPPAGE;
     let cash = opts.cash ?? 1_000_000;
     if (!Number.isFinite(cash) || cash <= 0) throw new Error(`初始资金非法：${cash}`);
     // 参考日历 = 所有股票 bar 日的并集升序；每股 day→bar 索引
@@ -94,7 +97,7 @@ export function replayRotation(stocks: ReplayStock[], opts: ReplayOptions = {}):
         // 调仓一：剔出全清（卖出价 = 收盘 ×(1−滑点)）
         for (const [code, qty] of held) {
             if (poolCodes.has(code) || !bars.has(code)) continue; // 缺价日不动（停牌）
-            const price = round2(bars.get(code)!.close * (1 - SLIPPAGE));
+            const price = round2(bars.get(code)!.close * (1 - slippage));
             const amount = round2(price * qty);
             const fee = computeFee("sell", amount);
             cash = round2(cash + amount - fee);
@@ -106,7 +109,7 @@ export function replayRotation(stocks: ReplayStock[], opts: ReplayOptions = {}):
         if (entrants.length > 0) {
             const spend = cash / entrants.length;
             for (const code of entrants) {
-                const price = round2(bars.get(code)!.close * (1 + SLIPPAGE));
+                const price = round2(bars.get(code)!.close * (1 + slippage));
                 const qty = Math.floor(spend / price / 100) * 100;
                 if (qty <= 0) continue;
                 const amount = round2(price * qty);

@@ -4,10 +4,13 @@
 // 用法：node dist/backtest/run.js [--topN 20] [--years 3] [--cash 1000000]
 //          [--limit 850] [--max 0] [--refresh]
 //   --max N  只拉前 N 只股票的日K（冒烟用；0=全市场）
-// 数据流：新浪今日快照（静态属性）+ 东财 IPO 表 + 东财后复权日K（磁盘缓存
-// hist-k/，首跑 ~5,000 请求，之后秒级）→ replayRotation → metrics + 文本曲线。
+// 数据流：新浪今日快照（静态属性）+ 东财 IPO 表（封锁窗时退化 N/C 前缀）+
+// 腾讯前复权日K（磁盘缓存 hist-k/，首跑 ~5,000 请求，之后秒级）→
+// replayRotation → metrics + 文本曲线。
+// 参数源：strategy = loadStrategy()（S14 策略即配置——CLI 与盯盘系统同一份）。
 
-import { parseSinaList, pickPool, eastmoneySource, sinaSource, type Quote } from "../plugins/market-data.js";
+import { parseSinaList, eastmoneySource, type Quote } from "../plugins/market-data.js";
+import { loadStrategy } from "../plugins/strategy.js";
 import { loadKlines } from "./kline.js";
 import { replayRotation, type ReplayStock } from "./replay.js";
 import { computeMetrics, textCurve } from "./metrics.js";
@@ -76,9 +79,10 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R
 }
 
 async function main(): Promise<void> {
-    const topN = Number(arg("topN", "20"));
+    const strategy = loadStrategy();
+    const topN = Number(arg("topN", String(strategy.pool.topN)));
     const years = Number(arg("years", "3"));
-    const cash = Number(arg("cash", "1000000"));
+    const cash = Number(arg("cash", String(strategy.backtest.initialCash)));
     const limit = Number(arg("limit", String(Math.ceil(years * 252) + 100)));
     const max = Number(arg("max", "0"));
     const refresh = process.argv.includes("--refresh");
@@ -113,9 +117,9 @@ async function main(): Promise<void> {
     });
     console.log(`  有效 ${stocks.length} 只（不足/失败跳过 ${universe.length - stocks.length}，其中拉取失败 ${failed}）`);
 
-    console.log(`[4/4] 逐日重放：topN=${topN} 初始资金=${cash}`);
+    console.log(`[4/4] 逐日重放：topN=${topN} 初始资金=${cash} 滑点=${strategy.backtest.slippage}`);
     const t0 = Date.now();
-    const result = replayRotation(stocks, { topN, cash, ipoDays });
+    const result = replayRotation(stocks, { topN, cash, ipoDays, slippage: strategy.backtest.slippage });
     console.log(`  ${result.days.length} 个交易日 / ${result.trades.length} 笔调仓 / ${Date.now() - t0}ms`);
 
     if (result.days.length < 2) {
