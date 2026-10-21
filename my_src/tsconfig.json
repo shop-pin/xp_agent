@@ -14,6 +14,7 @@
   },
   "include": [
     "*.ts",
+    "backtest/**/*.ts",
     "cordis/**/*.ts",
     "cordis-tests/**/*.ts",
     "services/**/*.ts",
