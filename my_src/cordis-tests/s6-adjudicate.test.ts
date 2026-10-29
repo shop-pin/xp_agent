@@ -23,6 +23,8 @@ test('product 技能层随产品发货 adjudicate，verdict 契约条款完整',
         '不超过 0.8',
         '真假摔',                        // 矛盾判别条款
         '两次 news 调用',                // token 纪律
+        '每信号最多一次 pack',           // M8 token 纪律：pack 替代散装调用的上限
+        'errors',                        // M8 部分失败语义：缺段按无证据处理，不脑补
         '非投资建议',
         'record_verdicts',               // S10 裁决事件层：入档条款
         'T+1',                           // S11 验收：当日买入不可卖显式存在
@@ -30,5 +32,8 @@ test('product 技能层随产品发货 adjudicate，verdict 契约条款完整',
     ]) {
         assert.ok(t.includes(clause), `契约条款「${clause}」应在模板中`)
     }
-    assert.deepEqual(skill!.allowedTools, ['get_signals', 'latest_news', 'record_verdicts', 'get_quote'])
+    assert.deepEqual(skill!.allowedTools, [
+        'get_signals', 'latest_news', 'record_verdicts', 'get_quote',
+        'mcp__tdx__tdx_adjudicate_pack', // M8：已挂载时优先，未挂载退回 get_quote
+    ])
 })

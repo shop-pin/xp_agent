@@ -1835,6 +1835,38 @@ const scenarios = {
       if (!ok) process.exitCode = 1;
     },
   },
+  "45": {
+    // M8：裁决上下文 pack 的 MCP 挂载——夹具 stdio 服务器（mcp-pack-server.mjs，
+    // 罐装数据）提供 adjudicate_pack 工具。机制锚定：发现/广告（mcp__pack__*
+    // 公共名）、调用路由、JSON 结果回流——/adjudicate 技能吃 pack 是提示词层，
+    // 真机验收（离线机制面在此钉死）。
+    prompt: "Use the pack tool to pull the adjudication context for sh600000.",
+    needsLog: true,
+    setup: (dir) => {
+      writeFileSync(join(dir, ".mcp.json"), JSON.stringify({
+        mcpServers: { pack: { command: "node", args: [join(HERE, "mcp-pack-server.mjs")] } },
+      }, null, 2));
+    },
+    turns: [
+      { tools: [{ name: "mcp__pack__adjudicate_pack", input: { code: "sh600000" } }] },
+      { text: "pack 四段齐：价 9.82 / 买卖盘 / 主力净流出 / 示例题材。裁决为研究输出，非投资建议。" },
+    ],
+    verify: (dir, logPath) => {
+      let ok = true;
+      const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
+      const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      const reqs = events.filter((e) => e.type === "request");
+      check("two model calls", reqs.length === 2);
+      check("pack tool advertised as mcp__pack__adjudicate_pack",
+        reqs[0]?.tools.includes("mcp__pack__adjudicate_pack"));
+      check("pack JSON fed back as tool_result (money_flow section present)",
+        (reqs[1]?.toolResults || []).some((t) => t.content.includes("main_net") && t.content.includes("-15344424.35")));
+      const lastResp = events.find((e) => e.type === "response" && e.req === 1);
+      check("loop ended after pack call (end_turn, no further tool_use)",
+        lastResp?.stop_reason === "end_turn" && (lastResp?.tool_use || []).length === 0);
+      if (!ok) process.exitCode = 1;
+    },
+  },
 };
 
 const s = scenarios[chapter];

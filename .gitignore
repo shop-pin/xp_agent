@@ -7,3 +7,5 @@
 my_src/node_modules/
 my_src/dist/
 my_src/.env
+# 本机 MCP 服务器挂载配置（含本机绝对路径——不入库）
+my_src/.mcp.json

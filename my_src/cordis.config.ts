@@ -46,6 +46,7 @@ import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin } from "./plugins/autonomy.js";
 import { marketDataPlugin } from "./plugins/market-data.js";
+import { makeTdxSource } from "./plugins/market-data-tdx.js";
 import { newsFeedPlugin } from "./plugins/news-feed.js";
 import { signalEnginePlugin } from "./plugins/signal-engine.js";
 import { paperBrokerPlugin } from "./plugins/paper-broker.js";
@@ -156,6 +157,8 @@ export interface AppHost {
     commands: CommandsBridge
     inject(text: string): void
     wake(text: string): unknown
+    /** 收盘收口自退桥（watch 方案 C：close 后退出进程；可选——无宿主树不接）。 */
+    requestExit?(): void
     getBudget(): { exceeded: boolean; reason: string }
     getMaxTurns(): number | null
     addTokens(input: number, output: number): void
@@ -222,6 +225,36 @@ function webPort(): number | undefined {
  * 'web'：web Host 版——启用 host 行并接上桥（--dump-config 无宿主时保持
  * disabled 占位：预览不该真的绑端口）。
  */
+/** stock profile 的行集（M7 抽出——stock 与 stock-tdx 只差 market 行的源注入）。 */
+function stockRows(host: AppHost | undefined, marketConfig?: Record<string, unknown>): Row[] {
+    const marketRow: Row = { id: "market", name: "market-data", ...(marketConfig ? { config: marketConfig } : {}) };
+    return host ? [
+        { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
+        { id: "guard", name: "trade-guard" },
+        marketRow,
+        { id: "news", name: "news-feed" },
+        { id: "signals", name: "signal-engine" },
+        { id: "broker", name: "paper-broker" },
+        // S9：memory 行整行替换——必须带上 app 层的桥与开关（同 skills 行纪律），
+        // 额外打开 writeTool（/review 的持仓与偏好落盘）
+        { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
+        // S9：盯盘编排——唤醒桥从宿主接（C5 loop 同款 inbox next-turn）；
+        // 收盘收口自退桥（方案 C）同源接出
+        { id: "watch", name: "market-watch", config: { wake: host.wake, exit: host.requestExit } },
+        { id: "datastore", name: "data-store" },
+    ] : [
+        { id: "skills", name: "skills-registry", config: { productSkills: true } },
+        { id: "guard", name: "trade-guard" },
+        marketRow,
+        { id: "news", name: "news-feed" },
+        { id: "signals", name: "signal-engine" },
+        { id: "broker", name: "paper-broker" },
+        { id: "memory", name: "memory-prefetch", config: { writeTool: true } },
+        { id: "watch", name: "market-watch" },
+        { id: "datastore", name: "data-store" },
+    ];
+}
+
 export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     full: [],
     "no-auto": [
@@ -245,30 +278,12 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     // product rank 5：用户/项目同名技能可覆盖）。工厂形态是因为 skills 行
     // 的 catalogInjection 要跟宿主走（子 agent 不注入目录——D1 语义，整行
     // 替换不能丢掉 app 层给的这个开关）。
-    stock: (host) => host ? [
-        { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
-        { id: "guard", name: "trade-guard" },
-        { id: "market", name: "market-data" },
-        { id: "news", name: "news-feed" },
-        { id: "signals", name: "signal-engine" },
-        { id: "broker", name: "paper-broker" },
-        // S9：memory 行整行替换——必须带上 app 层的桥与开关（同 skills 行纪律），
-        // 额外打开 writeTool（/review 的持仓与偏好落盘）
-        { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
-        // S9：盯盘编排——唤醒桥从宿主接（C5 loop 同款 inbox next-turn）
-        { id: "watch", name: "market-watch", config: { wake: host.wake } },
-        { id: "datastore", name: "data-store" },
-    ] : [
-        { id: "skills", name: "skills-registry", config: { productSkills: true } },
-        { id: "guard", name: "trade-guard" },
-        { id: "market", name: "market-data" },
-        { id: "news", name: "news-feed" },
-        { id: "signals", name: "signal-engine" },
-        { id: "broker", name: "paper-broker" },
-        { id: "memory", name: "memory-prefetch", config: { writeTool: true } },
-        { id: "watch", name: "market-watch" },
-        { id: "datastore", name: "data-store" },
-    ],
+    // M7：marketRow 参数支持源注入（stock-tdx 变体传 tdxSource；缺省新浪）。
+    stock: (host) => stockRows(host),
+    // M7：TDX 源变体——数据面走 eltdx 网关（前置：python -m eltdx.http_server
+    // --port 7727，env MINI_TDX_GATEWAY）。网关未启动 = 拉取失败 fail-closed
+    // （guard 无行情拒单）。池工具的估值过滤在 TDX 源下退化（见 market-data-tdx 头注）。
+    "stock-tdx": (host) => stockRows(host, { source: makeTdxSource() }),
     // S7：web + stock 组合——F6 投影侧栏要看 trade 流水，得同时有 host 行和
     // broker 行。profile 是单选的，组合形态就显式做成第四个名字（不加多层
     // 组合语法——两个真实需求之前不发明机制）。
@@ -282,7 +297,7 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
             { id: "signals", name: "signal-engine" },
             { id: "broker", name: "paper-broker" },
             { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
-            { id: "watch", name: "market-watch", config: { wake: host.wake } },
+            { id: "watch", name: "market-watch", config: { wake: host.wake, exit: host.requestExit } },
             { id: "datastore", name: "data-store" },
         ]
         : [

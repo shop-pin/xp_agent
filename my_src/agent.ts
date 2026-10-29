@@ -65,7 +65,14 @@ export class Agent implements AgentHandle {
     private readonly llmRoute: string = process.env.MINI_CLAUDE_LLM_ROUTE || "anthropic";
     // （D5：this.messages 工作集消亡——请求组装与一切读取走 sessionLog.derive()）
     private mode: PermissionMode = "default";
-    private tools: ToolDef[];
+    // 广告视图（M8 真机验收修正）：主 agent 不再用 tools.js 静态数组——插件
+    // 注册的工具（股票面 get_signals 等）此前从未进过请求体，mock 脚本回合
+    // 强推 tool_use 把这问题掩了 40 章。惰性快照 cordis 注册表（首次取用时
+    // loadRows 已跑完）+ 静态 deferred 件（enter/exit_plan_mode 魔法名不在
+    // 注册表）；schedule_wakeup 显隐开关改写视图。customTools（fork 白名单）
+    // 语义不变：子 agent 用显式数组，不接注册表。
+    private toolsOverride: ToolDef[] | null;
+    private toolsView: ToolDef[] | null = null;
     // C1：每个 Agent 一棵 mini-cordis 树，工具注册表长在上面；
     // 后续 C 阶段服务（session-log/llm/approval）逐章挂进同一棵树
     private cordis: Context;
@@ -149,13 +156,35 @@ export class Agent implements AgentHandle {
             group: "dynamic",
             render: () => (this.mode === "plan" ? this.buildPlanModePrompt() : null),
         });
-        this.tools = options.customTools || toolDefinitions;
+        this.toolsOverride = options.customTools ?? null;
         this.hasCustomPrompt = !!options.customSystemPrompt;
         // --plan 启动即规划：plan 文件路径在此生成，提示注入走请求时的
         // buildAnthropicSystem() planSuffix（本类没有常驻 systemPrompt 字段）
         if (this.mode === "plan") {
             this.planFilePath = this.generatePlanFilePath();
         }
+    }
+
+    /** 广告视图：主 agent = 注册表投影（请求体形状，剥 execute/hint）+ 静态
+     *  deferred 件；子 agent = customTools 白名单原样。首次读时快照（此后
+     *  schedule_wakeup 开关增删写视图）。 */
+    private get tools(): ToolDef[] {
+        if (this.toolsOverride) return this.toolsOverride;
+        if (!this.toolsView) {
+            // schedule_wakeup 初始不广告（dynamic loop 外隐藏，场景 24 锚）——
+            // autonomy 把它注册进了注册表，这里投影时摘除，开关按需补回
+            const projected: ToolDef[] = this.cordis.require<ToolsService>("tools").list()
+                .filter((d) => d.name !== "schedule_wakeup")
+                .map((d) => ({
+                name: d.name,
+                description: d.description,
+                input_schema: d.parameters as ToolDef["input_schema"],
+                ...(d.deferred ? { deferred: true } : {}),
+            }));
+            const staticDeferred = toolDefinitions.filter((t) => t.deferred && !projected.some((p) => p.name === t.name));
+            this.toolsView = [...projected, ...staticDeferred];
+        }
+        return this.toolsView;
     }
 
     /** E2：宿主能力面——app 装配层经它把桥/选项接进清单（接线知识在 config 侧）。 */
@@ -170,6 +199,7 @@ export class Agent implements AgentHandle {
                 this.inbox.append("next-turn", text);
                 return this.ensureDriver();
             },
+            requestExit: () => this.requestExit(),
             getBudget: () => this.checkBudget(),
             getMaxTurns: () => this.maxTurns,
             addTokens: (input: number, output: number) => {
@@ -577,11 +607,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         }
     }
 
-    /** dynamic loop 的 schedule_wakeup 广告开关（幂等）。 */
+    /** dynamic loop 的 schedule_wakeup 广告开关（幂等）。注册表里 autonomy
+     *  已注册本工具——开关作用在广告视图上（视图含它则摘除，不含则补回）。 */
     private setScheduleWakeupToolVisible(on: boolean): void {
-        const has = this.tools.some((t) => t.name === "schedule_wakeup");
-        if (on && !has) this.tools = [...this.tools, SCHEDULE_WAKEUP_TOOL];
-        if (!on && has) this.tools = this.tools.filter((t) => t.name !== "schedule_wakeup");
+        const view = this.tools;
+        const has = view.some((t) => t.name === "schedule_wakeup");
+        if (on && !has) this.toolsView = [...view, SCHEDULE_WAKEUP_TOOL];
+        if (!on && has) this.toolsView = view.filter((t) => t.name !== "schedule_wakeup");
     }
 
     /** 停止运行中的 /loop（REPL 中断处理经 cancel 调用）：定时器等待期立即
@@ -671,6 +703,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     /** 兼容入口（goal/loop/subagent/one-shot 沿用）：followup + await settle。 */
     async chat(userText: string): Promise<void> {
         await this.followup(userText);
+    }
+
+    /** 宿主自退（watch 收盘收口链经 AppHost.requestExit 到达）：复用 cli 双
+     *  SIGINT 的收尾先例（issue #8——先 close 断 MCP 子进程/定时器再退，否则
+     *  stdio 把进程吊住）。不做优雅退场戏：close 即断，进程即刻终止。 */
+    requestExit(): void {
+        void this.close().finally(() => process.exit(0));
     }
 
     private setStatus(s: AgentStatus): void {

@@ -173,6 +173,11 @@ class McpConnection {
 //   1. ~/.claude/settings.json（用户级）  2. .claude/settings.json（项目级）
 //   3. .mcp.json（项目根）
 function loadMcpConfigs(): Record<string, McpServerConfig> {
+    // 测试密封：node --test 子进程一律不读磁盘配置。D2 时代靠"恰好无配置
+    // 文件"免疫，M8 在项目根放 .mcp.json（真机挂载）后被全栈测试捡到——
+    // f2/f3 当场 spawn 真 python 服务器且测试进程因管道不关永不退出。
+    // MCP 机制的测试面在 d2（注入 raw）与 run-mock 场景 45（临时目录配置）。
+    if (process.env.NODE_TEST_CONTEXT) return {};
     const merged: Record<string, McpServerConfig> = {};
     for (const filePath of [
         join(homedir(), ".claude", "settings.json"),
