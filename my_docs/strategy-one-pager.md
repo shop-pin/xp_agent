@@ -51,6 +51,12 @@
 | 池过滤（流动性/低价/PE/PB/次新/容量） | `pool.amountMin / priceMin / peMin / peMax / pbMin / recentDays / topN` | 3,000 万 / 2 元 / 0 / 300 / 0 / 365 天 / 20 |
 | 回测滑点/初始资金 | `backtest.slippage / initialCash` | 0.2% / 100 万 |
 
+## 六、盯盘编排（会话运行参数——编排调参不入策略四节，权威在 DEFAULT_STRATEGY.watch）
+
+| 规则 | 参数键 | 默认 |
+|---|---|---|
+| 收盘收口链：复盘 turn 结束 → digest-run 编译 → 宿主自退（挂机无人值守；digest 失败不阻断自退） | `watch.closeOutAfterReview` | false（交互会话关） |
+
 ## 缺口清单（调试期按序）
 
 1. ~~自动止损（离场节空白——最大缺口）~~ ✅ 2026-10-21 `exit.stopLossPct` 落地（watch 持仓风控唤醒，不自动卖）；止盈仍未固化

@@ -45,7 +45,10 @@ interface Mount {
     schedule: ScheduleService; quotes: Quote[]; cleanup: () => void;
 }
 
-function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: { broker?: boolean; stopLossPct?: number } = {}): Mount {
+function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
+    broker?: boolean; stopLossPct?: number;
+    closeOut?: () => Promise<void> | void; exit?: () => void; closeOutAfterReview?: boolean;
+} = {}): Mount {
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
     new SessionLog(ctx, 'session-log')
@@ -70,6 +73,9 @@ function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: { broker?: boolea
         signalCooldownMs: cooldownMs,
         stopLossPct: opts.stopLossPct,
         strategy: DEFAULT_STRATEGY,
+        closeOut: opts.closeOut,
+        exit: opts.exit,
+        closeOutAfterReview: opts.closeOutAfterReview,
     })
     return {
         ctx, watch: ctx.watch!, wakes, schedule, quotes,
@@ -144,6 +150,80 @@ test('stop 解除：不再评估唤醒；/watch 命令注册进命令表', async
     m.watch.evaluate()
     assert.equal(m.wakes.length, 1, '解除后收盘不再唤醒')
     m.cleanup()
+})
+
+// ---------- 收盘收口链（复盘 turn 结束 → digest → 自退；方案 C） ----------
+
+const settle = () => new Promise((r) => setTimeout(r, 0))
+
+test('收口链默认关：turn-end 不触发 digest/自退（交互会话行为不变）', async () => {
+    let digest = 0
+    let exited = 0
+    const m = mountWatch(180_000, MON_OPEN, {
+        closeOut: () => { digest++ }, exit: () => { exited++ },
+    })
+    m.watch.start()
+    m.tick(MON_CLOSED - MON_OPEN)
+    m.watch.evaluate() // close wake 照发（复盘 turn 照跑）
+    assert.equal(m.wakes.length, 2)
+    m.ctx.emit('agent/turn-end', { reason: 'review' })
+    await settle()
+    assert.equal(digest, 0, '策略默认关：不收口')
+    assert.equal(exited, 0)
+    m.cleanup()
+})
+
+test('收口链开启：复盘 turn 结束 → 先 digest 后自退，一次不重复；盘中 turn-end 不触发', async () => {
+    const seq: string[] = []
+    const m = mountWatch(180_000, MON_OPEN, {
+        closeOutAfterReview: true,
+        closeOut: async () => { seq.push('digest') },
+        exit: () => { seq.push('exit') },
+    })
+    m.watch.start() // 开盘巡检 turn
+    m.ctx.emit('agent/turn-end', { reason: 'open' })
+    await settle()
+    assert.deepEqual(seq, [], '巡检 turn 结束在 open 相位：不收口')
+    m.tick(MON_CLOSED - MON_OPEN)
+    m.watch.evaluate() // close wake，收口链 armed
+    m.ctx.emit('agent/turn-end', { reason: 'review' })
+    await settle()
+    assert.deepEqual(seq, ['digest', 'exit'], '顺序：digest 在前，自退收尾')
+    assert.ok(notes(m.ctx).some((n) => n.value?.kind === 'close-out'), '收口注记落日志')
+    m.ctx.emit('agent/turn-end', { reason: 'again' })
+    await settle()
+    assert.equal(seq.length, 2, '收口只一次（awaitingReview 闩）')
+    m.cleanup()
+})
+
+test('收口链 digest 抛错仍自退；无宿主（exit 缺）只收口不退', async () => {
+    let exited = 0
+    const m1 = mountWatch(180_000, MON_OPEN, {
+        closeOutAfterReview: true,
+        closeOut: async () => { throw new Error('boom') },
+        exit: () => { exited++ },
+    })
+    m1.watch.start()
+    m1.tick(MON_CLOSED - MON_OPEN)
+    m1.watch.evaluate()
+    m1.ctx.emit('agent/turn-end', { reason: 'review' })
+    await settle()
+    assert.equal(exited, 1, 'digest 失败不阻断自退')
+    m1.cleanup()
+
+    let digest = 0
+    const m2 = mountWatch(180_000, MON_OPEN, {
+        closeOutAfterReview: true,
+        closeOut: () => { digest++ },
+    })
+    m2.watch.start()
+    m2.tick(MON_CLOSED - MON_OPEN)
+    m2.watch.evaluate()
+    m2.ctx.emit('agent/turn-end', { reason: 'review' })
+    await settle()
+    assert.equal(digest, 1, '无宿主桥：digest 照跑')
+    assert.equal(m2.watch.armed, true, '会话存活（没退）')
+    m2.cleanup()
 })
 
 // ---------- 信号唤醒 ----------

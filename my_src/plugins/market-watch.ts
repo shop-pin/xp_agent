@@ -20,6 +20,8 @@
 // /watch（off 停）：用户显式启动——不是挂载即盯盘（一次性问价的会话不该
 // 被唤醒）。注记 meta/note(key:"watch") 进 SessionLog（日志即真相）。
 
+import { spawn } from "child_process";
+import { join } from "path";
 import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
@@ -79,6 +81,17 @@ export const defaultPrompts: WatchPrompts = {
     },
 };
 
+/** 收盘收口缺省实现：spawn 同仓的 digest-run CLI（零 LLM 编译当日 digest）。
+ *  cwd 纪律：runbook 固定从 my_src 起 `node dist/cli.js`。失败静默收敛——
+ *  收口链不因 digest 挂掉而阻断自退（digest 可事后手动补跑）。 */
+function spawnDigestRun(): Promise<void> {
+    return new Promise((resolve) => {
+        const child = spawn(process.execPath, [join("dist", "backtest", "digest-run.js")], { stdio: "ignore" });
+        child.on("close", () => resolve());
+        child.on("error", () => resolve());
+    });
+}
+
 export interface WatchConfig {
     /** 策略配置（缺省 loadStrategy()——watch 节参数源）。 */
     strategy?: StrategyConfig;
@@ -92,6 +105,12 @@ export interface WatchConfig {
     perCodeWakeCap?: number;
     /** 止损线（缺省走策略 exit.stopLossPct；0 = 关）。 */
     stopLossPct?: number;
+    /** 收盘收口钩（复盘 turn 结束后跑；缺省 spawn dist/backtest/digest-run.js）。 */
+    closeOut?: () => Promise<void> | void;
+    /** 宿主自退桥（AppHost.requestExit——close 后退出进程；缺 Host = 只收口不退）。 */
+    exit?: () => void;
+    /** 收盘收口链开关（缺省走策略 watch.closeOutAfterReview）。 */
+    closeOutAfterReview?: boolean;
     /** 提示词覆盖（测试锚定）。 */
     prompts?: Partial<WatchPrompts>;
 }
@@ -105,6 +124,8 @@ export class WatchService extends Service {
     private day = "";
     private patrolled = false;
     private reviewed = false;
+    /** 收盘收口链 armed：close wake 已发、等复盘 turn 的 agent/turn-end。 */
+    private awaitingReview = false;
     private lastSignalWake = 0;
     /** 信箱：同 code 留最新（冷却内的信号不再裸丢——Day 1 中恒集团被槽位饿死）。 */
     private pending = new Map<string, { sig: Signal; at: number }>();
@@ -116,6 +137,9 @@ export class WatchService extends Service {
     private maxSignalAgeMs: number;
     private perCodeWakeCap: number;
     private stopLossPct: number;
+    private closeOut: (() => Promise<void> | void) | undefined;
+    private exit: (() => void) | undefined;
+    private closeOutAfterReview: boolean;
     private prompts: WatchPrompts;
     private tickMs: number;
 
@@ -126,6 +150,9 @@ export class WatchService extends Service {
         this.maxSignalAgeMs = config.maxSignalAgeMs ?? this.cooldown * 2;
         this.perCodeWakeCap = config.perCodeWakeCap ?? 2;
         this.stopLossPct = config.stopLossPct ?? 0.05;
+        this.closeOut = config.closeOut ?? spawnDigestRun;
+        this.exit = config.exit;
+        this.closeOutAfterReview = config.closeOutAfterReview ?? false;
         this.prompts = { ...defaultPrompts, ...config.prompts };
         // 测试/演示加速旋钮（对齐 MINI_WEB_PORT 的 env 传参先例）
         this.tickMs = Number(process.env.MINI_WATCH_TICK_MS) || 30_000;
@@ -182,6 +209,7 @@ export class WatchService extends Service {
             void this.fire(this.prompts.open(today), "open", today);
         } else if (phase === "closed" && this.patrolled && !this.reviewed) {
             this.reviewed = true;
+            this.awaitingReview = this.closeOutAfterReview;
             void this.fire(this.prompts.close(today), "close", today);
         }
         if (phase === "open") {
@@ -269,6 +297,32 @@ export class WatchService extends Service {
             this.ctx.get<UiService>("ui")?.error(`盯盘唤醒失败：${e instanceof Error ? e.message : String(e)}`);
         }
     }
+
+    /** 收盘收口链（2026-10-29 方案 C）：close wake 的复盘 turn 结束（agent/turn-end
+     *  且仍处 closed）→ 跑收口钩（digest-run 编译）→ 宿主自退。挂机工作流的无人值守
+     *  半边：早开会话挂机，收盘自动 复盘→digest→退出——两天实录里复盘 turn 都死在
+     *  "note 入队后进程被关"，本链把收尾搬进进程自己的生命周期。
+     *  误触发面：收盘后用户手聊的第一个 turn 结束也会命中——挂机场景无此输入，
+     *  交互模式默认关（strategy.watch.closeOutAfterReview）。 */
+    async onTurnEnd(): Promise<void> {
+        if (!this.armed || !this.awaitingReview) return;
+        const market = this.ctx.get<MarketDataService>("market");
+        if (!market || marketPhase(market.clock()) !== "closed") return;
+        this.awaitingReview = false;
+        this.note({ kind: "close-out", day: this.day });
+        if (this.closeOut) {
+            this.ctx.get<UiService>("ui")?.info("🌙 收盘收口：编译今日 digest…");
+            try {
+                await this.closeOut();
+            } catch (e) {
+                this.ctx.get<UiService>("ui")?.error(`收盘 digest 失败：${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+        if (this.exit) {
+            this.ctx.get<UiService>("ui")?.info("👋 复盘完成，盯盘会话自退");
+            this.exit();
+        }
+    }
 }
 
 export const marketWatchPlugin: Plugin = {
@@ -283,8 +337,10 @@ export const marketWatchPlugin: Plugin = {
             maxSignalAgeMs: config.maxSignalAgeMs ?? strategy.watch.maxSignalAgeMs,
             perCodeWakeCap: config.perCodeWakeCap ?? strategy.watch.perCodeWakeCap,
             stopLossPct: config.stopLossPct ?? strategy.exit.stopLossPct,
+            closeOutAfterReview: config.closeOutAfterReview ?? strategy.watch.closeOutAfterReview,
         });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));
+        ctx.on("agent/turn-end", () => void watch.onTurnEnd());
         ctx.effect(() => () => {
             if (watch.armed) watch.stop();
         });

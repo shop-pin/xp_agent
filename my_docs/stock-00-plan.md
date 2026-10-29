@@ -165,12 +165,6 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 | S12 | ✅ 完成（2026-10-21） | `stock-S12.md`；`pickPool` 七道过滤纯函数（停牌/ST·退·北交所红线/流动性 3000 万/低价 2 元/PE 区间 0-300 未知剔除/PB>0/次新 365 天退化 N/C 前缀——阈值全部可调，默认=保守起点）+ `get_stock_pool` 只读工具（候选数/全市场数/IPO 源注记 + 流通市值升序）+ `Quote.pe`（parseSinaList 补 per=第五批判定兑现；东财补 f9）+ **`fetchIpoDays?` 可选能力**（东财 clist f26=YYYYMMDD，**2026-10-21 真机实测 Node 可达——2026-10-18 的 WAF RST 不复现，记档更新：东财对 Node 可用性时变，依赖前先探**；源失败退化 N/C 前缀且输出注记明说）+ mock 场景 44；板块口径=北交所红线剔（创/科在池内，20 候选中占 9 席，调试期按需加开关挂账）；真机冒烟：5,575 只/4.4s + IPO 5,922 只/0.7s → 候选 20（流通 8.3-13 亿）；翻车记档：map 直接引用带可选参函数签名隐雷、记档知识自带时效；cordis 274/274、mock 40、snapshot 39/39（ch44 新录，旧章零重录）；建议 commit：`add stock pool picker with seven filters and ipo dates` |
 | S13 | ✅ 完成（2026-10-21，P4 收官） | `stock-S13.md`；backtest/ 研究面四模块（kline/replay/metrics/run CLI）+ **微盘 20 轮动近三年跑通**（866 交易日、5,920 笔调仓、总收益 −28.8%/回撤 −51.1%/2024 −25.4%=微盘流动性危机显形；缓存 hist-k/ 后重放 6.4s）+ 手算对拍（10 交易日 4 笔调仓净值逐日到分）+ 文本曲线；**源探测更正**：东财 IP 级间歇封锁当日实测（上午通/午后 curl+Node 双 000）——日K主源改腾讯 ifzq qfq（全天候稳定），东财 fetchIpoDays 保留供封锁窗；近似口径四条记档（静态缩放/收盘成交/滑点 ±0.2%/amount≈close×vol×100）；费用 computeFee 单源复用；挂账#1 实盘侧双补丁仍在账（回测侧滑点已内置）；翻车记档：手算名次错被引擎逮住（第三次同族）、metrics 恢复判定写反、Number("")=0 残行、初始资金 replace("_") 只换首个、"1_000_000"教训；回测=研究面不进插件树（零快照变化）；cordis 278/278、mock 40、snapshot 39/39；建议 commit：`add backtest engine with daily rotation replay and metrics` |
 | S14 | ✅ 完成（2026-10-21，P4/P5 分界——实盘前最后一章） | `stock-S14.md` + `strategy-one-pager.md`（一页纸：入场/离场/仓位/风控四节+缺口清单，**离场=无自动止损标为调试期第一优先**）；`plugins/strategy.ts` 六节策略配置（DEFAULT_STRATEGY=历史硬编码零漂移搬家）+ `loadStrategy()` 用户覆盖（~/.mini-claude/stocks/strategy.json 节级深合并、坏配置明确拒读）+ 五处消费端接线（engine 阈值参数化 defaultRules(strategy)/watch/guard/池工具/回测 run+replay slippage）；**一致行为锚测试**（用户覆盖 pool.topN → 池工具生效，回测 CLI 同源）；翻车记档：spread 后显式赋 undefined 顶掉策略默认（池入参覆盖 S12 起就失效，一致锚首个战果）、阈值敏感测试挂 DEFAULT_STRATEGY 保浸入式；默认零漂移证明=cordis 282/282、mock 40、snapshot 39/39 全部零重录；建议 commit：`add strategy config with one page policy and parameter wiring` |
-| S10 | ⬜ 未开始 | 数据留存与历史落地（日 K 收口 / 关注面明细 / 事件层，P4 起） |
-| S11 | ⬜ 未开始 | 盘口数据与买卖压力因子（五档解析 + 关注面轮询） |
-| S12 | ⬜ 未开始 | 选股池工具（微盘轮动·上，七道过滤 + IPO 源调研） |
-| S13 | ⬜ 未开始 | 历史日 K 与回测引擎（微盘轮动·下） |
-| S14 | ⬜ 未开始 | 交易系统成型（复盘/回测反馈环 → 参数固化 → 策略文档） |
-| S15 | ⬜ 未开始 | QmtBroker 实盘（原 S10 顺延；前置 = 跟踪记录 review + S14） |
 
 > 约定：每章完成时在本表打勾、写 `my_docs/stock-<n>.md`（含翻车记档 + 自测题）、给 commit message（用户自己提交）。
 > 模式沿用 D5 起：Claude 写讲解 md → 实现代码 → 验证（cordis + mock + 本章测试）→ 复查文档 → commit message → 问是否开下一章。
