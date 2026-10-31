@@ -549,7 +549,8 @@ test('get_trades 按日过滤 + get_portfolio 当日盈亏行（手算）', asyn
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
     new SessionLog(ctx, 'session-log')
-    const src: QuoteSource = { async fetchMarketSnapshot() { return QUOTES }, async fetchQuotes() { return [] } }
+    const quotes: Quote[] = QUOTES.map((q) => ({ ...q }))
+    const src: QuoteSource = { async fetchMarketSnapshot() { return quotes }, async fetchQuotes() { return [] } }
     let clock = MON_OPEN
     ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(clock), pollIntervalMs: 60_000 })
     const ledger = join(mkdtempSync(join(tmpdir(), 's9-ledger-')), 'paper.jsonl')
@@ -557,9 +558,11 @@ test('get_trades 按日过滤 + get_portfolio 当日盈亏行（手算）', asyn
     await ctx.market!.refresh()
     const broker = ctx.broker!
 
-    // 周一买 10000@10（fee 26）；周二卖 10000@9.5（fee 72.2，pnl -5098.2）
+    // 周一买 10000@10（fee 26）；周二市价走到 9.5 后卖 10000@9.5（fee 72.2，pnl -5098.2）
     await broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
     clock += 86_400_000
+    quotes[0].price = 9.5 // 卖前刷新行情（漂移校验拒 stale 挂单）
+    await ctx.market!.refresh()
     const sell = await broker.submitOrder({ code: 'sh600000', side: 'sell', price: 9.5, qty: 10_000 })
     assert.ok('orderId' in sell)
     const tools = ctx.require<ToolsService>('tools')

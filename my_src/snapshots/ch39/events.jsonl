@@ -9,9 +9,9 @@
 {"type":"tool/result","callId":"toolu_mock_0_0","content":"Filled P0001: 买入 sh600000 10000 股 @ 10，费用 26 元，现金余额 899974 元"}
 {"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_0_0","content":"Filled P0001: 买入 sh600000 10000 股 @ 10，费用 26 元，现金余额 899974 元"}]}
 {"type":"turn/start"}
-{"type":"assistant/message","content":[{"type":"tool_use","id":"toolu_mock_1_0","name":"place_order","input":{"code":"sh600000","side":"sell","price":11,"qty":10000}}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
+{"type":"assistant/message","content":[{"type":"tool_use","id":"toolu_mock_1_0","name":"place_order","input":{"code":"sh600000","side":"sell","price":10,"qty":10000}}],"usage":{"input":100,"output":20,"cacheRead":0,"cacheCreation":0}}
 {"type":"turn/end","reason":"tool-use"}
-{"type":"tool/call","id":"toolu_mock_1_0","name":"place_order","input":{"code":"sh600000","side":"sell","price":11,"qty":10000}}
+{"type":"tool/call","id":"toolu_mock_1_0","name":"place_order","input":{"code":"sh600000","side":"sell","price":10,"qty":10000}}
 {"type":"tool/result","callId":"toolu_mock_1_0","content":"Rejected: 可卖不足：委托 10000 股，可卖 0 股（T+1：当日买入 10000 股不可卖）"}
 {"type":"user/message","content":[{"type":"tool_result","tool_use_id":"toolu_mock_1_0","content":"Rejected: 可卖不足：委托 10000 股，可卖 0 股（T+1：当日买入 10000 股不可卖）"}]}
 {"type":"turn/start"}

@@ -1616,7 +1616,8 @@ const scenarios = {
     runs: [{ paperProbe: true }],
     turns: [
       { tools: [{ name: "place_order", input: { code: "sh600000", side: "buy", price: 10, qty: 10_000, reason: "signal rapid-move" } }] },
-      { tools: [{ name: "place_order", input: { code: "sh600000", side: "sell", price: 11, qty: 10_000 } }] },
+      // 同日卖 @市价（漂移校验拒 stale 挂单——卖价必须贴最新价，T+1 拒才轮得到）
+      { tools: [{ name: "place_order", input: { code: "sh600000", side: "sell", price: 10, qty: 10_000 } }] },
       { tools: [{ name: "place_order", input: { code: "sh600000", side: "buy", price: 10, qty: 50 } }] },
       { tools: [{ name: "get_portfolio", input: {} }] },
       { text: "paper trading checked." },

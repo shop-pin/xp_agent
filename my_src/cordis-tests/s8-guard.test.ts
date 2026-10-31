@@ -29,15 +29,16 @@ const QUOTES: Quote[] = [
     { code: 'bj920999', name: '北交样本', price: 3, change: 0, changePercent: 0, open: 3, high: 3, low: 3, preClose: 3, volume: 1000, amount: 3e6, turnoverRate: 0.1, volumeRatio: 1, marketCap: 0, floatCap: 0, pb: 0 },
 ]
 
-interface Mount { ctx: Context; guard: TradeGuardService; broker: PaperBroker; tick: (ms: number) => void; cleanup: () => void }
+interface Mount { ctx: Context; guard: TradeGuardService; broker: PaperBroker; quotes: Quote[]; tick: (ms: number) => void; cleanup: () => void }
 
 async function mountGuard(config: GuardConfig = {}, at: number = T_OPEN): Promise<Mount> {
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
     new SessionLog(ctx, 'session-log')
     new CommandService(ctx, 'commands')
+    const quotes: Quote[] = QUOTES.map((q) => ({ ...q })) // 副本：滑点/漂移补丁后变价场景要改快照
     const src: QuoteSource = {
-        async fetchMarketSnapshot() { return QUOTES },
+        async fetchMarketSnapshot() { return quotes },
         async fetchQuotes() { return [] },
     }
     let clock = at
@@ -48,7 +49,7 @@ async function mountGuard(config: GuardConfig = {}, at: number = T_OPEN): Promis
     ctx.plugin(tradeGuardPlugin, { ...config, now, strategy: DEFAULT_STRATEGY })
     await ctx.market!.refresh() // 首轮快照落进 latest（guard 的 fail-closed 需要）
     return {
-        ctx, guard: ctx.guard!, broker: ctx.broker!,
+        ctx, guard: ctx.guard!, broker: ctx.broker!, quotes,
         tick: (ms) => { clock += ms },
         cleanup: () => rmSync(dirname(ledger), { recursive: true, force: true }),
     }
@@ -131,10 +132,11 @@ test('标的排除：北交所前缀拒单（规则 1-2 的交易面兜底——
 
 test('涨跌停触板拒单：guard 拒触板（>=hi/<=lo），比 broker 的出界拒更严', async () => {
     const m = await mountGuard()
-    // 浦发银行 preClose 10 → 主板 ±10% → [9, 11]。11.0 未出界（broker 会收）
-    // 但已触板——追板单在 guard 拦死；9.0 同理杀跌单。
+    // 浦发银行 preClose 10 → 主板 ±10% → [9, 11]。追板单 11（市价 10，偏离 10%）
+    // 在 broker 层被漂移校验拒（挂账#1 补丁②——stale 追板价是它治的典型）；
+    // 9.0 杀跌单同理。guard 的触板拒（>=hi/<=lo）在 place 瀑布更外层先拦。
     const direct = await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 11, qty: 100 })
-    assert.ok('orderId' in direct, 'broker 只拒出界：11.0 直单可成交')
+    assert.match((direct as { reason: string }).reason, /偏离 10\.0% 超 1%/, '直单也拒：追板价 = stale 挂单')
     const chase = await place(m, { code: 'sh600000', side: 'buy', price: 11, qty: 100 })
     assert.match(chase.kind === 'denied' && chase.content || '', /委托价 11 触及涨跌停板 \[9, 11\]/)
     const kill = await place(m, { code: 'sh600000', side: 'buy', price: 9, qty: 100 })
@@ -151,6 +153,8 @@ test('单日亏损上限：当日已实现亏够即拦一切新单；次日日�
     // proceeds 94927.8，pnl = 94927.8 - 100026 = -5098.2 ≤ -5000
     await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
     m.tick(86_400_000)
+    m.quotes[0].price = 9.5 // 卖前刷新行情（漂移校验拒 stale 挂单）
+    await m.ctx.market!.refresh()
     const sell = await m.broker.submitOrder({ code: 'sh600000', side: 'sell', price: 9.5, qty: 10_000 })
     assert.ok('orderId' in sell, `卖出应成交（实际 ${JSON.stringify(sell)}）`)
     assert.equal((sell as any).realizedPnl, -5098.2)

@@ -35,7 +35,7 @@ const SIGNAL = {
 
 interface Mount {
     ctx: Context; store: DataStoreService; market: MarketDataService; broker: PaperBroker;
-    tools: ToolsService; tick: (ms: number) => void; root: string; home: string; cleanup: () => void;
+    tools: ToolsService; quotes: Quote[]; tick: (ms: number) => void; root: string; home: string; cleanup: () => void;
 }
 
 /** HOME 沙箱（watchlist 读 temp home，不碰真实清单）+ 数据根目录在 temp。 */
@@ -53,13 +53,14 @@ function mountStore(): Mount {
     new SessionLog(ctx, 'session-log')
     new CommandService(ctx, 'commands')
     let clock = MON_OPEN
-    const src: QuoteSource = { async fetchMarketSnapshot() { return QUOTES }, async fetchQuotes() { return [] } }
+    const quotes: Quote[] = QUOTES.map((q) => ({ ...q })) // 副本：滑点/漂移补丁后变价场景要改快照
+    const src: QuoteSource = { async fetchMarketSnapshot() { return quotes }, async fetchQuotes() { return [] } }
     const now = () => new Date(clock)
     ctx.plugin(marketDataPlugin, { source: src, now, pollIntervalMs: 60_000, strategy: DEFAULT_STRATEGY })
     ctx.plugin(paperBrokerPlugin, { ledgerPath: join(home, 'paper.jsonl'), now })
     ctx.plugin(dataStorePlugin, { rootDir: root })
     return {
-        ctx, store: ctx.dataStore!, market: ctx.market!, broker: ctx.broker!, tools,
+        ctx, store: ctx.dataStore!, market: ctx.market!, broker: ctx.broker!, tools, quotes,
         tick: (ms) => { clock += ms }, root, home,
         cleanup: () => {
             ctx.dataStore?.dispose()
@@ -212,6 +213,8 @@ test('get_trades_csv：账本流水导出（数字沿用 s9 手算：fee 26/72.2
     try {
         await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
         m.tick(86_400_000)
+        m.quotes[0].price = 9.5 // 卖前刷新行情（漂移校验拒 stale 挂单）
+        await m.market.refresh()
         const sell = await m.broker.submitOrder({ code: 'sh600000', side: 'sell', price: 9.5, qty: 10_000 })
         assert.ok('orderId' in sell)
         const csv = await m.tools.get('get_trades_csv')!.execute({}, {})

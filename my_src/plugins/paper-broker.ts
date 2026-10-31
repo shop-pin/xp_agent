@@ -10,7 +10,9 @@
 //   - 涨跌停：委托价超 [round(昨收×(1±板%),2)] 拒单（往窄倒——对齐交易所
 //     拒单行为，不做钳制成交）
 //   - T+1：当日买入不可卖；交易日按北京时间日历日判定（boughtToday 随日切清零）
-//   - 成交价 = 委托价（无订单簿建模——纸面撮合的诚实简化）
+//   - 成交价 = 最新快照价 ± 滑点（挂账#1 补丁①，2026-10-31），委托价为限价
+//     保护（更优一侧不越过）；委托价偏离最新价 >1% 拒单（补丁②，stale 挂单
+//     fail-closed）——无订单簿建模的纸面撮合，但不再按委托价乐观成交
 //   - 留痕双轨：账本 JSONL（跨会话真账，可重放对账）+ SessionLog meta/note
 //     （会话内成交流，F6 投影侧栏消费）——账本是真相，注记是视图
 //
@@ -27,6 +29,7 @@ import { homedir } from "os";
 import { join } from "path";
 import type { MarketDataService } from "./market-data.js";
 import { limitTier } from "./signal-engine.js";
+import { loadStrategy } from "./strategy.js";
 
 // ---------- 词汇表 ----------
 
@@ -124,6 +127,9 @@ interface PositionState {
 export interface PaperConfig {
     startingCash?: number;
     ledgerPath?: string;
+    /** 单边滑点（0.002 = ±0.2%）——缺省走策略 backtest.slippage（插件层接线：
+     *  同一配置值驱动回测与模拟盘，S14 一致行为锚的延伸）。 */
+    slippage?: number;
     now?: () => Date;
 }
 
@@ -135,6 +141,8 @@ export class PaperBroker extends Service {
     private market: MarketDataService | null = null;
     private now: () => Date;
     private ledgerPath: string;
+    /** 单边滑点（±0.2% 缺省）——成交建模见 submitOrder。 */
+    private slippage: number;
     cash: number;
     /** 累计已实现盈亏（元）。 */
     realizedPnl = 0;
@@ -148,6 +156,7 @@ export class PaperBroker extends Service {
         super(ctx, name);
         this.now = config.now ?? (() => new Date());
         this.ledgerPath = config.ledgerPath ?? paperLedgerPath();
+        this.slippage = Math.max(config.slippage ?? 0, 0);
         this.cash = config.startingCash ?? 1_000_000;
         this.loadLedger();
     }
@@ -220,12 +229,28 @@ export class PaperBroker extends Service {
 
         const quote = await this.quoteFor(order.code);
         if (!quote) return { reason: `无 ${order.code} 行情，无法校验价带` };
+        if (!(quote.price > 0)) return { reason: `无 ${order.code} 有效最新价（停牌/快照缺）——fail-closed 拒单` };
         const [lo, hi] = priceBand(order.code, quote.name, quote.preClose);
         if (order.price < lo || order.price > hi) {
             return { reason: `委托价 ${order.price} 超出 ${quote.name} 当日价带 [${lo}, ${hi}]（昨收 ${quote.preClose}）` };
         }
 
-        const amount = round2(order.price * qty);
+        // 挂账#1 补丁②（价格漂移拒单）：委托价与下单时刻最新快照偏离 >1% = stale
+        // 挂单（旧行情下的想当然价），fail-closed 拒——先看最新行情再下单。
+        const drift = Math.abs(order.price / quote.price - 1);
+        if (drift > 0.01) {
+            return { reason: `委托价 ${order.price} 与最新价 ${quote.price} 偏离 ${(drift * 100).toFixed(1)}% 超 1%（stale 挂单拒单）——刷新行情后按最新价附近重新委托` };
+        }
+        // 挂账#1 补丁①（滑点成交）：限价单不成交在劣于市价±冲击成本的价格——
+        // buy = min(委托价, 最新价×(1+slip)) / sell = max(委托价, 最新价×(1−slip))。
+        // 委托价仍是限价保护（更优一侧不越过），治"挂高价按高价成交"的乐观偏差。
+        const slipped = quote.price * (1 + (order.side === "buy" ? this.slippage : -this.slippage));
+        // 成交价到分（A 股价格步长 0.01）——滑点价先 round2 再与限价取边界
+        const fillPrice = order.side === "buy"
+            ? Math.min(order.price, round2(slipped))
+            : Math.max(order.price, round2(slipped));
+
+        const amount = round2(fillPrice * qty);
         const fee = computeFee(order.side, amount);
         const at = this.now().getTime();
         const today = cnDay(at);
@@ -244,8 +269,8 @@ export class PaperBroker extends Service {
             p.qty += qty;
             p.boughtToday += qty;
             p.cost = round2(p.cost + amount + fee);
-            if (p.peak === 0) p.peak = order.price; // 新持有期：峰值从成交价起步（加仓不压低历史峰）
-            return this.settle({ orderId: this.nextOrderId(), code: order.code, side: "buy", price: order.price, qty, fee, realizedPnl: null, at });
+            if (p.peak === 0) p.peak = fillPrice; // 新持有期：峰值从成交价起步（加仓不压低历史峰）
+            return this.settle({ orderId: this.nextOrderId(), code: order.code, side: "buy", price: fillPrice, qty, fee, realizedPnl: null, at });
         }
 
         // sell
@@ -265,7 +290,7 @@ export class PaperBroker extends Service {
         p.qty -= qty;
         p.cost = round2(p.cost - basis);
         if (p.qty === 0) this.positions.delete(order.code);
-        return this.settle({ orderId: this.nextOrderId(), code: order.code, side: "sell", price: order.price, qty, fee, realizedPnl: pnl, at });
+        return this.settle({ orderId: this.nextOrderId(), code: order.code, side: "sell", price: fillPrice, qty, fee, realizedPnl: pnl, at });
     }
 
     private nextOrderId(): string {
@@ -354,9 +379,9 @@ export class PaperBroker extends Service {
         const tools = this.ctx.require<ToolsService>("tools");
         tools.register({
             name: "place_order",
-            description: "模拟盘下单（限价单，整手 100 股，纸面即时成交）。"
+            description: "模拟盘下单（限价单，整手 100 股，按下单时最新价±滑点成交，委托价为限价保护）。"
                 + "费用按 A 股口径（佣金万2.5 最低5元/过户费/印花税卖出0.05%）；T+1 当日买入不可卖；"
-                + "委托价超涨跌停价带拒单。reason 填裁决/信号依据（留痕）。",
+                + "委托价超涨跌停价带、或偏离最新价 1% 以上拒单。reason 填裁决/信号依据（留痕）。",
             parameters: {
                 type: "object",
                 properties: {
@@ -469,7 +494,11 @@ export const paperBrokerPlugin: Plugin = {
     inject: ["tools", "market"],
     apply(ctx: Context, config: PaperConfig = {}) {
         const market = ctx.require<MarketDataService>("market");
-        const broker = new PaperBroker(ctx, "broker", config);
+        // 滑点缺省走策略 backtest.slippage——同一配置值驱动回测与模拟盘（S14 锚）
+        const full: PaperConfig = config.slippage === undefined
+            ? { ...config, slippage: loadStrategy().backtest.slippage }
+            : config;
+        const broker = new PaperBroker(ctx, "broker", full);
         broker.attach(market);
         broker.attachTools();
     },

@@ -49,8 +49,9 @@ function mountBroker(over: { startingCash?: number } = {}) {
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
     new SessionLog(ctx, 'session-log')
+    const quotes: Quote[] = QUOTES.map((q) => ({ ...q })) // 副本：滑点/漂移补丁后变价场景要改快照
     const src: QuoteSource = {
-        async fetchMarketSnapshot() { return QUOTES },
+        async fetchMarketSnapshot() { return quotes },
         async fetchQuotes() { return [] },
     }
     ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(T0), pollIntervalMs: 60_000 })
@@ -63,7 +64,7 @@ function mountBroker(over: { startingCash?: number } = {}) {
     const fills: Fill[] = []
     ctx.on('broker/fill', (f) => { fills.push(f) })
     return {
-        ctx, fiber, ledger, fills,
+        ctx, fiber, ledger, fills, quotes,
         broker: ctx.broker!,
         tick: (ms: number) => { clock += ms },
         cleanup: async () => { await fiber.dispose(); rmSync(dirname(ledger), { recursive: true, force: true }) },
@@ -97,17 +98,54 @@ test('拒单三连：不足一手 / 超价带 / 无行情代码', async () => {
     await m.cleanup()
 })
 
+// ---------- 滑点成交与漂移拒单（挂账#1 双补丁，2026-10-31） ----------
+
+test('滑点成交：追价单按市价±滑点成交（不按委托价乐观成交）；sell 对称取优', async () => {
+    const m = mountBroker()
+    // buy@10.05（市价 10，漂移 0.5% 通过）→ fill = min(10.05, 10×1.002) = 10.02：
+    // amount 1002，fee = max(5, 0.2505) + 0.01002 = 5.01；cash = 1e6 − 1002 − 5.01
+    const buy = await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10.05, qty: 100 })
+    assert.ok('orderId' in buy)
+    assert.equal((buy as Fill).price, 10.02, '成交在滑点价而非委托价 10.05')
+    assert.equal((buy as Fill).fee, 5.01)
+    assert.equal(m.broker.cash, 998_992.99)
+
+    m.tick(86_400_000)
+    // sell@9.95（市价 10，漂移 0.5% 通过）→ fill = max(9.95, 10×0.998) = 9.98（市价卖单化）：
+    // amount 998，fee = max(5, 0.2495) + 0.01 + 印花 0.499 = 5.51；
+    // basis = 买笔含费成本 1002+5.01 = 1007.01 → pnl = 998 − 5.51 − 1007.01 = −14.52
+    const sell = await m.broker.submitOrder({ code: 'sh600000', side: 'sell', price: 9.95, qty: 100 })
+    assert.ok('orderId' in sell)
+    assert.equal((sell as Fill).price, 9.98, '卖单成交在市价−滑点，不劣于委托价也不按委托价')
+    assert.equal((sell as Fill).fee, 5.51)
+    assert.equal((sell as Fill).realizedPnl, -14.52)
+    await m.cleanup()
+})
+
+test('漂移拒单：委托价偏离最新价 >1% 拒（fail-closed），1% 边界内放行', async () => {
+    const m = mountBroker()
+    const stale = await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 9.8, qty: 100 })
+    assert.match((stale as { reason: string }).reason, /偏离 2\.0% 超 1%.*stale/)
+    const edge = await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10.09, qty: 100 })
+    assert.ok('orderId' in edge, '0.9% 边界内放行（drift > 0.01 才拒）')
+    assert.equal((edge as Fill).price, 10.02, '放行后仍按滑点价成交（限价 10.09 保护不越过）')
+    await m.cleanup()
+})
+
 test('T+1 日切 + 卖出已实现盈亏（手算）', async () => {
     const m = mountBroker()
     // 买 10000@10：cost 100026；次日卖 10000@11：proceeds 110000-83.6=109916.4
     // pnl = 109916.4 - 100026 = 9890.4；现金回到 100 万 + 9890.4
     await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+    m.quotes[0].price = 11 // 卖前刷新行情（漂移校验拒 stale 挂单——补丁②的本职）
+    await m.ctx.market!.refresh()
     const sameDay = await m.broker.submitOrder({ code: 'sh600000', side: 'sell', price: 11, qty: 10_000 })
     assert.match((sameDay as { reason: string }).reason, /可卖不足/)
     m.tick(86_400_000) // 次日同刻
     assert.equal(m.broker.getPositions()[0].availQty, 10_000, '日切后全部可卖')
     const sell = await m.broker.submitOrder({ code: 'sh600000', side: 'sell', price: 11, qty: 10_000 })
     assert.ok('orderId' in sell)
+    assert.equal((sell as Fill).price, 11, '卖价 = max(委托 11, 市价 11×0.998) = 委托价（限价保护）')
     assert.equal((sell as Fill).fee, 83.6)
     assert.equal((sell as Fill).realizedPnl, 9890.4)
     assert.equal(m.broker.cash, 1_000_000 + 9890.4)
@@ -128,6 +166,8 @@ test('分批建仓的加权成本与部分卖出（手算）', async () => {
     const m = mountBroker()
     // 第一笔 100@10 fee 5.01 → cost 1005.01；第二笔 100@11 fee 5.01+0.01? amount1100 → 佣金 max(5,0.275)=5 过户 0.011 → 5.01
     await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 100 })
+    m.quotes[0].price = 11 // 市价走到 11 再加仓（否则漂移校验拒 stale 委托价）
+    await m.ctx.market!.refresh()
     await m.broker.submitOrder({ code: 'sh600000', side: 'buy', price: 11, qty: 100 })
     assert.equal(m.broker.getPositions()[0].cost, 1005.01 + 1105.01)
     m.tick(86_400_000)
@@ -148,7 +188,8 @@ test('账本重放：重启同账（现金/持仓/盈亏/序列号），日切�
     // 新 ctx/新 broker、同账本、时钟推进到次日
     const ctx2 = new Context()
     new ToolsService(ctx2, 'tools')
-    const src: QuoteSource = { async fetchMarketSnapshot() { return QUOTES }, async fetchQuotes() { return [] } }
+    const quotes2: Quote[] = QUOTES.map((q) => ({ ...q, price: 11 })) // 卖时市价 11（漂移校验通过）
+    const src: QuoteSource = { async fetchMarketSnapshot() { return quotes2 }, async fetchQuotes() { return [] } }
     ctx2.plugin(marketDataPlugin, { source: src, now: () => new Date(T0), pollIntervalMs: 60_000 })
     const day2 = T0 + 86_400_000
     const f2 = ctx2.plugin(paperBrokerPlugin, { ledgerPath: ledger, now: () => new Date(day2) })
