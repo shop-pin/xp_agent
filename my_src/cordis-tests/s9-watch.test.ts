@@ -47,7 +47,7 @@ interface Mount {
 
 function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
     broker?: boolean; stopLossPct?: number;
-    closeOut?: () => Promise<void> | void; exit?: () => void; closeOutAfterReview?: boolean;
+    closeOut?: (day: string) => Promise<void> | void; exit?: () => void; closeOutAfterReview?: boolean;
 } = {}): Mount {
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
@@ -177,7 +177,7 @@ test('收口链开启：复盘 turn 结束 → 先 digest 后自退，一次不�
     const seq: string[] = []
     const m = mountWatch(180_000, MON_OPEN, {
         closeOutAfterReview: true,
-        closeOut: async () => { seq.push('digest') },
+        closeOut: async (day) => { seq.push(`digest:${day}`) },
         exit: () => { seq.push('exit') },
     })
     m.watch.start() // 开盘巡检 turn
@@ -188,7 +188,7 @@ test('收口链开启：复盘 turn 结束 → 先 digest 后自退，一次不�
     m.watch.evaluate() // close wake，收口链 armed
     m.ctx.emit('agent/turn-end', { reason: 'review' })
     await settle()
-    assert.deepEqual(seq, ['digest', 'exit'], '顺序：digest 在前，自退收尾')
+    assert.deepEqual(seq, ['digest:2026-10-19', 'exit'], 'digest 显式收口日（缺陷③：不带 --day 会静默编旧日）')
     assert.ok(notes(m.ctx).some((n) => n.value?.kind === 'close-out'), '收口注记落日志')
     m.ctx.emit('agent/turn-end', { reason: 'again' })
     await settle()
@@ -514,4 +514,41 @@ test('get_trades 按日过滤 + get_portfolio 当日盈亏行（手算）', asyn
     assert.match(port, /已实现盈亏 -5098\.2 元 \| 当日已实现 -5098\.2 元/)
     assert.equal(broker.todayPnl(), -5098.2)
     rmSync(dirname(ledger), { recursive: true, force: true })
+})
+
+// ---------- 数据面健康度联动（2026-10-30 缺陷①②） ----------
+
+test('get_portfolio 无行情：不按 0 元估（幽灵 -100% 修复），未计值显式标注', async () => {
+    const ctx = new Context()
+    new ToolsService(ctx, 'tools')
+    new SessionLog(ctx, 'session-log')
+    const src: QuoteSource = { async fetchMarketSnapshot() { return QUOTES }, async fetchQuotes() { return [] } }
+    const clock = MON_OPEN
+    ctx.plugin(marketDataPlugin, { source: src, now: () => new Date(clock), pollIntervalMs: 60_000 })
+    const ledger = join(mkdtempSync(join(tmpdir(), 's9-ghost-')), 'paper.jsonl')
+    ctx.plugin(paperBrokerPlugin, { ledgerPath: ledger, now: () => new Date(clock) })
+    await ctx.market!.refresh()
+    await ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+    ctx.market!.latest = null // 数据面断供后的冷缓存（10-30 实录：网关挂一天）
+
+    const tools = ctx.require<ToolsService>('tools')
+    const port = await tools.get('get_portfolio')!.execute({}, {})
+    assert.match(port, /市值—（无行情，未计值）/, '持仓行不显示幽灵数字')
+    assert.doesNotMatch(port, /-100/, '不再出现 0 元成本口径的 -100%')
+    assert.match(port, /持仓市值 0 元（1 只无行情未计值）/, '总市值只累有行情部分并注明缺口')
+    assert.match(port, /现金 899974 元/, '现金与已实现口径不受影响')
+    rmSync(dirname(ledger), { recursive: true, force: true })
+})
+
+test('market/degraded → watch 注记记账（不唤醒 turn——断供无裁决可做）', async () => {
+    const m = mountWatch()
+    m.ctx.emit('market/degraded', {
+        at: MON_OPEN, source: 'tdx', fallback: 'sina', error: '网关不可达', failCount: 3, switched: true,
+    })
+    const hit = notes(m.ctx).find((n) => n.value?.kind === 'data-degraded')
+    assert.ok(hit, '降级注记落 SessionLog')
+    assert.equal(hit.value.source, 'tdx')
+    assert.equal(hit.value.switched, true)
+    assert.equal(m.wakes.length, 0, '降级不烧 LLM turn')
+    m.cleanup()
 })

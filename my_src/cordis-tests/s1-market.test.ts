@@ -209,3 +209,80 @@ test('工具：注册/权限/read hint + screen_market 输出含统计头与命�
     assert.match(badCodes, /Error: no valid codes/)
     await fiber.dispose()
 })
+
+// ---------- 数据面健康度与兜底（2026-10-30 缺陷①：网关死一天零告警） ----------
+
+function namedSource(name: string, quotes: () => Quote[]): QuoteSource & { snapshotCalls: number } {
+    return {
+        name,
+        snapshotCalls: 0,
+        async fetchMarketSnapshot() {
+            this.snapshotCalls++
+            const rows = quotes()
+            if (rows.length === 0) throw new Error('源不可达')
+            return rows
+        },
+        async fetchQuotes(codes) { return quotes().filter(q => codes.includes(q.code)) },
+    }
+}
+
+test('健康度+兜底：主源连续失败 3 轮 → 切兜底当轮接管 + degraded 事件一次 + 计数清零', async () => {
+    const primary = namedSource('flaky', () => []) // 恒失败
+    const backup = namedSource('backup', () => SAMPLE)
+    const ctx = new Context()
+    new ToolsService(ctx, 'tools')
+    const degraded: any[] = []
+    ctx.on('market/degraded', (d) => degraded.push(d))
+    const fiber = ctx.plugin(marketDataPlugin, { source: primary, fallback: backup, pollIntervalMs: 60_000 })
+    const market = ctx.market!
+
+    // 第 1、2 轮：静默计数（阈值下不告警不切换）
+    await assert.rejects(market.refresh(), /源不可达/)
+    await assert.rejects(market.refresh(), /源不可达/)
+    assert.equal(degraded.length, 0)
+    assert.equal(market.health.failCount, 2)
+    assert.equal(market.health.degraded, false)
+
+    // 第 3 轮（达阈值）：降级事件 + 切兜底 + 本轮立即重试成功——管道不饿到下一轮询
+    const snap = await market.refresh()
+    assert.equal(degraded.length, 1)
+    assert.equal(degraded[0].source, 'flaky')
+    assert.equal(degraded[0].fallback, 'backup')
+    assert.equal(degraded[0].switched, true)
+    assert.equal(market.health.usingFallback, true)
+    assert.equal(market.health.failCount, 0, '兜底重试成功：失败计数清零')
+    assert.equal(market.health.lastOkAt > 0, true)
+    assert.equal(snap.quotes.length, SAMPLE.length)
+    assert.ok(backup.snapshotCalls >= 1)
+    assert.equal(primary.snapshotCalls, 3)
+
+    // 切换后不切回：主源恢复也不会被再使用（防抖动；进程重启即重置）
+    await fiber.dispose()
+})
+
+test('健康度无兜底：fail-closed 事件 switched=false，refresh 仍抛，恢复后计数清零但降级闩保持', async () => {
+    let up = false
+    const lonely = namedSource('lonely', () => up ? SAMPLE : [])
+    const ctx = new Context()
+    new ToolsService(ctx, 'tools')
+    const degraded: any[] = []
+    ctx.on('market/degraded', (d) => degraded.push(d))
+    const fiber = ctx.plugin(marketDataPlugin, { source: lonely, pollIntervalMs: 60_000 })
+    const market = ctx.market!
+
+    for (let i = 0; i < 3; i++) await assert.rejects(market.refresh(), /源不可达/)
+    assert.equal(degraded.length, 1, '达阈值发降级事件（fail-closed 的唯一声响）')
+    assert.equal(degraded[0].switched, false)
+    assert.equal(degraded[0].fallback, undefined)
+    assert.equal(market.health.usingFallback, false)
+    assert.equal(market.health.degraded, true)
+    assert.equal(market.latest, null, '断供期间缓存不更新（latest 保持 null）')
+
+    up = true
+    const snap = await market.refresh()
+    assert.equal(market.health.failCount, 0, '恢复成功计数清零')
+    assert.equal(market.health.lastError, '')
+    assert.equal(snap.quotes.length, SAMPLE.length)
+    assert.equal(degraded.length, 1, '同一降级期事件不重发（闩）')
+    await fiber.dispose()
+})

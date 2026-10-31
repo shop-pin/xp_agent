@@ -82,13 +82,22 @@ export const defaultPrompts: WatchPrompts = {
 };
 
 /** 收盘收口缺省实现：spawn 同仓的 digest-run CLI（零 LLM 编译当日 digest）。
- *  cwd 纪律：runbook 固定从 my_src 起 `node dist/cli.js`。失败静默收敛——
- *  收口链不因 digest 挂掉而阻断自退（digest 可事后手动补跑）。 */
-function spawnDigestRun(): Promise<void> {
-    return new Promise((resolve) => {
-        const child = spawn(process.execPath, [join("dist", "backtest", "digest-run.js")], { stdio: "ignore" });
-        child.on("close", () => resolve());
-        child.on("error", () => resolve());
+ *  cwd 纪律：runbook 固定从 my_src 起 `node dist/cli.js`。显式 --day（2026-10-30
+ *  缺陷③：缺省取最新收口日，当日断供时静默重算昨日 digest 无告警）；stderr
+ *  捕获、非零退出显式 reject——digest 挂掉要能在收口链的 catch 里喊出声。
+ *  收口链本身仍不阻断自退（digest 可事后手动补跑）。 */
+function spawnDigestRun(day: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath,
+            [join("dist", "backtest", "digest-run.js"), "--day", day],
+            { stdio: ["ignore", "ignore", "pipe"] });
+        let err = "";
+        child.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
+        child.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`digest-run exit ${code}${err.trim() ? `：${err.trim()}` : ""}`));
+        });
+        child.on("error", reject);
     });
 }
 
@@ -105,8 +114,8 @@ export interface WatchConfig {
     perCodeWakeCap?: number;
     /** 止损线（缺省走策略 exit.stopLossPct；0 = 关）。 */
     stopLossPct?: number;
-    /** 收盘收口钩（复盘 turn 结束后跑；缺省 spawn dist/backtest/digest-run.js）。 */
-    closeOut?: () => Promise<void> | void;
+    /** 收盘收口钩（复盘 turn 结束后跑；参数 = 收口日。缺省 spawn dist/backtest/digest-run.js）。 */
+    closeOut?: (day: string) => Promise<void> | void;
     /** 宿主自退桥（AppHost.requestExit——close 后退出进程；缺 Host = 只收口不退）。 */
     exit?: () => void;
     /** 收盘收口链开关（缺省走策略 watch.closeOutAfterReview）。 */
@@ -137,7 +146,7 @@ export class WatchService extends Service {
     private maxSignalAgeMs: number;
     private perCodeWakeCap: number;
     private stopLossPct: number;
-    private closeOut: (() => Promise<void> | void) | undefined;
+    private closeOut: ((day: string) => Promise<void> | void) | undefined;
     private exit: (() => void) | undefined;
     private closeOutAfterReview: boolean;
     private prompts: WatchPrompts;
@@ -245,6 +254,12 @@ export class WatchService extends Service {
         }
     }
 
+    /** 数据面降级记账（2026-10-30 缺陷①）：不唤醒 turn——断供无裁决可做，
+     *  省 token 纪律；注记进 SessionLog，盘后复盘/追责有据可查。 */
+    onDegraded(d: { at: number; source: string; fallback?: string; error: string; failCount: number; switched: boolean }): void {
+        this.note({ kind: "data-degraded", ...d });
+    }
+
     /** market/signal 监听：armed + 开盘中 + 未熔断才进信箱——冷却窗内不裸丢。 */
     onSignal(sig: Signal): void {
         if (!this.armed) return;
@@ -313,7 +328,7 @@ export class WatchService extends Service {
         if (this.closeOut) {
             this.ctx.get<UiService>("ui")?.info("🌙 收盘收口：编译今日 digest…");
             try {
-                await this.closeOut();
+                await this.closeOut(this.day);
             } catch (e) {
                 this.ctx.get<UiService>("ui")?.error(`收盘 digest 失败：${e instanceof Error ? e.message : String(e)}`);
             }
@@ -340,6 +355,7 @@ export const marketWatchPlugin: Plugin = {
             closeOutAfterReview: config.closeOutAfterReview ?? strategy.watch.closeOutAfterReview,
         });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));
+        ctx.on("market/degraded", (d) => watch.onDegraded(d));
         ctx.on("agent/turn-end", () => void watch.onTurnEnd());
         ctx.effect(() => () => {
             if (watch.armed) watch.stop();

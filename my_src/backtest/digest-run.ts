@@ -88,9 +88,17 @@ async function main(): Promise<void> {
         console.error("daily-k 目录为空——还没有收口数据");
         process.exit(1);
     }
+    const dayGiven = process.argv.includes("--day");
     const day = arg("day", kDays[kDays.length - 1]!);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
         console.error(`--day 格式应为 YYYY-MM-DD：${day}`);
+        process.exit(1);
+    }
+    // 显式指日的诚实语义（2026-10-30 缺陷③）：该日无收口 = 数据面当日断供，
+    // 明确报错不静默编旧日（缺省不带 --day 的手动补跑路径行为不变）。
+    if (dayGiven && !kDays.includes(day)) {
+        console.error(`指定日 ${day} 无 daily-k 收口（当日数据面断供？最新收口 ${kDays[kDays.length - 1]}）`
+            + "——不静默重算旧日；补数据后重跑，或去掉 --day 编译最新收口日");
         process.exit(1);
     }
     const fetchHist = process.argv.includes("--fetch");

@@ -369,24 +369,33 @@ export class PaperBroker extends Service {
         });
         tools.register({
             name: "get_portfolio",
-            description: "模拟盘账户：现金、持仓（可卖/成本/市值/浮盈）、总资产、累计与当日已实现盈亏。市值按最新快照价估。",
+            description: "模拟盘账户：现金、持仓（可卖/成本/市值/浮盈）、总资产、累计与当日已实现盈亏。"
+                + "市值按最新快照价估；无行情快照的持仓标「未计值」不按 0 元算。",
             parameters: { type: "object", properties: {} },
             permissionHint: "read",
             execute: () => {
                 const positions = this.getPositions();
+                // 无行情不按 0 元估（2026-10-30 缺陷②：缓存空 → "市值 0 盈亏
+                // -100%" 幽灵污染复盘）——该行标注未计值，总市值只累有行情部分。
+                let missing = 0;
                 const rows = positions.map((pos) => {
                     const q = this.market?.latest?.byCode.get(pos.code);
-                    const price = q?.price ?? 0;
-                    const value = round2(price * pos.qty);
+                    if (!q || !(q.price > 0)) {
+                        missing++;
+                        return `${pos.code}  持${pos.qty}股 可卖${pos.availQty}  成本${pos.cost}  市值—（无行情，未计值）`;
+                    }
+                    const value = round2(q.price * pos.qty);
                     const pnl = pos.cost > 0 ? round2(((value - pos.cost) / pos.cost) * 100) : 0;
-                    return `${pos.code}  ${q?.name ?? ""}  持${pos.qty}股 可卖${pos.availQty}  成本${pos.cost}  市值${value}  浮盈${pnl >= 0 ? "+" : ""}${pnl}%`;
+                    return `${pos.code}  ${q.name}  持${pos.qty}股 可卖${pos.availQty}  成本${pos.cost}  市值${value}  浮盈${pnl >= 0 ? "+" : ""}${pnl}%`;
                 });
                 const totalValue = round2(positions.reduce((s, pos) => {
                     const price = this.market?.latest?.byCode.get(pos.code)?.price ?? 0;
-                    return s + price * pos.qty;
+                    return price > 0 ? s + price * pos.qty : s;
                 }, 0));
                 const day = this.todayPnl();
-                const header = `现金 ${round2(this.cash)} 元 | 持仓市值 ${totalValue} 元 | 总资产 ${round2(this.cash + totalValue)} 元`
+                const header = `现金 ${round2(this.cash)} 元 | 持仓市值 ${totalValue} 元`
+                    + `${missing > 0 ? `（${missing} 只无行情未计值）` : ""}`
+                    + ` | 总资产 ${round2(this.cash + totalValue)} 元`
                     + ` | 已实现盈亏 ${this.realizedPnl >= 0 ? "+" : ""}${this.realizedPnl} 元`
                     + ` | 当日已实现 ${day >= 0 ? "+" : ""}${day} 元`;
                 return [header, ...(rows.length > 0 ? rows : ["（无持仓）"])].join("\n");

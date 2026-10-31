@@ -45,7 +45,7 @@ import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin } from "./plugins/autonomy.js";
-import { marketDataPlugin } from "./plugins/market-data.js";
+import { marketDataPlugin, sinaSource } from "./plugins/market-data.js";
 import { makeTdxSource } from "./plugins/market-data-tdx.js";
 import { newsFeedPlugin } from "./plugins/news-feed.js";
 import { signalEnginePlugin } from "./plugins/signal-engine.js";
@@ -281,9 +281,11 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     // M7：marketRow 参数支持源注入（stock-tdx 变体传 tdxSource；缺省新浪）。
     stock: (host) => stockRows(host),
     // M7：TDX 源变体——数据面走 eltdx 网关（前置：python -m eltdx.http_server
-    // --port 7727，env MINI_TDX_GATEWAY）。网关未启动 = 拉取失败 fail-closed
-    // （guard 无行情拒单）。池工具的估值过滤在 TDX 源下退化（见 market-data-tdx 头注）。
-    "stock-tdx": (host) => stockRows(host, { source: makeTdxSource() }),
+    // --port 7727，env MINI_TDX_GATEWAY）。网关连续失败（约 15s）自动切新浪兜底
+    // 并发降级告警（2026-10-30 缺陷①：fail-closed 裸奔一天零告警的修复）——
+    // 切换不自动切回（防抖动，挂机日结进程每日重启即重置）；池工具的估值过滤
+    // 在 TDX 源下退化（见 market-data-tdx 头注），兜底期同样退化。
+    "stock-tdx": (host) => stockRows(host, { source: makeTdxSource(), fallback: sinaSource }),
     // S7：web + stock 组合——F6 投影侧栏要看 trade 流水，得同时有 host 行和
     // broker 行。profile 是单选的，组合形态就显式做成第四个名字（不加多层
     // 组合语法——两个真实需求之前不发明机制）。

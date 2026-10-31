@@ -19,6 +19,7 @@ import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
 import type { ToolsService } from "../services/tools.js";
+import type { UiService } from "../services/ui-service.js";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -67,6 +68,8 @@ export interface Book { bids: Level[]; asks: Level[] }
 
 /** 数据源接缝：换源 = 换实现，服务与工具零改。 */
 export interface QuoteSource {
+    /** 源名（健康度告警与降级事件的标识；缺省 "?"）。 */
+    readonly name?: string;
     /** 全市场快照（约 5,900 只，分页并发拉取）。 */
     fetchMarketSnapshot(): Promise<Quote[]>;
     /** 单票/少量明细（实时性优于快照轮询间隔）。 */
@@ -253,6 +256,7 @@ async function slFetchPage(pageNo: number): Promise<Quote[]> {
 
 /** 主数据源：全市场快照=新浪排行列表，单票明细=新浪 hq。 */
 export const sinaSource: QuoteSource = {
+    name: "sina",
     async fetchMarketSnapshot(): Promise<Quote[]> {
         // sort=symbol 固定升序 = 分页稳定序（按涨跌幅排序会在翻页时洗牌）。
         // 波式并发：一波 8 页，见到短页/空页即到尾部。
@@ -278,6 +282,7 @@ export const sinaSource: QuoteSource = {
 
 /** 备源：全市场快照=东财 push2（部分网络环境对 Node 掐连接，见文件头记档）。 */
 export const eastmoneySource: QuoteSource = {
+    name: "eastmoney",
     async fetchMarketSnapshot(): Promise<Quote[]> {
         const first = await emFetchPage(1);
         const pages = Math.ceil(first.total / EM_PAGE);
@@ -483,8 +488,32 @@ export interface MarketConfig {
     historyRounds?: number;
     /** 数据源注入（测试用 MockQuoteSource；生产缺省=新浪主源）。 */
     source?: QuoteSource;
+    /** 兜底源（主源连续失败达阈值时自动接管+告警；显式传 source 时不默认——
+     *  stock-tdx 由配置层显式配 sina；stock 缺省配 eastmoney）。 */
+    fallback?: QuoteSource;
     /** 时钟注入（测试时段判定）。 */
     now?: () => Date;
+}
+
+/** 健康度阈值：连续失败 N 轮（默认轮询 5s → 约 15s）判定数据面降级——
+ *  告警 + 切兜底（若有）。2026-10-30 缺陷①：网关死一天零告警、快照管道
+ *  饿死，0 信号白挂一天。 */
+const FAIL_THRESHOLD = 3;
+/** 降级态的重复告警限频 ms（挂机场景没人盯终端——日志里每 30 分钟喊一次）。 */
+const WARN_INTERVAL_MS = 30 * 60_000;
+
+/** 数据面健康度快照（只读观察面——工具/编排/人查同一张表）。 */
+export interface MarketHealth {
+    /** 连续失败 ≥ 阈值（或已切兜底）。 */
+    degraded: boolean;
+    /** 当前连续失败轮数。 */
+    failCount: number;
+    /** 最近一次失败的原因（"" = 无）。 */
+    lastError: string;
+    /** 最近一轮成功拉取的时刻（0 = 从未成功——进程起来就没拿到过数据）。 */
+    lastOkAt: number;
+    /** 当前是否兜底源在服务。 */
+    usingFallback: boolean;
 }
 
 /** 快照/明细的文本面：模型看的是这张表，不是 5,900 行原始数据。 */
@@ -496,11 +525,18 @@ function formatQuoteRow(q: Quote): string {
 
 export class MarketDataService extends Service {
     private source: QuoteSource;
+    private fallback: QuoteSource | undefined;
     private pollIntervalMs: number;
     private historyRounds: number;
     private now: () => Date;
     private timer: NodeJS.Timeout | null = null;
     private inFlight: Promise<Snapshot> | null = null;
+    // 健康度：连续失败计数 / 最近错误 / 最近成功时刻 / 降级事件已发闩 / 限频告警时刻
+    private failCount = 0;
+    private lastError = "";
+    private lastOkAt = 0;
+    private degradedEmitted = false;
+    private lastWarnAt = 0;
 
     latest: Snapshot | null = null;
     /** 最近 N 轮序列（环形，S5 信号引擎的口粮：价格+量+额）。 */
@@ -511,9 +547,56 @@ export class MarketDataService extends Service {
     constructor(ctx: Context, name: string, config: MarketConfig = {}) {
         super(ctx, name);
         this.source = config.source ?? sinaSource;
+        this.fallback = config.fallback;
         this.pollIntervalMs = config.pollIntervalMs ?? 5_000;
         this.historyRounds = config.historyRounds ?? 60;
         this.now = config.now ?? (() => new Date());
+    }
+
+    /** 当前在役源名（告警/事件/health 的标识）。 */
+    get sourceName(): string {
+        return this.source.name ?? "?";
+    }
+
+    get health(): MarketHealth {
+        return {
+            degraded: this.degradedEmitted,
+            failCount: this.failCount,
+            lastError: this.lastError,
+            lastOkAt: this.lastOkAt,
+            usingFallback: this.fallback !== undefined && this.source === this.fallback,
+        };
+    }
+
+    private warn(text: string): void {
+        this.ctx.get<UiService>("ui")?.error(text);
+    }
+
+    /** 拉取失败：计数 + 限频告警 + 首次降级发事件（fail-closed 无兜底时是唯一声响）。 */
+    private noteFailure(e: unknown): void {
+        this.failCount++;
+        this.lastError = e instanceof Error ? e.message : String(e);
+        if (this.failCount < FAIL_THRESHOLD) return;
+        const now = this.now().getTime();
+        if (now - this.lastWarnAt < WARN_INTERVAL_MS) return;
+        this.lastWarnAt = now;
+        const first = !this.degradedEmitted;
+        this.degradedEmitted = true;
+        const switching = first && this.fallback !== undefined && this.source !== this.fallback;
+        this.warn(`⚠ 行情数据面降级：源 ${this.sourceName} 连续失败 ${this.failCount} 轮`
+            + `${switching ? `，切兜底 ${this.fallback!.name ?? "?"}` : this.fallback ? "（兜底已接管）" : "（无兜底，fail-closed）"}`
+            + `：${this.lastError}`);
+        this.ctx.emit("market/degraded", {
+            at: now, source: this.sourceName,
+            fallback: switching ? this.fallback?.name : undefined,
+            error: this.lastError, failCount: this.failCount, switched: switching,
+        });
+    }
+
+    private noteSuccess(): void {
+        this.failCount = 0;
+        this.lastError = "";
+        this.lastOkAt = this.now().getTime();
     }
 
     /** 启动轮询：立即拉一轮（休市也拉——收盘快照可用），此后只在交易时段刷。
@@ -539,11 +622,26 @@ export class MarketDataService extends Service {
     }
 
     /** 全市场刷新（并发去重：进行中就等同一趟）。完成时同步广播
-     *  market/snapshot——S5 信号引擎等消费者在此挂评估。 */
+     *  market/snapshot——S5 信号引擎等消费者在此挂评估。
+     *  失败路径（2026-10-30 缺陷①）：连续失败达阈值 → 记健康度 + 告警 +
+     *  发 market/degraded；有兜底则切兜底并立即重试本轮（管道不饿到下一
+     *  轮询）。切换后不自动切回（防抖动；挂机日结进程每日重启即重置）。 */
     async refresh(): Promise<Snapshot> {
         if (this.inFlight) return this.inFlight;
         this.inFlight = (async () => {
-            const quotes = await this.source.fetchMarketSnapshot();
+            let quotes: Quote[];
+            try {
+                quotes = await this.source.fetchMarketSnapshot();
+            } catch (e) {
+                this.noteFailure(e);
+                if (this.fallback && this.source !== this.fallback && this.failCount >= FAIL_THRESHOLD) {
+                    this.source = this.fallback;
+                    quotes = await this.source.fetchMarketSnapshot();
+                } else {
+                    throw e;
+                }
+            }
+            this.noteSuccess();
             // at 走注入时钟（测试/场景确定性）；缺省=真钟表
             const snap: Snapshot = { at: this.now().getTime(), quotes, byCode: new Map(quotes.map((q) => [q.code, q])) };
             this.latest = snap;
@@ -730,6 +828,9 @@ declare module "../cordis/events.js" {
     interface Events {
         /** 每轮全市场快照落定（refresh 尾同步广播）——消费方：S5 信号引擎。 */
         "market/snapshot"(snap: Snapshot): void;
+        /** 数据面降级（主源连续失败达阈值）：switched=true 表示已切兜底源；
+         *  fail-closed 无兜底时是断供的唯一声响。消费方：watch 记账。 */
+        "market/degraded"(d: { at: number; source: string; fallback?: string; error: string; failCount: number; switched: boolean }): void;
     }
 }
 
@@ -737,7 +838,12 @@ export const marketDataPlugin: Plugin = {
     name: "market-data",
     inject: ["tools"],
     apply(ctx: Context, config: MarketConfig = {}) {
-        const market = new MarketDataService(ctx, "market", config);
+        // 兜底缺省：新浪主源配东财备源；显式注入源（tdx/测试 mock）不自作主张——
+        // stock-tdx 由配置层显式配 sina（cordis.config.ts）
+        const full: MarketConfig = config.fallback === undefined && !config.source
+            ? { ...config, fallback: eastmoneySource }
+            : config;
+        const market = new MarketDataService(ctx, "market", full);
         market.attachTools();
         market.start();
         ctx.effect(() => () => market.dispose());

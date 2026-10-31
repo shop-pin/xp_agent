@@ -88,6 +88,7 @@ export function projectTdxRecord(rec: TdxRecord, name: string): Quote | null {
 const CN_HSA = "沪深A股"; // normalize_category 唯一别名 → 分类 6；北交所无别名
 
 export class TdxQuoteSource implements QuoteSource {
+    readonly name = "tdx";
     private gateway: string;
     private concurrency: number;
     private pageSize: number;
