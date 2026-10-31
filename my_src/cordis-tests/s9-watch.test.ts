@@ -46,7 +46,7 @@ interface Mount {
 }
 
 function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
-    broker?: boolean; stopLossPct?: number;
+    broker?: boolean; stopLossPct?: number; trailingStopPct?: number;
     closeOut?: (day: string) => Promise<void> | void; exit?: () => void; closeOutAfterReview?: boolean;
 } = {}): Mount {
     const ctx = new Context()
@@ -72,6 +72,7 @@ function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
         wake: async (text: string) => { wakes.push(text) },
         signalCooldownMs: cooldownMs,
         stopLossPct: opts.stopLossPct,
+        trailingStopPct: opts.trailingStopPct,
         strategy: DEFAULT_STRATEGY,
         closeOut: opts.closeOut,
         exit: opts.exit,
@@ -393,8 +394,7 @@ test('止损唤醒：T+1 可卖破线叫一次，同日不重复，跨日再叫'
     }
 })
 
-test('止损静默面：未破线不叫；stopLossPct=0 关；熔断中不叫', async () => {
-    // 未破线：−0.5% 在 −5% 线上
+test('止损静默面：未破线不叫；stopLossPct=0 关；熔断中不叫', async () => {    // 未破线：−0.5% 在 −5% 线上
     const m1 = mountWatch(180_000, MON_OPEN, { broker: true })
     try {
         await m1.ctx.market!.refresh()
@@ -439,6 +439,67 @@ test('止损静默面：未破线不叫；stopLossPct=0 关；熔断中不叫', 
         assert.equal(m3.wakes.filter((w) => w.includes('持仓风控')).length, 0, '熔断中不叫')
     } finally {
         m3.cleanup()
+    }
+})
+
+// ---------- 移动止盈（2026-10-31：exit.trailingStopPct） ----------
+
+test('移动止盈：峰值回撤穿越锁利线叫一次（与止损共用日阀）；未涨过直接破止损仍走止损语义', async () => {
+    const m = mountWatch(180_000, MON_OPEN, { broker: true })
+    try {
+        await m.ctx.market!.refresh()
+        // 周一买 10000@10：含费成本 = 100_026
+        await m.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m.tick(TUE_OPEN - MON_OPEN) // 周二 T+1 可卖
+        m.quotes[0].price = 11      // 涨：checkStops 喂价 peak=11（只上抬）
+        await m.ctx.market!.refresh()
+        m.watch.start()             // 巡检 turn（11 未破任何线）
+        assert.equal(m.wakes.filter((w) => w.includes('持仓风控')).length, 0)
+        m.quotes[0].price = 10.45   // = 11×0.95 锁利线：10.45×10000=104500 ≤ 线 104500，
+                                    // 线 > 止损线 95024.7 → trailing 接管；浮盈 (104500−100026)/100026=+4.5%
+        await m.ctx.market!.refresh()
+        m.watch.evaluate()
+        assert.match(m.wakes.at(-1)!, /峰值回撤锁利/)
+        assert.match(m.wakes.at(-1)!, /持有期峰值 11，现价 10\.45（回撤 -5\.0%）/)
+        assert.match(m.wakes.at(-1)!, /当前浮盈 \+4\.5%/)
+        m.watch.evaluate()
+        assert.equal(m.wakes.filter((w) => w.includes('持仓风控')).length, 1, '同 code 每日一次（止损/止盈共用 riskWoke）')
+    } finally {
+        m.cleanup()
+    }
+
+    // 从未涨过（peak=买入价）：trailing 线 95000 < 止损线 95024.7 未接管 → 阴跌破止损走 stop-loss 语义
+    const m2 = mountWatch(180_000, MON_OPEN, { broker: true })
+    try {
+        await m2.ctx.market!.refresh()
+        await m2.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m2.tick(TUE_OPEN - MON_OPEN)
+        m2.quotes[0].price = 9.4
+        await m2.ctx.market!.refresh()
+        m2.watch.start()
+        m2.watch.evaluate()
+        assert.match(m2.wakes.at(-1)!, /浮亏 -6\.0%/, '止损语义（非 trailing）')
+        assert.doesNotMatch(m2.wakes.at(-1)!, /峰值回撤/)
+    } finally {
+        m2.cleanup()
+    }
+})
+
+test('移动止盈关（trailingStopPct=0）：峰值回撤不叫；peak 只上抬不下压', async () => {
+    const m = mountWatch(180_000, MON_OPEN, { broker: true, trailingStopPct: 0 })
+    try {
+        await m.ctx.market!.refresh()
+        await m.ctx.broker!.submitOrder({ code: 'sh600000', side: 'buy', price: 10, qty: 10_000 })
+        m.tick(TUE_OPEN - MON_OPEN)
+        m.quotes[0].price = 11
+        await m.ctx.market!.refresh()
+        m.watch.start()
+        m.quotes[0].price = 10.45 // 破 11×0.95 线，但 trailing 关且未破止损线
+        await m.ctx.market!.refresh()
+        m.watch.evaluate()
+        assert.equal(m.wakes.filter((w) => w.includes('持仓风控')).length, 0, '0 = 关')
+    } finally {
+        m.cleanup()
     }
 })
 

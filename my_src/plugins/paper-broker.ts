@@ -66,6 +66,10 @@ export interface Position {
     availQty: number;
     /** 持仓总成本（含买入费用摊入，元）。 */
     cost: number;
+    /** 持有期最高快照价（元）——移动止盈的回撤基准。买入成交价起步，
+     *  watch 盘中喂价上抬；进程重启后回落为买入成交价（盘中峰值不留账，
+     *  保守方向：线变低不易误触发）。 */
+    peak: number;
 }
 
 // ---------- 费用与价格纯函数（手算对拍钉死） ----------
@@ -113,6 +117,8 @@ interface PositionState {
     boughtToday: number;
     day: string;
     cost: number;
+    /** 持有期最高快照价（0 = 尚未定价，首笔买入成交价起步）。 */
+    peak: number;
 }
 
 export interface PaperConfig {
@@ -155,6 +161,15 @@ export class PaperBroker extends Service {
         return [...this.positions.values()].map((p) => this.snapshotPosition(p, today));
     }
 
+    /** 持有期峰值喂价（移动止盈的回撤基准）：peak 只上抬不下压。
+     *  无持仓 no-op；清仓后重买 = 新持有期（peak 随持仓删除重置）。 */
+    notePrice(code: string, price: number): void {
+        if (!(price > 0)) return;
+        const p = this.positions.get(code);
+        if (!p) return;
+        p.peak = Math.max(p.peak, price);
+    }
+
     /** 全账本成交（坏行跳过——S10 get_trades_csv 的数据面）。 */
     allFills(): Fill[] {
         const fills: Fill[] = [];
@@ -173,7 +188,7 @@ export class PaperBroker extends Service {
 
     private snapshotPosition(p: PositionState, today: string): Position {
         this.rollDay(p, today);
-        return { code: p.code, qty: p.qty, availQty: p.qty - p.boughtToday, cost: round2(p.cost) };
+        return { code: p.code, qty: p.qty, availQty: p.qty - p.boughtToday, cost: round2(p.cost), peak: p.peak };
     }
 
     private rollDay(p: PositionState, today: string): void {
@@ -222,13 +237,14 @@ export class PaperBroker extends Service {
             this.cash = round2(this.cash - amount - fee);
             let p = this.positions.get(order.code);
             if (!p) {
-                p = { code: order.code, qty: 0, boughtToday: 0, day: today, cost: 0 };
+                p = { code: order.code, qty: 0, boughtToday: 0, day: today, cost: 0, peak: 0 };
                 this.positions.set(order.code, p);
             }
             this.rollDay(p, today);
             p.qty += qty;
             p.boughtToday += qty;
             p.cost = round2(p.cost + amount + fee);
+            if (p.peak === 0) p.peak = order.price; // 新持有期：峰值从成交价起步（加仓不压低历史峰）
             return this.settle({ orderId: this.nextOrderId(), code: order.code, side: "buy", price: order.price, qty, fee, realizedPnl: null, at });
         }
 
@@ -308,13 +324,14 @@ export class PaperBroker extends Service {
         if (f.side === "buy") {
             this.cash = round2(this.cash - amount - f.fee);
             if (!p) {
-                p = { code: f.code, qty: 0, boughtToday: 0, day: today, cost: 0 };
+                p = { code: f.code, qty: 0, boughtToday: 0, day: today, cost: 0, peak: 0 };
                 this.positions.set(f.code, p);
             }
             this.rollDay(p, today);
             p.qty += f.qty;
             p.boughtToday += f.qty;
             p.cost = round2(p.cost + amount + f.fee);
+            if (p.peak === 0) p.peak = f.price;
         } else {
             this.cash = round2(this.cash + amount - f.fee);
             this.realizedPnl = round2(this.realizedPnl + (f.realizedPnl ?? 0));

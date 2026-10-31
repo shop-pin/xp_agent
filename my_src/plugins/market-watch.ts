@@ -35,7 +35,7 @@ import type { Signal } from "./signal-engine.js";
 import type { TradeGuardService } from "./trade-guard.js";
 import { loadStrategy, type StrategyConfig } from "./strategy.js";
 
-/** 破止损线的持仓快照（drawdown 与 /portfolio 浮盈同口径：对含费总成本）。 */
+/** 破离场线的持仓快照（drawdown 与 /portfolio 浮盈同口径：对含费总成本）。 */
 export interface RiskHit {
     code: string;
     qty: number;
@@ -46,6 +46,10 @@ export interface RiskHit {
     price: number;
     /** 相对含费总成本的浮动盈亏比例（负数，如 -0.0602）。 */
     drawdown: number;
+    /** 触发类型：stop-loss = 破成本止损线；trailing = 峰值回撤锁利。 */
+    reason: "stop-loss" | "trailing";
+    /** 持有期最高快照价（trailing 触发时随附；止损触发 = 现价）。 */
+    peak: number;
 }
 
 export interface WatchPrompts {
@@ -73,11 +77,14 @@ export const defaultPrompts: WatchPrompts = {
         + `信号与消息对照、memory 更新持仓与偏好、明日计划）。`,
     risk: (hits, time) => {
         const lines = hits.map((h) =>
-            `${h.code}：含费成本 ${h.cost} 元（${h.qty} 股，可卖 ${h.availQty}），`
-            + `现价 ${h.price}，浮亏 ${(h.drawdown * 100).toFixed(1)}%`);
-        return `[盯盘 持仓风控 ${time}] ${hits.length} 笔持仓破止损线：${lines.join("；")}。`
-            + `止损不自动卖：请逐笔 /adjudicate 裁决，确认破位的直接 place_order 卖出可卖部分`
-            + `（guard 会拦超限单）；若判为瞬时插针可暂持，但须给出理由与认错位。`;
+            h.reason === "trailing"
+                ? `${h.code}：峰值回撤锁利——持有期峰值 ${h.peak}，现价 ${h.price}（回撤 ${(h.peak > 0 ? (h.price / h.peak - 1) * 100 : 0).toFixed(1)}%），`
+                + `含费成本 ${h.cost} 元（${h.qty} 股，可卖 ${h.availQty}），当前浮盈 ${h.drawdown >= 0 ? "+" : ""}${(h.drawdown * 100).toFixed(1)}%`
+                : `${h.code}：含费成本 ${h.cost} 元（${h.qty} 股，可卖 ${h.availQty}），`
+                + `现价 ${h.price}，浮亏 ${(h.drawdown * 100).toFixed(1)}%`);
+        return `[盯盘 持仓风控 ${time}] ${hits.length} 笔持仓触离场线：${lines.join("；")}。`
+            + `不自动卖：请逐笔 /adjudicate 裁决，确认离场的直接 place_order 卖出可卖部分`
+            + `（guard 会拦超限单）；若判为瞬时插针/正常回踩可暂持，但须给出理由与认错位。`;
     },
 };
 
@@ -114,6 +121,8 @@ export interface WatchConfig {
     perCodeWakeCap?: number;
     /** 止损线（缺省走策略 exit.stopLossPct；0 = 关）。 */
     stopLossPct?: number;
+    /** 移动止盈线（缺省走策略 exit.trailingStopPct；0 = 关）。 */
+    trailingStopPct?: number;
     /** 收盘收口钩（复盘 turn 结束后跑；参数 = 收口日。缺省 spawn dist/backtest/digest-run.js）。 */
     closeOut?: (day: string) => Promise<void> | void;
     /** 宿主自退桥（AppHost.requestExit——close 后退出进程；缺 Host = 只收口不退）。 */
@@ -146,6 +155,7 @@ export class WatchService extends Service {
     private maxSignalAgeMs: number;
     private perCodeWakeCap: number;
     private stopLossPct: number;
+    private trailingStopPct: number;
     private closeOut: ((day: string) => Promise<void> | void) | undefined;
     private exit: (() => void) | undefined;
     private closeOutAfterReview: boolean;
@@ -159,6 +169,7 @@ export class WatchService extends Service {
         this.maxSignalAgeMs = config.maxSignalAgeMs ?? this.cooldown * 2;
         this.perCodeWakeCap = config.perCodeWakeCap ?? 2;
         this.stopLossPct = config.stopLossPct ?? 0.05;
+        this.trailingStopPct = config.trailingStopPct ?? 0.05;
         this.closeOut = config.closeOut ?? spawnDigestRun;
         this.exit = config.exit;
         this.closeOutAfterReview = config.closeOutAfterReview ?? false;
@@ -227,11 +238,13 @@ export class WatchService extends Service {
         }
     }
 
-    /** 持仓风控（S14 离场节）：现价市值破含费成本止损线 → 唤醒裁决（不自动卖）。
-     *  破线是持续状态、没有新鲜度——同 code 每日至多唤醒一次（Day 1 教训：
-     *  重复唤醒没有新信息）；T+1 当日买入不可卖——无可卖部分不叫（叫了也执行不了）。 */
+    /** 持仓风控（S14 离场节 + 2026-10-31 移动止盈）：现价市值破含费成本止损线，
+     *  或从持有期峰值回撤穿越锁利线（且回撤线高于止损线=锁利位有效）→ 唤醒裁决
+     *  （不自动卖）。破线是持续状态、没有新鲜度——同 code 每日至多唤醒一次
+     *  （Day 1 教训：重复唤醒没有新信息；止损/止盈共用一把去重阀）；T+1 当日
+     *  买入不可卖——无可卖部分不叫（叫了也执行不了）。 */
     private checkStops(): void {
-        if (this.stopLossPct <= 0) return;
+        if (this.stopLossPct <= 0 && this.trailingStopPct <= 0) return;
         const market = this.ctx.get<MarketDataService>("market");
         const broker = this.ctx.get<PaperBroker>("broker");
         if (!market || !broker || !market.latest) return;
@@ -244,10 +257,19 @@ export class WatchService extends Service {
             if (this.riskWoke.get(p.code) === day) continue;
             const q = market.latest.byCode.get(p.code);
             if (!q) continue;
+            broker.notePrice(p.code, q.price); // 峰值喂价先行：只上抬不下压
             const drawdown = (q.price * p.qty - p.cost) / p.cost;
-            if (drawdown > -this.stopLossPct) continue;
-            this.riskWoke.set(p.code, day);
-            hits.push({ code: p.code, qty: p.qty, availQty: p.availQty, cost: p.cost, price: q.price, drawdown });
+            const stopLineValue = p.cost * (1 - this.stopLossPct);
+            const trailingLineValue = p.peak * (1 - this.trailingStopPct) * p.qty;
+            // trailing 只在锁利位高于止损位时接管（浮盈不足时止损线兜底，不双叫）
+            const trailingArmed = this.trailingStopPct > 0 && trailingLineValue > stopLineValue;
+            if (this.stopLossPct > 0 && drawdown <= -this.stopLossPct) {
+                this.riskWoke.set(p.code, day);
+                hits.push({ code: p.code, qty: p.qty, availQty: p.availQty, cost: p.cost, price: q.price, drawdown, reason: "stop-loss", peak: p.peak });
+            } else if (trailingArmed && q.price * p.qty <= trailingLineValue) {
+                this.riskWoke.set(p.code, day);
+                hits.push({ code: p.code, qty: p.qty, availQty: p.availQty, cost: p.cost, price: q.price, drawdown, reason: "trailing", peak: p.peak });
+            }
         }
         if (hits.length > 0) {
             void this.fire(this.prompts.risk(hits, cnHm(now.getTime())), "risk", day);
@@ -352,6 +374,7 @@ export const marketWatchPlugin: Plugin = {
             maxSignalAgeMs: config.maxSignalAgeMs ?? strategy.watch.maxSignalAgeMs,
             perCodeWakeCap: config.perCodeWakeCap ?? strategy.watch.perCodeWakeCap,
             stopLossPct: config.stopLossPct ?? strategy.exit.stopLossPct,
+            trailingStopPct: config.trailingStopPct ?? strategy.exit.trailingStopPct,
             closeOutAfterReview: config.closeOutAfterReview ?? strategy.watch.closeOutAfterReview,
         });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));

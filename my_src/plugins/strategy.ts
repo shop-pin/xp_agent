@@ -69,6 +69,9 @@ export interface ExitConfig {
     /** 止损线（2026-10-22 用户定 −5%）：相对含费成本，只对 T+1 可卖部分生效；
      *  触发 = watch 持仓风控唤醒裁决，不自动卖。0 = 关。 */
     stopLossPct: number;
+    /** 移动止盈（2026-10-31 用户定 −5%）：现价 ≤ 持有期峰值×(1−5%) 且回撤线
+     *  高于止损线（锁利位有效才接管）→ 同一风控唤醒裁决。0 = 关。 */
+    trailingStopPct: number;
 }
 
 export interface PoolConfig {
@@ -110,7 +113,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
     },
     watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2, closeOutAfterReview: false },
     risk: { maxPositionPct: 0.2, maxDailyLoss: 15_000 },
-    exit: { stopLossPct: 0.05 },
+    exit: { stopLossPct: 0.05, trailingStopPct: 0.05 },
     pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, pbMin: 0, recentDays: 365 },
     backtest: { slippage: 0.002, initialCash: 1_000_000 },
 };
