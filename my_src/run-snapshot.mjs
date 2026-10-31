@@ -36,13 +36,21 @@ for (const dir of targets) {
     }
     const ch = dir.slice(2);
     const r = spawnSync(process.execPath, [join(HERE, "run-mock.mjs"), ch, flag], {
-        stdio: ["ignore", "pipe", "inherit"],
+        stdio: ["ignore", "pipe", "pipe"],
         encoding: "utf-8",
     });
     const tail = (r.stdout || "").trim().split("\n").filter(Boolean).pop() || "";
-    const ok = r.status === 0 && tail.includes("✓ snapshot");
+    // record 的成功旗标是 ⚑（录制完成即目标达成——场景 verify 在录制期可能
+    // 因旧期望红基线而非零退出，不追究）；replay 才锚退出码 + ✓。挂账#5：
+    // 原判定不认 ⚑，--record 恒红、进不了 && 链。
+    const ok = record ? tail.includes("⚑ snapshot recorded") : r.status === 0 && tail.includes("✓ snapshot");
+    // 失败时带出场景的 crash/stderr 尾巴（挂账#11：此前 stderr 直通终端不进
+    // runner 输出，"0 requests"类失败只剩光秃秃的 line count 断言没法断因）
+    const stderrTail = (r.stderr || "").trim().split("\n").filter(Boolean).slice(-2).join(" | ");
+    const detail = ok ? tail.trim() : tail.slice(0, 120)
+        + (stderrTail ? ` …stderr: ${stderrTail.slice(0, 140)}` : "");
     if (!ok) red++;
-    console.log(`${dir} ${ok ? "✓" : "✗"}  ${ok ? tail.trim() : tail.slice(0, 160)}`);
+    console.log(`${dir} ${ok ? (record ? "⚑" : "✓") : "✗"}  ${detail}`);
 }
 console.log(`\nsnapshot ${record ? "record" : "replay"}: ${targets.length - red}/${targets.length} green`);
 process.exit(red === 0 ? 0 : 1);

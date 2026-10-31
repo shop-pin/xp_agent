@@ -118,14 +118,14 @@ dsh 课程的三个思想（一切皆插件 / 日志即真相 / 能力接缝）�
 1. ✅ **模拟盘成交建模两补丁**（治 stale-price fill 乐观偏差；2026-10-31 落地）：滑点成交——`fill = min(委托价, 最新快照×(1+slip))`（buy，sell 对称 max）——限价保护保留、不再按委托价乐观成交（到分 round2）；价格漂移拒单——委托价与下单时刻最新快照偏离 >1% 拒（stale 挂单 fail-closed）；`PaperConfig.slippage` 缺省走 `backtest.slippage`（同一配置驱动回测与模拟盘）。波及面：7 个测试场景借 stale 漏洞（卖单委托价离快照 10%）全部改为"卖前刷快照"——借漏洞本身证明补丁治的偏差真实存在
 2. ✅ guard 单日亏损上限缺省 5 万，对 300k 账户偏松（16.7%/天）——已收紧（2026-10-22 随止损 exit 节落地：`risk.maxDailyLoss` 50k → 15k = 5%/日，进 strategy 配置）
 3. ✅ 账本 CSV/Excel 导出小工具（S10 已落地：`get_trades_csv` 工具，CSV 逐字段 echo 账本）
-4. 场景 29（S2 stockProbe）挂 news 即真网络轮询（失败静默吞）→ S8 记档遗留
-5. snapshot runner record 模式尾行判定误报（找 "✓" 打的是 "⚑"）→ S9 记档遗留
-6. host 仅实现 GET，HEAD 请求落 API 404 → S9 手测发现
+4. ✅ 场景 29（S2 stockProbe，现为 ch34）挂 news 即真网络轮询（失败静默吞）→ 已修（2026-10-31 小尾巴轮）：extraRows 加 news mock 行覆盖 profile 的 news-feed（同 market 行手法）
+5. ✅ snapshot runner record 模式尾行判定误报（找 "✓" 打的是 "⚑"）→ 已修（2026-10-31）：record 模式判定认 ⚑（录制完成即目标达成）——`--record` 不再恒红，可进 `&&` 链；replay 判定不变
+6. ✅ host 仅实现 GET，HEAD 请求落 API 404 → 已修（2026-10-31）：serveStatic 加 headOnly（头照发 body 不写）
 8. ✅ S12 候选池"板块"过滤目前=北交所红线剔，创业板/科创板在池内（Day1 候选 20 占 9 席）——**开关已加（2026-10-31）**：`pool.excludeCK`（pickPool 剔 sz30/sh68 前缀 + get_stock_pool 工具参数覆盖），**默认 false 行为零漂移**；要用主板纯微盘池时在 `~/.mini-claude/stocks/strategy.json` 的 pool 节开 `{"excludeCK": true}`
 7. **S5/S9 信号管道修复轮**（2026-10-21 跟踪 Day 1 实跑复盘：80 信号→80 turn→0 下单、真涨停迟发 5.5h，根因与逐项清单见 `my_docs/stock-tracking-20261021-review.md`）——P0：宇宙闸（日成交额下限 + excludeBJ **默认 true**——2026-10-21 用户定：北交所现不买，以后配置放开；原"bj 单独收紧阈值"建议随之挂起）+ 重发纪律（同 code+rule 日上限 2 次 / 重发需 |strength|×1.5 / 方向翻转强证据）+ guard 标的排除加 bj 前缀（"不交易"交易面兜底，规则映射发现）；P1：机械门槛进引擎（breakout 双门槛 |pct|≥0.5% 或 surge≥2.5、volume-surge 绝对量 ≥30 万/分钟、N 前缀首日跳板位规则、低价股门槛按 tick 归一）+ 唤醒管道（冷却改"留最新/超龄丢弃"、同 code 当日已裁决不再 wake、攒批 digest 唤醒）+ 已裁决记忆回流（no-opinion/avoid 码当日静音）；P2 观察后定：信号分层 wake/log（防双门槛误杀广誉远式贴线真票，仍待观察）、~~数据面刷新失败可见性~~ ✅（2026-10-31 随三缺陷修复轮落地：`market/degraded` 事件 + 限频告警 + health 观察面，见 #10）。→ 跟踪期 S5/S9 修复轮，S10 前完成
 9. **学习环·教训进裁决**（2026-10-27 建，起因 = GLM lite 套餐被看盘烧穿）：已落地零 LLM 的 digest/裁决打分器（`backtest/digest.ts` + `digest-run.ts`，events×日K×账本 → `digest/<day>.md` 一页：裁决按 action×信心档对账 T+1/T+3、规则 T+1 对账、持仓风控、自动旗标；手算对拍 `tracking-digest.test.ts`）+ 学习知识库 `my_docs/stock-learnings.md`（四层教训库 + 周末历史分析协议）。待办：(a) 纪律——每轮 /adjudicate 后 record_verdicts（首跑发现 verdicts 0 条，校准层断粮）；(b) 裁决技能吃 learnings 确立条目（≤10 条进上下文）；(c) 周末与用户跑首场历史分析（2026-10-31/11-01 候选）→ 跟踪期 P2
 10. ✅ **10-30 空转日三缺陷修复轮**（2026-10-31 修，`stock-tracking-20261031-fixes.md`）：①数据面健康度（连续失败 ≥3 轮 = degraded：`market/degraded` 事件 + UI 限频 30 分钟告警 + `market.health` 观察面；watch 记 note 不唤醒 turn）+ 自动兜底（stock-tdx→sina 显式配、stock 缺省→eastmoney；当轮切换立即重试、**不自动切回**——挂机日结进程每日重启即重置）；②get_portfolio 无行情不按 0 元估（`市值—（无行情，未计值）` + 总市值只累有行情部分并注明缺口）；③digest 显式 `--day`（watch closeOut(day) 带 day + stderr 捕获非零 reject；digest-run 显式日无收口报错 exit 1 不静默编旧日）。回归：cordis 302/302、mock 28 章、snapshot 40/40（ch34/39-44 描述漂移重录）。翻车记档：`tsc --noEmit` 不产 dist 回归白跑（298→302 破绽）；snapshot replay 偶发红根因=探针 chat 抛错被吞+50ms 竞速窗（与改动正交，见下条）
-11. **snapshot replay 偶发红（探针脆弱点）**（2026-10-31 观察）：多子进程连环跑后偶发"场景 0 requests"——ch37 型探针 `agent.chat()` 抛错被 runs 循环 try-catch 吞掉 + 50ms 竞速窗被高负载突破（回环 TCP 抖动同族）。单场景复跑 20 连绿、红痕自愈型。处置：遇红先复跑确认再查根因；加固方向=探针 chat 兜错显式化（crashed 语义已有，补探针分支）→ 随下一次 snapshot 体系相关改动并入
+11. ✅ **snapshot replay 偶发红（探针脆弱点）**（2026-10-31 观察，同日小尾巴轮加固）：三处治本——①`probeFetchGate` 确定性等待替换 8 处裸 `setTimeout(50)` 竞速窗（包裹 mock source 调用计数，2s 超时显式抛错走 crash 通道）；②crash 退出码收紧（`crashed → exit 1`，不再被"verify 绿"吃掉）+ runner 失败时带出 stderr 尾巴（可断因）；③**意外收获：ch41 watchProbe 的 finally `watch.stop()` ReferenceError 被吞数日**（try 内 const 让每次成功路径都崩、crash exit 0 静默）——声明提 try 外根治。ch41 因 close 流程完整化多一行事件重录。教训记档：**"crash 但退出 0"是最危险的静默吞模式**，收紧退出码是抓这类 bug 的手段
 
 ---
 

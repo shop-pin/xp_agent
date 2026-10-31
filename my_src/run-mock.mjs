@@ -20,6 +20,23 @@ const snapshotMode = process.argv.includes("--snapshot-record") ? "record"
   : process.argv.includes("--snapshot-replay") ? "replay" : undefined;
 const snapshotDir = join(HERE, "snapshots", `ch${chapter}`);
 
+// 挂账#11（2026-10-31）：探针的"首轮 refresh 落定"等待。裸 setTimeout(50) 是
+// 竞速窗——连环子进程高负载下不够用，chat 抛错被 runs 循环吞掉，capture 0 行
+// → snapshot 偶发"line count N != 0"红（红痕自愈型，无法稳定复现）。改成
+// 包裹 mock source 的调用计数做确定性等待，2s 超时显式抛错（走 crash 通道）。
+function probeFetchGate(source, label = "market") {
+  let calls = 0;
+  const orig = source.fetchMarketSnapshot;
+  source.fetchMarketSnapshot = async (...args) => { calls++; return orig.apply(source, args); };
+  return async () => {
+    const t0 = Date.now();
+    while (calls === 0) {
+      if (Date.now() - t0 > 2000) throw new Error(`probe ${label} first fetch not settled within 2s`);
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  };
+}
+
 const scenarios = {
   "1": {
     prompt: "Read the file greeting.txt and tell me what it says.",
@@ -2149,9 +2166,22 @@ if (s.runs) {
           async fetchMarketSnapshot() { return quotes; },
           async fetchQuotes(codes) { return quotes.filter((x) => codes.includes(x.code)); },
         };
+        // news 行同款覆盖（挂账#4：profile stock 的 news-feed 无 config = 真新浪
+        // 源起轮询，失败静默吞——探针网络零依赖纪律）
+        const mockNews = {
+          async fetchLatest() {
+            return [{
+              id: "n1", time: Date.UTC(2026, 9, 16, 6, 50, 0),
+              text: "浦发银行：三季度净利润同比增长", tags: ["浦发银行"], codes: ["sh600000"],
+            }];
+          },
+        };
         const agent = new agentMod.Agent({
           profile: "stock",
-          extraRows: [{ id: "market", name: "market-data", config: { source: mockSource } }],
+          extraRows: [
+            { id: "market", name: "market-data", config: { source: mockSource } },
+            { id: "news", name: "news-feed", config: { source: mockNews } },
+          ],
         });
         await agent.chat("Invoke the brief skill with no args.");
         if (agent.close) await agent.close();
@@ -2228,13 +2258,14 @@ if (s.runs) {
           async fetchQuotes() { return []; },
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0)); // 周一 10:00 CST
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           extraRows: [
             { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
             { id: "signals", name: "signal-engine" },
           ],
         });
-        await new Promise((r) => setTimeout(r, 50)); // 等 start() 首轮（平静）落定
+        await waitFirst(); // 等 start() 首轮（平静）落定（挂账#11：确定性等待）
         await agent.chat("Check the live market signals.");
         if (agent.close) await agent.close();
       } else if (r.adjudicateProbe !== undefined) {
@@ -2263,6 +2294,7 @@ if (s.runs) {
           },
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           extraRows: [
             { id: "skills", name: "skills-registry", config: { productSkills: true } },
@@ -2271,7 +2303,7 @@ if (s.runs) {
             { id: "news", name: "news-feed", config: { source: mockNews } },
           ],
         });
-        await new Promise((r) => setTimeout(r, 50));
+        await waitFirst();
         await agent.chat("Invoke the adjudicate skill.");
         if (agent.close) await agent.close();
       } else if (r.paperProbe !== undefined) {
@@ -2288,6 +2320,7 @@ if (s.runs) {
             async fetchQuotes() { return []; },
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           extraRows: [
             { id: "market", name: "market-data", config: { source: src, now: () => fixed, pollIntervalMs: 60_000 } },
@@ -2295,7 +2328,7 @@ if (s.runs) {
           ],
         });
         agent.setConfirmFn(async () => true);
-        await new Promise((r) => setTimeout(r, 50));
+        await waitFirst();
         await agent.chat("Run the paper trading checks.");
         if (agent.close) await agent.close();
       } else if (r.guardProbe !== undefined) {
@@ -2314,6 +2347,7 @@ if (s.runs) {
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0)); // 周一 10:00 CST
         let confirms = 0;
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           profile: "stock",
           extraRows: [
@@ -2324,7 +2358,7 @@ if (s.runs) {
           ],
         });
         agent.setConfirmFn(async () => { confirms++; return true; });
-        await new Promise((r) => setTimeout(r, 50));
+        await waitFirst();
         await agent.chat("Run the guard checks.");
         if (agent.close) await agent.close();
         writeFileSync(join(workdir, "confirms.txt"), String(confirms));
@@ -2348,6 +2382,10 @@ if (s.runs) {
         };
         const now = () => new Date(t);
         process.env.MINI_WATCH_TICK_MS = "10";
+        // watch 声明在 try 外——finally 的 stop 要引用它（原 try 内 const 让
+        // finally 每次成功路径都 ReferenceError，被"crash 但 exit 0"吞了数日，
+        // crash 退出码收紧后暴露）
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           profile: "stock",
           extraRows: [
@@ -2365,10 +2403,11 @@ if (s.runs) {
           }
           return true;
         };
+        const market = agent.cordis.get("market");
+        let watch;
         try {
-          await new Promise((res) => setTimeout(res, 50)); // 首轮快照（平静）落定
-          const market = agent.cordis.get("market");
-          const watch = agent.cordis.get("watch");
+          await waitFirst(); // 首轮快照（平静）落定
+          watch = agent.cordis.get("watch");
           watch.start();                                   // ① 开盘巡检 turn
           await waitUntil(() => !agent.busy && watch.snapshot.patrolled);
           await market.refresh();                          // ② spike → market/signal → 盘中信号 turn
@@ -2380,7 +2419,7 @@ if (s.runs) {
           delete process.env.MINI_WATCH_TICK_MS;
           // watch tick 链挂 schedule 裸 setTimeout（非 unref）——探针手动
           // start 的，finally 必须手动 stop，否则进程挂着不退出
-          watch.stop();
+          watch?.stop();
           if (agent.close) await agent.close();
         }
       } else if (r.datastoreProbe !== undefined) {
@@ -2397,6 +2436,7 @@ if (s.runs) {
           async fetchQuotes() { return []; },
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0)); // 周一 10:00 CST
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           profile: "stock",
           extraRows: [
@@ -2406,7 +2446,7 @@ if (s.runs) {
             { id: "datastore", name: "data-store", config: { rootDir: join(workdir, "data") } },
           ],
         });
-        await new Promise((r2) => setTimeout(r2, 50)); // 首轮快照落定（明细层第一行）
+        await waitFirst(); // 首轮快照落定（明细层第一行）
         await agent.chat("把今天浦发银行的裁决入档，然后导出成交流水 CSV。");
         if (agent.close) await agent.close();
       } else if (r.bookProbe !== undefined) {
@@ -2429,6 +2469,7 @@ if (s.runs) {
           async fetchQuotes() { return [detailQ]; },
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           profile: "stock",
           extraRows: [
@@ -2437,7 +2478,7 @@ if (s.runs) {
             { id: "datastore", name: "data-store", config: { rootDir: join(workdir, "data") } },
           ],
         });
-        await new Promise((r2) => setTimeout(r2, 50));
+        await waitFirst();
         await agent.chat("看看浦发银行的五档盘口。");
         if (agent.close) await agent.close();
       } else if (r.poolProbe !== undefined) {
@@ -2457,6 +2498,7 @@ if (s.runs) {
           async fetchIpoDays() { return new Map([["sh600011", "2026-09-01"]]); },
         };
         const fixed = new Date(Date.UTC(2026, 9, 19, 2, 0, 0));
+        const waitFirst = probeFetchGate(src);
         const agent = new agentMod.Agent({
           profile: "stock",
           extraRows: [
@@ -2465,7 +2507,7 @@ if (s.runs) {
             { id: "datastore", name: "data-store", config: { rootDir: join(workdir, "data") } },
           ],
         });
-        await new Promise((r2) => setTimeout(r2, 50));
+        await waitFirst();
         await agent.chat("跑一下今天的微盘候选池。");
         if (agent.close) await agent.close();
       } else {
@@ -2481,7 +2523,9 @@ if (s.runs) {
   await mock.close();
   if (s.verify) s.verify(workdir, logPath);
   await snapshotStep();
-  if (crashed) process.exit(process.exitCode ?? 0);
+  // crash 后显式退（MCP 子进程可能悬着）——退出码必须非零：crash 是硬信号，
+  // 不能被"verify 绿"吃掉（挂账#11 加固）
+  if (crashed) process.exit(process.exitCode === undefined ? 1 : process.exitCode);
 } else {
   console.log(`  you: ${s.prompt}\n`);
   const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);

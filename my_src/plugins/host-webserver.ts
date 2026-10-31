@@ -625,7 +625,7 @@ export class HostService extends Service {
                 }
                 return sendEnvelope(res, 200, { ok: true, value });
             }
-            if (req.method === "GET") return this.serveStatic(url, res);
+            if (req.method === "GET" || req.method === "HEAD") return this.serveStatic(url, res, req.method === "HEAD");
             return sendEnvelope(res, 404, { ok: false, error: `not found: ${req.method} ${url.pathname}` });
         } catch (e: any) {
             // 语义错误（busy/坏参数/桥抛错）→ 信封 ok:false，HTTP 200——
@@ -634,11 +634,11 @@ export class HostService extends Service {
         }
     }
 
-    private serveStatic(url: URL, res: ServerResponse): void {
+    private serveStatic(url: URL, res: ServerResponse, headOnly = false): void {
         const root = this.config.staticDir ?? process.env.MINI_WEB_STATIC ?? DEFAULT_WEBUI_DIST;
         if (!existsSync(root)) {
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-            res.end("static dir not found (set staticDir, MINI_WEB_STATIC, or build webui: npm run webui)");
+            res.end(headOnly ? undefined : "static dir not found (set staticDir, MINI_WEB_STATIC, or build webui: npm run webui)");
             return;
         }
         const pathname = decodeURIComponent(url.pathname);
@@ -647,16 +647,17 @@ export class HostService extends Service {
         // 前缀守卫：../ 穿越出的路径必然离开 staticDir
         if (file !== resolve(root) && !file.startsWith(resolve(root) + sep)) {
             res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
-            res.end("forbidden");
+            res.end(headOnly ? undefined : "forbidden");
             return;
         }
         if (!existsSync(file) || !statSync(file).isFile()) {
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-            res.end("not found");
+            res.end(headOnly ? undefined : "not found");
             return;
         }
+        // HEAD：头照发（含 content-length 语义由 Node 按 body 推导），不写 body
         res.writeHead(200, { "content-type": CONTENT_TYPES[extname(file)] ?? "application/octet-stream" });
-        res.end(readFileSync(file));
+        res.end(headOnly ? undefined : readFileSync(file));
     }
 }
 
