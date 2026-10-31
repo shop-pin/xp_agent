@@ -80,6 +80,8 @@ export interface PoolConfig {
     priceMin: number;
     peMin: number;
     peMax: number;
+    /** 剔创业板+科创板（挂账#8 开关，2026-10-31；默认 false 行为零漂移）。 */
+    excludeCK: boolean;
     pbMin: number;
     recentDays: number;
 }
@@ -114,7 +116,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
     watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2, closeOutAfterReview: false },
     risk: { maxPositionPct: 0.2, maxDailyLoss: 15_000 },
     exit: { stopLossPct: 0.05, trailingStopPct: 0.05 },
-    pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, pbMin: 0, recentDays: 365 },
+    pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, excludeCK: false, pbMin: 0, recentDays: 365 },
     backtest: { slippage: 0.002, initialCash: 1_000_000 },
 };
 

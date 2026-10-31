@@ -49,6 +49,22 @@ test('pickPool：topN 裁剪按流通市值升序；缺表只剔 N/C 前缀', ()
     assert.ok(pool[0]!.floatCap <= pool[1]!.floatCap, '升序')
 })
 
+test('pickPool：excludeCK 开关剔创业板(sz30)/科创板(sh68)——默认关行为零漂移（挂账#8）', () => {
+    const quotes = [
+        q({ code: 'sz300001', floatCap: 6e8 }),   // 创业板
+        q({ code: 'sz301002', floatCap: 7e8 }),   // 创业板注册制段
+        q({ code: 'sh688003', floatCap: 8e8 }),   // 科创板
+        q({ code: 'sh600001', floatCap: 10e8 }),  // 主板
+        q({ code: 'sz000002', floatCap: 12e8 }),  // 主板（深）
+    ]
+    // 默认关：两创在池内（Day1 实跑 20 席占 9 的现状口径）
+    assert.deepEqual(pickPool(quotes, { today: '2026-10-19' }).map((x) => x.code),
+        ['sz300001', 'sz301002', 'sh688003', 'sh600001', 'sz000002'])
+    // 开：只剩主板
+    assert.deepEqual(pickPool(quotes, { excludeCK: true, today: '2026-10-19' }).map((x) => x.code),
+        ['sh600001', 'sz000002'])
+})
+
 test('parseSinaList：per 字段 → pe（第五批判定的"差一行解析"兑现）', () => {
     const rows = [{
         symbol: 'sh600000', name: '浦发银行', trade: '10', pricechange: '0.1',

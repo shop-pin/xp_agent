@@ -418,6 +418,10 @@ export interface PickPoolFilter {
     /** PE 区间（默认 [0, 300]：亏损与爆表剔除；未知 PE 剔除——保守口径）。 */
     peMin?: number;
     peMax?: number;
+    /** 剔创业板（sz30）+科创板（sh68）——挂账#8 开关（2026-10-31）：文章口径
+     *  通用主板微盘；两创 20% 涨跌幅波动放大，需要更纯的主板微盘池时开。
+     *  默认 false（Day1 实跑候选 20 两创占 9 席，行为零漂移）。 */
+    excludeCK?: boolean;
     /** PB 下限（默认 >0：负净资产剔除）。 */
     pbMin?: number;
     /** IPO 日期表（fetchIpoDays 口粮）——次新硬过滤；缺表退化为 N/C 前缀。 */
@@ -443,6 +447,7 @@ export function pickPool(quotes: Quote[], f: PickPoolFilter = {}): Quote[] {
     const kept = quotes.filter((q) => {
         if (q.price <= 0) return false;                                   // 停牌/无效行
         if (isExcludedStock(q, true, true)) return false;                 // ST/退 + 北交所（规则 1-2/1-3 红线）
+        if (f.excludeCK && (q.code.startsWith("sz30") || q.code.startsWith("sh68"))) return false; // 创/科（挂账#8 开关，默认关）
         if (q.amount < amountMin) return false;                           // 流动性死穴
         if (q.price < priceMin) return false;                             // 低价/面值退市死穴
         if (!(q.pe !== undefined && q.pe > peMin && q.pe <= peMax)) return false; // PE 区间（未知=剔除）
@@ -776,7 +781,7 @@ export class MarketDataService extends Service {
         });
         tools.register({
             name: "get_stock_pool",
-            description: "微盘轮动候选池：流通市值最小的 N 只，七道过滤（停牌/ST·退·北交所红线/流动性/低价/PE 区间/PB>0/次新）。"
+            description: "微盘轮动候选池：流通市值最小的 N 只，七道过滤（停牌/ST·退·北交所红线/流动性/低价/PE 区间/PB>0/次新；可选剔创业板+科创板）。"
                 + "数据源：全市场快照 + 东财 IPO 日期表（源不可用退化为 N/C 前缀次新过滤）。研究面工具——产出是候选名单，不是买点。",
             parameters: {
                 type: "object",
@@ -785,6 +790,7 @@ export class MarketDataService extends Service {
                     amountMin: { type: "number", description: "日成交额下限（元，默认 3e7）" },
                     priceMin: { type: "number", description: "股价下限（元，默认 2）" },
                     peMax: { type: "number", description: "PE 上限（默认 300）" },
+                    excludeCK: { type: "boolean", description: "剔除创业板+科创板（默认走策略 pool.excludeCK，当前默认不剔）" },
                     recentDays: { type: "number", description: "次新宽限天数（默认 365）" },
                 },
             },
@@ -802,7 +808,7 @@ export class MarketDataService extends Service {
                 // 池参数 = 策略配置（S14 策略即配置）< 工具入参覆盖（仅覆写有值的键——
                 // spread 后赋 undefined 会把策略默认顶掉）
                 const filter = { ...loadStrategy().pool, ipoDays, today: cnDayStr(this.now().getTime()) };
-                for (const key of ["topN", "amountMin", "priceMin", "peMax", "recentDays"] as const) {
+                for (const key of ["topN", "amountMin", "priceMin", "peMax", "excludeCK", "recentDays"] as const) {
                     const v = input[key];
                     if (v !== undefined) (filter as Record<string, unknown>)[key] = v;
                 }

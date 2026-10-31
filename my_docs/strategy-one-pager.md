@@ -48,7 +48,7 @@
 
 | 规则 | 参数键 | 默认 |
 |---|---|---|
-| 池过滤（流动性/低价/PE/PB/次新/容量） | `pool.amountMin / priceMin / peMin / peMax / pbMin / recentDays / topN` | 3,000 万 / 2 元 / 0 / 300 / 0 / 365 天 / 20 |
+| 池过滤（流动性/低价/PE/PB/次新/容量/创·科开关） | `pool.amountMin / priceMin / peMin / peMax / pbMin / recentDays / topN / excludeCK` | 3,000 万 / 2 元 / 0 / 300 / 0 / 365 天 / 20 / false（剔创/科默认关） |
 | 回测滑点/初始资金 | `backtest.slippage / initialCash` | 0.2% / 100 万 |
 
 ## 六、盯盘编排（会话运行参数——编排调参不入策略四节，权威在 DEFAULT_STRATEGY.watch）
@@ -62,5 +62,5 @@
 1. ~~自动止损（离场节空白——最大缺口）~~ ✅ 2026-10-21 `exit.stopLossPct` 落地（watch 持仓风控唤醒，不自动卖）；~~止盈仍未固化~~ ✅ 2026-10-31 `exit.trailingStopPct` 移动止盈落地（回测校准待 S13 复跑）
 2. ~~挂账 #1：paper-broker 快照价成交 + 漂移拒单~~ ✅ 2026-10-31 落地（滑点 0.2% 同 `backtest.slippage` 单源 + 漂移 >1% 拒）
 3. ~~挂账 #2：maxDailyLoss 收紧~~ ✅ 2026-10-21 DEFAULT 50,000 → 15,000
-4. 挂账 #8：创/科板块开关（2026 实跑候选 20 创/科占 9 席）
+4. ~~挂账 #8：创/科板块开关~~ ✅ 2026-10-31 `pool.excludeCK` 落地（默认 false 零漂移）
 5. 择时层（S13 基线：裸轮动 3 年 −28.8%/回撤 −51.1%——择时是第一个改进方向）
