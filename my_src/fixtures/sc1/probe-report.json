@@ -1,0 +1,86 @@
+{
+  "sh600000": {
+    "wkSelf": {
+      "checked": 106,
+      "missing": 4,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "moSelf": {
+      "checked": 24,
+      "missing": 6,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "wkCorpus": {
+      "checked": 58,
+      "missing": 0,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "moCorpus": {
+      "checked": 23,
+      "missing": 0,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "corpusBars": 641,
+    "cutoff": "2026-10-21"
+  },
+  "sz000001": {
+    "wkSelf": {
+      "checked": 106,
+      "missing": 4,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "moSelf": {
+      "checked": 24,
+      "missing": 6,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "wkCorpus": {
+      "checked": 58,
+      "missing": 0,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "moCorpus": {
+      "checked": 23,
+      "missing": 0,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "corpusBars": 641,
+    "cutoff": "2026-10-21"
+  },
+  "sz300750": {
+    "wkSelf": {
+      "checked": 106,
+      "missing": 4,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "moSelf": {
+      "checked": 24,
+      "missing": 6,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "wkCorpus": {
+      "checked": 58,
+      "missing": 0,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "moCorpus": {
+      "checked": 23,
+      "missing": 0,
+      "maxDiff": 0,
+      "bad": []
+    },
+    "corpusBars": 641,
+    "cutoff": "2026-10-21"
+  }
+}
