@@ -5,7 +5,8 @@
 //   --fetch  用 hist-k（腾讯 qfq）补全 daily-k 覆盖前的老窗口（联网按需，
 //            只补序列断尾的票；缺省零网络）
 // 输入：<dataRoot>/events/{signals,verdicts}.jsonl + daily-k/<day>.jsonl +
-//       paper-ledger.jsonl（paperLedgerPath——与 broker 同一路径）
+//       paper-ledger.jsonl（paperLedgerPath——与 broker 同一路径）+
+//       style-state.jsonl（style-run 产物，存在才打风格注记）
 // 输出：stdout + <dataRoot>/digest/<day>.md——复盘与 my_docs/stock-learnings
 //        的口粮（零 LLM 编译，LLM 只在"读 digest 下判断"时进场）。
 
@@ -18,6 +19,8 @@ import {
 } from "../plugins/data-store.js";
 import { loadStrategy } from "../plugins/strategy.js";
 import { loadKlines } from "./kline.js";
+import { SCHEMA } from "./schema.js";
+import type { StyleStateRow } from "./style.js";
 import {
     aggregateRules, aggregateVerdicts, gradeSignals, gradeVerdicts, marketOverview,
     positionsFromFills, type Series, type SignalRow, type VerdictRow,
@@ -210,6 +213,26 @@ async function main(): Promise<void> {
     out.push("## 六、值得记录的观察（自动旗标）");
     for (const f of flags) out.push(`- ${f}`);
     if (flags.length === 0) out.push("- 今日无新旗标");
+
+    out.push("");
+    out.push("## 七、风格状态（研究面，口径①静态五分位）");
+    const stylePath = join(root, "style-state.jsonl");
+    if (!existsSync(stylePath)) {
+        out.push(`- 未生成——先跑 node dist/backtest/style-run.js（生成 ${stylePath}）`);
+    } else {
+        const st = readSchemaJsonl<StyleStateRow>(stylePath, SCHEMA.STYLE_STATE);
+        const last = st.rows[st.rows.length - 1];
+        if (!last) {
+            out.push("- 状态文件为空——重跑 style-run");
+        } else {
+            const gate = (w: number) => (last.ma[String(w)] ? "开" : "关");
+            const lag = last.day < day ? "（早于本 digest 日——盘后 style-run 刷新）" : "";
+            out.push(`- 截至 ${last.day}${lag}：微盘指数 ${last.micro.toFixed(4)} / 大盘 ${last.macro.toFixed(4)}`
+                + `，当日 spread ${(last.daySpread * 100).toFixed(2)}%，近 5 日合计 ${(last.spread5 * 100).toFixed(2)}%`);
+            out.push(`- 闸位（微盘>MAw，开=在均线上）：${[100, 150, 200, 250].map((w) => `MA${w} ${gate(w)}`).join(" / ")}`);
+            out.push(`- 覆盖 ${last.coverage} 只；周末协议复跑 style-run 刷新（缓存先行）`);
+        }
+    }
 
     const text = out.join("\n") + "\n";
     console.log(text);

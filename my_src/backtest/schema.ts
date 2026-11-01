@@ -2,4 +2,6 @@
 
 export const SCHEMA = {
     HIST_K: "backtest.hist-k",
+    /** 风格状态派生面（style-run 全量重写，digest 只读）。 */
+    STYLE_STATE: "stocks.style-state",
 } as const;

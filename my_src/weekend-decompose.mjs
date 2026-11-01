@@ -144,10 +144,13 @@ console.log(`  ${"基线（无闸）".padEnd(28)} 总收益 ${pct(computeMetrics
 const spread20 = (i) => { let s = 0; for (let j = Math.max(0, i - 20); j < i; j++) s += mAvg(microR, days[j]) - mAvg(macroR, days[j]); return s; };
 applyGate("A1 spread20>0（空仓）", (i) => (spread20(i) > 0 ? 1 : 0));
 applyGate("A1 spread20>0（半仓）", (i) => (spread20(i) > 0 ? 1 : 0.5));
-// A2：微盘指数 > MA200
-const ma200 = (i) => { const from = Math.max(0, i - 200); let s = 0; for (let j = from; j < i; j++) s += mIdx[j]; return s / (i - from || 1); };
-applyGate("A2 微盘>MA200（空仓）", (i) => (mIdx[i - 1] > ma200(i - 1) ? 1 : 0));
-applyGate("A2 微盘>MA200（半仓）", (i) => (mIdx[i - 1] > ma200(i - 1) ? 1 : 0.5));
+// A2：微盘指数 > MAN(w)——敏感性扫描 w ∈ {100,150,200,250}（择时前置①）
+const maN = (w) => (i) => { const from = Math.max(0, i - w); let s = 0; for (let j = from; j < i; j++) s += mIdx[j]; return s / (i - from || 1); };
+for (const w of [100, 150, 200, 250]) {
+    const ma = maN(w);
+    applyGate(`A2 微盘>MA${w}（空仓）`, (i) => (mIdx[i - 1] > ma(i - 1) ? 1 : 0));
+    applyGate(`A2 微盘>MA${w}（半仓）`, (i) => (mIdx[i - 1] > ma(i - 1) ? 1 : 0.5));
+}
 // B：自回撤闸（FULL/HALF/FLAT 状态机，滞回 −5% 恢复；FLAT 10 日后探针回半仓——
 // 否则净值冻结、回撤永不修复，闸死锁在空仓）
 function gateB() {
