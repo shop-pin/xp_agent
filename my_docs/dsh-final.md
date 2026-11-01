@@ -71,6 +71,8 @@
 
 ## 4. dsh 源码导读地图（下一轮的路标）
 
+> 参照物路标（2026-11-01）：旧 zip 快照 `deepseek-harness-master/` 已删，本表路径现以官方克隆 **`E:\deepseek-harness`** 为根（HEAD ce7073d5，2026-10-30）。同步判定见 `dsh-sync-20261101.md`。
+
 读过（mini 有对应物，读的时候有锚）：
 
 | dsh 包 | 对应 mini | 章 |
