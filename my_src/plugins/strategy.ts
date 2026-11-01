@@ -92,6 +92,12 @@ export interface BacktestConfig {
     initialCash: number;
 }
 
+export interface ScreenerConfig {
+    /** 收盘收口链自动跑选股（SC5，2026-11-01）：digest 之后追加 screener-run。
+     *  默认 false——公式库先人工看一段报告再开（未验证的公式不自动进链）。 */
+    autoRun: boolean;
+}
+
 export interface StrategyConfig {
     universe: UniverseConfig;
     signals: SignalsConfig;
@@ -100,6 +106,7 @@ export interface StrategyConfig {
     exit: ExitConfig;
     pool: PoolConfig;
     backtest: BacktestConfig;
+    screener: ScreenerConfig;
 }
 
 /** 默认策略（唯一权威——值 = 各插件历史硬编码的零漂移搬家）。 */
@@ -118,6 +125,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
     exit: { stopLossPct: 0.05, trailingStopPct: 0.05 },
     pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, excludeCK: false, pbMin: 0, recentDays: 365 },
     backtest: { slippage: 0.002, initialCash: 1_000_000 },
+    screener: { autoRun: false },
 };
 
 export function userStrategyPath(): string {
@@ -143,5 +151,6 @@ export function loadStrategy(userPath?: string): StrategyConfig {
         exit: { ...DEFAULT_STRATEGY.exit, ...user.exit },
         pool: { ...DEFAULT_STRATEGY.pool, ...user.pool },
         backtest: { ...DEFAULT_STRATEGY.backtest, ...user.backtest },
+        screener: { ...DEFAULT_STRATEGY.screener, ...user.screener },
     };
 }

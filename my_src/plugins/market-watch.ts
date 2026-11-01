@@ -108,6 +108,37 @@ function spawnDigestRun(day: string): Promise<void> {
     });
 }
 
+/** 选股步骤（SC5）：同形态 spawn screener-run（research 面，结果只进
+ *  screener/<day>.{jsonl,md}）。开关 = strategy.screener.autoRun（默认 false）。 */
+function spawnScreenerRun(day: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath,
+            [join("dist", "backtest", "screener-run.js"), "--day", day],
+            { stdio: ["ignore", "ignore", "pipe"] });
+        let err = "";
+        child.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
+        child.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`screener-run exit ${code}${err.trim() ? `：${err.trim()}` : ""}`));
+        });
+        child.on("error", reject);
+    });
+}
+
+/** 缺省收口链：digest（必跑）→ 选股（strategy.screener.autoRun 开时）。
+ *  spawn 函数可注入——链路组合的测试面。选股失败随收口链 catch 喊出声，
+ *  不阻断自退（与 digest 同语义：可事后手动补跑）。 */
+export function defaultCloseOut(
+    strategy: StrategyConfig,
+    spawnDigest: (day: string) => Promise<void> = spawnDigestRun,
+    spawnScreener: (day: string) => Promise<void> = spawnScreenerRun,
+): (day: string) => Promise<void> {
+    return async (day) => {
+        await spawnDigest(day);
+        if (strategy.screener?.autoRun) await spawnScreener(day);
+    };
+}
+
 export interface WatchConfig {
     /** 策略配置（缺省 loadStrategy()——watch 节参数源）。 */
     strategy?: StrategyConfig;
@@ -375,6 +406,8 @@ export const marketWatchPlugin: Plugin = {
             perCodeWakeCap: config.perCodeWakeCap ?? strategy.watch.perCodeWakeCap,
             stopLossPct: config.stopLossPct ?? strategy.exit.stopLossPct,
             trailingStopPct: config.trailingStopPct ?? strategy.exit.trailingStopPct,
+            // 缺省收口链 = digest + 选股（autoRun 开时）——显式 closeOut 覆盖不受影响
+            closeOut: config.closeOut ?? defaultCloseOut(strategy),
             closeOutAfterReview: config.closeOutAfterReview ?? strategy.watch.closeOutAfterReview,
         });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));

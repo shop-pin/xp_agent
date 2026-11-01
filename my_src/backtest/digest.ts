@@ -158,3 +158,25 @@ export function marketOverview(rows: readonly { chg: number }[]): MarketOverview
         medianChg: median,
     };
 }
+
+// ---------- 选股摘要（SC5：digest 第八节渲染，输入 = screener/<day>.jsonl 行） ----------
+
+export interface ScreenerSummaryRow { code: string; name: string; formulas: string[] }
+
+/** 第八节渲染（纯函数）：按公式归组、每公式最多点名 8 只。 */
+export function renderScreenerSection(rows: readonly ScreenerSummaryRow[]): string[] {
+    if (rows.length === 0) return ["- 空清单"];
+    const perFormula = new Map<string, string[]>();
+    for (const r of rows) {
+        for (const f of r.formulas) {
+            const arr = perFormula.get(f);
+            if (arr) arr.push(`${r.code} ${r.name}`);
+            else perFormula.set(f, [`${r.code} ${r.name}`]);
+        }
+    }
+    const lines: string[] = [`命中 ${rows.length} 票 · ${perFormula.size} 条公式`];
+    for (const [f, list] of perFormula) {
+        lines.push(`- ${f}（${list.length}）：${list.slice(0, 8).join("、")}${list.length > 8 ? " …" : ""}`);
+    }
+    return lines;
+}

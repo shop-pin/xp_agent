@@ -23,7 +23,7 @@ import { SCHEMA } from "./schema.js";
 import type { StyleStateRow } from "./style.js";
 import {
     aggregateRules, aggregateVerdicts, gradeSignals, gradeVerdicts, marketOverview,
-    positionsFromFills, type Series, type SignalRow, type VerdictRow,
+    positionsFromFills, renderScreenerSection, type ScreenerSummaryRow, type Series, type SignalRow, type VerdictRow,
 } from "./digest.js";
 
 function arg(name: string, def: string): string {
@@ -232,6 +232,16 @@ async function main(): Promise<void> {
             out.push(`- 闸位（微盘>MAw，开=在均线上）：${[100, 150, 200, 250].map((w) => `MA${w} ${gate(w)}`).join(" / ")}`);
             out.push(`- 覆盖 ${last.coverage} 只；周末协议复跑 style-run 刷新（缓存先行）`);
         }
+    }
+
+    out.push("");
+    out.push("## 八、选股摘要（screener-run 产物，研究面）");
+    const scPath = join(root, "screener", `${day}.jsonl`);
+    if (!existsSync(scPath)) {
+        out.push("- 今日无选股产出（screener-run 未跑或 strategy.screener.autoRun 关）");
+    } else {
+        const sc = readSchemaJsonl<ScreenerSummaryRow>(scPath, SCHEMA.SCREENER);
+        out.push(...renderScreenerSection(sc.rows));
     }
 
     const text = out.join("\n") + "\n";
