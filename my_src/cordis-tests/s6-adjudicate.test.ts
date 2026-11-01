@@ -29,11 +29,13 @@ test('product 技能层随产品发货 adjudicate，verdict 契约条款完整',
         'record_verdicts',               // S10 裁决事件层：入档条款
         'T+1',                           // S11 验收：当日买入不可卖显式存在
         '盘口',                          // S11：盘口佐证上下文
+        'get_learnings',                 // 挂账#9(b)：确立教训进裁决上下文
+        '失效条件',                       // 教训条目三要素之一（证据/状态/失效条件）
     ]) {
         assert.ok(t.includes(clause), `契约条款「${clause}」应在模板中`)
     }
     assert.deepEqual(skill!.allowedTools, [
-        'get_signals', 'latest_news', 'record_verdicts', 'get_quote',
+        'get_signals', 'latest_news', 'get_learnings', 'record_verdicts', 'get_quote',
         'mcp__tdx__tdx_adjudicate_pack', // M8：已挂载时优先，未挂载退回 get_quote
     ])
 })

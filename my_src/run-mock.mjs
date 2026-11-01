@@ -1595,11 +1595,18 @@ const scenarios = {
     // S6：裁决技能全链——skills+market(两态)+signals+news 全 mock 装配。
     // 真假摔用例：rapid-move 向上信号 × 减持利空新闻 → 契约要求 confidence
     // 压低并点破矛盾（裁决质量本身是手测面；场景锚的是取数链与输入面）。
+    // 挂账#9(b)：取数链首位吃 get_learnings——确立条目进上下文、候选不进。
     needsLog: true,
-    setup: () => {},
+    setup: (dir) => {
+      mkdirSync(join(dir, ".mini-claude", "stocks"), { recursive: true });
+      writeFileSync(join(dir, ".mini-claude", "stocks", "learnings.md"),
+        "- [2026-10-20] GLM lite 烧穿——LLM 高频轮询不可行 | 证据：Day1 复盘 | 状态：确立（永久纪律）| 失效：无\n"
+        + "- [2026-10-19] 单日旗标未复现 | 证据：digest | 状态：候选 | 失效：复现即转试用\n");
+    },
     runs: [{ adjudicateProbe: true }],
     turns: [
       { tools: [{ name: "skill", input: { skill_name: "adjudicate", args: "" } }] },
+      { tools: [{ name: "get_learnings", input: {} }] },
       { tools: [{ name: "get_signals", input: { live: true } }] },
       { tools: [{ name: "latest_news", input: { codes: ["sh600000"], limit: 5 } }] },
       { text: '{"verdicts":[{"code":"sh600000","action":"watch","confidence":0.25,"reasons":["放量上攻与减持公告矛盾"],"risks":["利空落地"]}]}\n\n裁决为研究输出，非投资建议。' },
@@ -1609,17 +1616,21 @@ const scenarios = {
       const check = (name, pass) => { console.log(`  ${pass ? "✓" : "✗"} ${name}`); if (!pass) ok = false; };
       const events = readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
       const reqs = events.filter((e) => e.type === "request" && e.track === "main");
-      check("four main requests (skill -> signals -> news -> verdict)", reqs.length === 4);
+      check("five main requests (skill -> learnings -> signals -> news -> verdict)", reqs.length === 5);
       check("catalog lists /adjudicate",
         typeof reqs[0]?.firstUserText === "string" && reqs[0].firstUserText.includes("- **/adjudicate**:"));
       check("skill activates the adjudicate template (contract rides in)",
         (reqs[1]?.toolResults || []).some((t) => t.content.includes('[Skill "adjudicate" activated]')
           && t.content.includes("只允许四值")));
+      check("get_learnings feeds established entries only (候选 stays out)",
+        (reqs[2]?.toolResults || []).some((t) => t.content.includes("established learnings (1, cap 10)")
+          && t.content.includes("GLM lite 烧穿")
+          && !t.content.includes("单日旗标")));
       check("get_signals(live) refreshes and returns the rapid-move shortlist",
-        (reqs[2]?.toolResults || []).some((t) => t.content.includes("rapid-move")
+        (reqs[3]?.toolResults || []).some((t) => t.content.includes("rapid-move")
           && t.content.includes("sh600000")));
       check("per-stock news pulled with codes filter (bearish fixture for the contradiction case)",
-        (reqs[3]?.toolResults || []).some((t) => t.content.includes("减持")
+        (reqs[4]?.toolResults || []).some((t) => t.content.includes("减持")
           && t.content.includes("快讯 1 条")));
       if (!ok) process.exitCode = 1;
     },

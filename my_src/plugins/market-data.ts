@@ -351,6 +351,51 @@ export function parseWatchlist(text: string): WatchlistEntry[] {
     return out;
 }
 
+// ---------- 教训库（挂账 #9(b)：裁决技能吃确立条目） ----------
+
+/** 教训库路径：与 watchlist/strategy 同区（产品数据面，真身唯一；
+ *  my_docs/stock-learnings.md 只留协议与格式讲解）。 */
+export function learningsPath(): string {
+    return join(homedir(), ".mini-claude", "stocks", "learnings.md");
+}
+
+export interface LearningEntry {
+    /** ISO [YYYY-MM-DD]——新→旧排序键。 */
+    date: string;
+    /** 状态段原文（确立/试用/候选/判死/观察中…），无状态段为空串。 */
+    status: string;
+    /** 原始行——输出零改写，证据与失效条件不丢。 */
+    line: string;
+}
+
+/** 教训条目解析（纯函数）：`- [YYYY-MM-DD] 观察 | 证据：… | 状态：X | 失效…`。
+ *  非 `- [日期]` 开头的行不认（标题/prose 自然跳过），无状态段收空串。 */
+export function parseLearnings(text: string): LearningEntry[] {
+    const out: LearningEntry[] = [];
+    for (const raw of text.split(/\r?\n/)) {
+        const m = raw.match(/^\s*-\s*\[(\d{4}-\d{2}-\d{2})\]\s*(.*)$/);
+        if (!m) continue;
+        let status = "";
+        for (const seg of m[2].split("|")) {
+            const sm = seg.trim().match(/^状态[:：]\s*(.*)$/);
+            if (sm) { status = sm[1].trim(); break; }
+        }
+        out.push({ date: m[1], status, line: raw.trim() });
+    }
+    return out;
+}
+
+/** 裁决上下文选取（纯函数）：只吃确立（判死防复发但不进裁决、候选/试用未成
+ *  立不误导），日期新→旧，上限 cap（默认 10）——token 预算由代码保证，不靠
+ *  模型自觉（同 token 硬预算纪律：模板劝 + 代码钉双层）。 */
+export function establishedLearnings(text: string, cap = 10): string[] {
+    return parseLearnings(text)
+        .filter((e) => e.status.startsWith("确立"))
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+        .slice(0, cap)
+        .map((e) => e.line);
+}
+
 // ---------- 筛选（纯函数，测试可见） ----------
 
 /** 宇宙排除判定（纯函数）：北交所前缀 + ST/退市名称——screen_market 筛选与
@@ -698,6 +743,30 @@ export class MarketDataService extends Service {
                 if (entries.length === 0) return `Watchlist is empty (${path}).`;
                 return [`watchlist (${entries.length}) — ${path}`,
                     ...entries.map((e) => `${e.code}${e.remark ? `  # ${e.remark}` : ""}`)].join("\n");
+            },
+        });
+        tools.register({
+            name: "get_learnings",
+            description: "读取股票教训库中状态=确立 的条目（≤10 条，日期新→旧），/adjudicate 的教训上下文源。"
+                + "文件：~/.mini-claude/stocks/learnings.md，条目格式："
+                + "`- [YYYY-MM-DD] 观察一句话 | 证据：数字出处 | 状态：确立 | 失效条件`。"
+                + "候选/试用/判死条目不进裁决（判死留库防复发）。",
+            parameters: { type: "object", properties: {} },
+            permissionHint: "read",
+            execute: () => {
+                const path = learningsPath();
+                if (!existsSync(path)) {
+                    return `No learnings file yet. Create it at:\n  ${path}\n`
+                        + `Format (one entry per line):\n`
+                        + `  - [2026-10-20] 观察一句话 | 证据：digest/2026-10-20.md §六 | 状态：候选 | 失效条件\n`
+                        + `States: 候选 → 试用 → 确立（进裁决）/ 判死（留库不删）`;
+                }
+                const lines = establishedLearnings(readFileSync(path, "utf-8"));
+                if (lines.length === 0) {
+                    return `No established learnings yet (${path}). `
+                        + `Only entries with 状态：确立 enter adjudication.`;
+                }
+                return [`established learnings (${lines.length}, cap 10) — ${path}`, ...lines].join("\n");
             },
         });
         tools.register({
