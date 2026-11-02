@@ -15,7 +15,8 @@ import { SCHEMA } from "./schema.js";
 import { loadMarketDaily } from "./kseries.js";
 import { baseFromBars } from "./formula.js";
 import { FormulaLibrary } from "./library.js";
-import { loadScreeners, screenerConfigPath } from "./screener-config.js";
+import { loadScreeners, screenerConfigPath, type ScreenerUniverse } from "./screener-config.js";
+import { loadStrategy } from "../plugins/strategy.js";
 import type { KBar } from "./kline.js";
 
 export interface ScreenerRunOptions {
@@ -92,7 +93,12 @@ export function runScreener(opts: ScreenerRunOptions = {}): ScreenerRunResult {
     }
 
     const market = loadMarketDaily(root);
-    const universe = { ...loaded.universe };
+    // 票池分层（2026-11-02）：缺省 ← strategy.screener.universe（用户常设）←
+    // configPath json 层显式值（本次调用显式配置最优先）
+    const strategy = loadStrategy();
+    const universe = {
+        ...loaded.universe, ...(strategy.screener.universe ?? {}), ...loaded.universeExplicit,
+    } as Required<ScreenerUniverse>;
     let universeCount = 0;
     const hits: ScreenerHit[] = [];
     const perFormula = new Map<string, number>();
@@ -132,6 +138,7 @@ export function runScreener(opts: ScreenerRunOptions = {}): ScreenerRunResult {
         universe.excludeBJ ? "剔北交所" : null,
         universe.excludeCK ? "剔创科" : null,
         `成交额≥${(universe.amountMin / 1e4).toFixed(0)}万`,
+        universe.qfq ? "前复权" : null,
     ].filter(Boolean).join(" + ");
     lines.push(`- 宇宙 ${universeCount} 只（${rulesText}）· 公式 ${perFormulaList.length} 条`
         + ` · 停用 ${disabled.length} 条 · 拒装 ${loaded.rejected.length} 条 · 耗时 ${Date.now() - t0}ms`);

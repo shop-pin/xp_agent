@@ -18,7 +18,7 @@
 import {
     ma, ema, sma, ref, hhv, llv, hhvBars, llvBars, sum, std, stdp,
     gt, lt, gte, lte, eq, ne, and, or, not, cross, count, every, exist,
-    barsLast, barsCount, add, sub, mul, div, abs, type Series, type Cond,
+    barsLast, barsCount, add, sub, mul, div, abs, forcast, type Series, type Cond,
 } from "./indicators.js";
 import type { KBar } from "./kline.js";
 
@@ -27,7 +27,8 @@ import type { KBar } from "./kline.js";
 type Tok =
     | { kind: "num"; v: number }
     | { kind: "ident"; name: string }
-    | { kind: "op"; op: string };
+    | { kind: "op"; op: string }
+    | { kind: "str"; v: string };
 
 const IDENT_RE = /^[A-Za-z_一-龥][A-Za-z0-9_一-龥.]*/;
 const NUM_RE = /^[0-9]+(\.[0-9]+)?/;
@@ -50,14 +51,23 @@ function lex(text: string): Tok[] {
             i = end + 1;
             continue;
         }
+        if (ch === "'") {  // TDX 字符串（NAMELIKE('ST') 等）——值不参与语义，仅为可解析
+            const end = text.indexOf("'", i + 1);
+            if (end < 0) throw new FormulaError("字符串 ' 未闭合", i);
+            toks.push({ kind: "str", v: text.slice(i + 1, end) });
+            i = end + 1;
+            continue;
+        }
         const rest = text.slice(i);
         const num = NUM_RE.exec(rest);
         if (num) { toks.push({ kind: "num", v: Number(num[0]) }); i += num[0].length; continue; }
         const ident = IDENT_RE.exec(rest);
         if (ident) { toks.push({ kind: "ident", name: ident[0] }); i += ident[0].length; continue; }
         const two = rest.slice(0, 2);
-        if (two === ":=" || two === "<=" || two === ">=" || two === "<>" || two === "!=" || two === "==") {
-            toks.push({ kind: "op", op: two === "==" ? "=" : two === "<>" ? "!=" : two });
+        if (two === ":=" || two === "<=" || two === ">=" || two === "<>" || two === "!=" || two === "=="
+            || two === "||" || two === "&&") {
+            toks.push({ kind: "op", op: two === "==" ? "=" : two === "<>" ? "!="
+                : two === "||" ? "OR" : two === "&&" ? "AND" : two });
             i += 2;
             continue;
         }
@@ -72,9 +82,16 @@ function lex(text: string): Tok[] {
 export type Expr =
     | { kind: "num"; v: number }
     | { kind: "name"; n: string }
+    | { kind: "str"; v: string }
     | { kind: "bin"; op: string; l: Expr; r: Expr }
     | { kind: "un"; op: string; x: Expr }
     | { kind: "call"; fn: string; args: Expr[] };
+
+/** TDX 绘图语句（STICKLINE/DRAWTEXT 等）——选股语义无操作，解析期整条忽略。 */
+const DRAW_FUNCS = new Set([
+    "STICKLINE", "DRAWTEXT", "DRAWICON", "DRAWNUMBER", "DRAWLINE", "DRAWKLINE",
+    "POLYLINE", "VERTLINE", "STICKLINE1", "DRAWTEXT_FIX", "DRAWNUMBER_FIX", "DRAWICON_FIX",
+]);
 
 export interface Statement { name: string; isOutput: boolean; expr: Expr }
 export interface Program {
@@ -92,7 +109,8 @@ class Parser {
     private eatOp(op: string): void {
         const t = this.peek();
         if (!t || t.kind !== "op" || t.op !== op) {
-            const got = t === undefined ? "EOF" : t.kind === "op" ? t.op : t.kind === "num" ? String(t.v) : t.name;
+            const got = t === undefined ? "EOF" : t.kind === "op" ? t.op
+                : t.kind === "num" ? String(t.v) : t.kind === "str" ? `'${t.v}'` : t.name;
             throw new FormulaError(`期望 "${op}"，实际 "${got}"`, this.i);
         }
         this.i++;
@@ -112,12 +130,24 @@ class Parser {
         const statements: Statement[] = [];
         const outputs: string[] = [];
         while (this.peek()) {
+            const head = this.peek()!;
+            // 绘图语句（STICKLINE(...),COLOR;）整条忽略——选股语义无操作
+            if (head.kind === "ident" && DRAW_FUNCS.has(head.name.toUpperCase())) {
+                const nxt = this.toks[this.i + 1];
+                if (nxt && nxt.kind === "op" && nxt.op === "(") {
+                    this.i++;
+                    this.skipDrawStatement(head.name.toUpperCase());
+                    continue;
+                }
+            }
             const name = this.ident();
             let isOutput: boolean;
             if (this.isOp(":=")) { isOutput = false; this.i++; }
             else if (this.isOp(":")) { isOutput = true; this.i++; }
             else throw new FormulaError(`期望 ":=" 或 ":"（变量 ${name}）`, this.i);
             const expr = this.parseExpr();
+            // TDX 画线属性剥离：,STICK,COLORRED,LINETHICK9 —— 属性=逗号+单记号
+            while (this.isOp(",")) { this.i++; this.i++; }
             this.eatOp(";");
             statements.push({ name: name.toUpperCase(), isOutput, expr });
             if (isOutput) outputs.push(name.toUpperCase());
@@ -126,15 +156,35 @@ class Parser {
         return { statements, outputs, params: new Set() };
     }
 
+    /** 绘图语句跳过：括号深度扫描到配对 )（参数是任意表达式，不解析），再剥属性到 ;。 */
+    private skipDrawStatement(name: string): void {
+        let depth = 0;
+        for (;;) {
+            const t = this.peek();
+            if (!t) throw new FormulaError(`绘图语句 ${name} 未闭合`, this.i);
+            this.i++;
+            if (t.kind === "op" && t.op === "(") depth++;
+            else if (t.kind === "op" && t.op === ")") { depth--; if (depth === 0) break; }
+        }
+        while (this.isOp(",")) { this.i++; this.i++; }
+        this.eatOp(";");
+    }
+
     parseExpr(): Expr { return this.parseOr(); }
     private parseOr(): Expr {
         let l = this.parseAnd();
-        while (this.isKeyword("OR")) { this.i++; l = { kind: "bin", op: "OR", l, r: this.parseAnd() }; }
+        for (;;) {
+            if (this.isKeyword("OR") || this.isOp("OR")) { this.i++; l = { kind: "bin", op: "OR", l, r: this.parseAnd() }; }
+            else break;
+        }
         return l;
     }
     private parseAnd(): Expr {
         let l = this.parseNot();
-        while (this.isKeyword("AND")) { this.i++; l = { kind: "bin", op: "AND", l, r: this.parseNot() }; }
+        for (;;) {
+            if (this.isKeyword("AND") || this.isOp("AND")) { this.i++; l = { kind: "bin", op: "AND", l, r: this.parseNot() }; }
+            else break;
+        }
         return l;
     }
     private isKeyword(kw: string): boolean {
@@ -178,6 +228,7 @@ class Parser {
         const t = this.peek();
         if (!t) throw new FormulaError("表达式意外结束", this.i);
         if (t.kind === "num") { this.i++; return { kind: "num", v: t.v }; }
+        if (t.kind === "str") { this.i++; return { kind: "str", v: t.v }; }
         if (t.kind === "ident") {
             this.i++;
             if (this.isOp("(")) {
@@ -208,17 +259,42 @@ export type Val = Series | Cond;
 type FnDef = {
     /** 窗口类函数在编译期需要的常量参位置（如 MA 第 2 参）。 */
     constArgs?: number[];
-    eval: (args: Val[], consts: number[]) => Val;
+    /** ctx = 基础行情绑定（FINANCE/CAPITAL 反推换手率用）。 */
+    eval: (args: Val[], consts: number[], ctx?: Record<string, Series>) => Val;
 };
 
 const s = (v: Val): Series => (typeof v[0] === "boolean" ? (v as Cond).map((b) => (b ? 1 : 0)) : v as Series);
 const c = (v: Val): Cond => (typeof v[0] === "boolean" ? v as Cond : (v as Series).map((x) => x !== null && x !== undefined && x > 0));
 
+/** 从换手率反推流通股本（手）：TO% = VOL(手)/股本(手)×100 → 股本 = VOL×100/TO。
+ *  无换手率的 bar（hist-k 路径）→ null。FINANCE(7)/CAPITAL 同源。 */
+function capitalFrom(ctx: Record<string, Series>): Series {
+    const to = ctx.TO ?? []; const vol = ctx.V ?? [];
+    return vol.map((v, i) => {
+        const t = to[i];
+        if (v === null || v === undefined || t === null || t === undefined || t <= 0) return null;
+        return (v * 100) / t;
+    });
+}
+
 export const BUILTIN_FUNCS: Record<string, FnDef> = {
     MA: { constArgs: [1], eval: (a, k) => ma(s(a[0]!), k[0]!) },
     EMA: { constArgs: [1], eval: (a, k) => ema(s(a[0]!), k[0]!) },
     SMA: { constArgs: [1, 2], eval: (a, k) => sma(s(a[0]!), k[0]!, k[1]!) },
-    REF: { constArgs: [1], eval: (a, k) => ref(s(a[0]!), k[0]!) },
+    REF: {
+        constArgs: [1],
+        // 统一动态位移：第二参求值后总是序列（数字字面量/params=常数序列，
+        // BARSLAST(cond)=真动态——取上次条件成立时的值）。j<0=窗口不足 null。
+        eval: (a) => {
+            const x = s(a[0]!); const win = s(a[1]!);
+            return x.map((v, i) => {
+                const n = win[i];
+                if (n === null || n === undefined || n < 0) return null;
+                const j = i - n;
+                return j < 0 ? null : (x[j] ?? null);
+            });
+        },
+    },
     HHV: { constArgs: [1], eval: (a, k) => hhv(s(a[0]!), k[0]!) },
     LLV: { constArgs: [1], eval: (a, k) => llv(s(a[0]!), k[0]!) },
     HHVBARS: { constArgs: [1], eval: (a, k) => hhvBars(s(a[0]!), k[0]!) },
@@ -235,6 +311,66 @@ export const BUILTIN_FUNCS: Record<string, FnDef> = {
     BARSLAST: { eval: (a) => barsLast(c(a[0]!)) },
     BARSCOUNT: { eval: (a) => barsCount(s(a[0]!)) },
     CROSS: { eval: (a) => cross(a[0]!, a[1]!) },
+    // TDX 移植高频三件（2026-11-02 用户公式验收轮）：IF 条件选择（DRAWNULL
+    // 作 else 分支=不画→null 传播）、FILTER 信号静默窗（发出后 N 根内不再发）、
+    // BETWEEN 区间判定。FORCAST/FINANCE/NAMELIKE/CODELIKE/SETCODE 不做——
+    // 前者语义重（线性回归）改写用 MA 近似，后者数据面不存在（universe 闸替代）。
+    IF: {
+        eval: (a) => {
+            const cond = c(a[0]!); const x = s(a[1]!); const y = s(a[2]!);
+            return cond.map((b, i) => (b ? x[i] : y[i]));
+        },
+    },
+    FILTER: {
+        constArgs: [1],
+        eval: (a, k) => {
+            const cond = c(a[0]!); const n = k[0]!;
+            const out: Cond = new Array(cond.length).fill(false);
+            let last = Number.NEGATIVE_INFINITY;
+            for (let i = 0; i < cond.length; i++) {
+                if (cond[i] === true && i - last > n) { out[i] = true; last = i; }
+            }
+            return out;
+        },
+    },
+    BETWEEN: {
+        eval: (a) => {
+            const x = s(a[0]!); const lo = s(a[1]!); const hi = s(a[2]!);
+            return x.map((v, i) => (v !== null && lo[i] !== null && hi[i] !== null && v >= lo[i]! && v <= hi[i]!));
+        },
+    },
+    // TDX 原版公式直读补件（2026-11-02 用户公式逐字适配轮）：
+    //   CONST 取末值常量；FORCAST 线性回归外推；NAMELIKE/CODELIKE 恒 false
+    //   （ST/板块过滤由 universe 闸承担——净效果一致）；SETCODE 恒 0（A 股
+    //   沪深分支恒真）；FINANCE/CAPITAL 从当日换手率反推流通股本（TO%=VOL/股本
+    //   → 股本(手)=VOL×100/TO；42=流通市值=C×股本×100），无换手率的历史段 null。
+    CONST: {
+        eval: (a) => {
+            const x = s(a[0]!);
+            let last: number | null = null;
+            for (let i = x.length - 1; i >= 0; i--) {
+                if (x[i] !== null && x[i] !== undefined) { last = x[i]!; break; }
+            }
+            return x.map(() => last);
+        },
+    },
+    FORCAST: { constArgs: [1], eval: (a, k) => forcast(s(a[0]!), k[0]!) },
+    NAMELIKE: { eval: (a) => new Array((a[0] as Series).length).fill(false) },
+    CODELIKE: { eval: (a) => new Array((a[0] as Series).length).fill(false) },
+    FINANCE: {
+        constArgs: [0],
+        eval: (a, k, ctx) => {
+            const which = k[0] ?? Number.NaN;
+            const cap = capitalFrom(ctx ?? {}); // 手
+            if (which === 7) return cap.map((v) => (v === null ? null : v * 100)); // TDX 单位=股
+            if (which === 42) { // 流通市值（元）=C×股本（股）
+                const c = (ctx?.C ?? []);
+                return cap.map((v, i) => (v === null ? null : (c[i] ?? 0) * v * 100));
+            }
+            return cap.map(() => null); // 其余财务字段无数据面——null（比较=false，保守）
+        },
+    },
+    CAPITAL: { eval: (_a, _k, ctx) => capitalFrom(ctx ?? {}) },
 };
 
 // ---------- 编译（一次）与求值（逐票） ----------
@@ -266,10 +402,12 @@ export function loadFormula(text: string, opts: FormulaLoadOptions = {}): Compil
     const indicators = opts.indicators;
     // 静态检查：未知函数 / 未知名字 / 窗口参常量性
     const locals = new Set(program.statements.map((st) => st.name));
-    const bases = new Set(["C", "O", "H", "L", "V", "VOL", "CLOSE", "OPEN", "HIGH", "LOW", "VOLUME", "AMOUNT"]);
+    const bases = new Set(["C", "O", "H", "L", "V", "VOL", "CLOSE", "OPEN", "HIGH", "LOW", "VOLUME", "AMOUNT",
+        "TO", "TURNOVER", "DRAWNULL", "AMO", "SETCODE", "CAPITAL"]);
     const walk = (e: Expr): void => {
         switch (e.kind) {
             case "num": return;
+            case "str": return; // 字符串字面量（NAMELIKE 参数）——无名字可查
             case "name": {
                 const n = e.n.toUpperCase();
                 if (!locals.has(n) && !bases.has(n) && !(n in params)
@@ -290,7 +428,14 @@ export function loadFormula(text: string, opts: FormulaLoadOptions = {}): Compil
                     const a = e.args[i]!;
                     if (a.kind === "num") { program.params.add(String(a.v)); continue; }
                     if (a.kind === "name" && a.n.toUpperCase() in params) { program.params.add(a.n.toUpperCase()); continue; }
-                    const got = a.kind === "name" ? `名字 "${a.n}"（未在 params 提供）` : "表达式（不支持）";
+                    // 本地变量窗口（TDX 网文公式惯用 LLV(X,X) 类写法）：编译期放行，
+                    // 运行期取该变量末值当窗口常量（consts 提取处回退链）
+                    if (a.kind === "name" && locals.has(a.n.toUpperCase())) { continue; }
+                    // 动态窗口特例（2026-11-02 用户公式移植）：REF(X, BARSLAST(cond))
+                    // ——窗口参运行期逐点，其余窗口函数仍严静态（SC2 原则的受控破口）
+                    if (a.kind === "call" && e.fn === "REF" && a.fn === "BARSLAST") { walk(a); continue; }
+                    const got = a.kind === "name" ? `名字 "${a.n}"（未在 params 提供）`
+                        : a.kind === "call" ? `表达式（BARSLAST 仅 REF 第二参支持动态）` : "表达式（不支持）";
                     throw new FormulaError(`${e.fn} 窗口参须为数字字面量或参数名——${got}`, 0);
                 }
                 return;
@@ -305,15 +450,23 @@ export function loadFormula(text: string, opts: FormulaLoadOptions = {}): Compil
     return { program, params, indicators, outputs: program.outputs };
 }
 
-/** 基础行情绑定（C/O/H/L/V/AMOUNT 全别名 → 同一序列）。 */
+/** 基础行情绑定（C/O/H/L/V/AMOUNT 全别名 → 同一序列；TO=换手率百分数，
+ *  hist-k 路径的 bar 无此字段 → null 序列；DRAWNULL=全 null，TDX 画线占位；
+ *  AMO=AMOUNT 别名（TDX 惯用）；SETCODE 恒 0（A 股沪深分支恒真）。 */
 export function baseFromBars(bars: readonly KBar[]): Record<string, Series> {
+    const toArr: Series = bars.map((b) => b.turnover ?? null);
     return {
         C: bars.map((b) => b.close), CLOSE: bars.map((b) => b.close),
         O: bars.map((b) => b.open), OPEN: bars.map((b) => b.open),
         H: bars.map((b) => b.high), HIGH: bars.map((b) => b.high),
         L: bars.map((b) => b.low), LOW: bars.map((b) => b.low),
         V: bars.map((b) => b.volume), VOL: bars.map((b) => b.volume), VOLUME: bars.map((b) => b.volume),
-        AMOUNT: bars.map((b) => b.amount),
+        AMOUNT: bars.map((b) => b.amount), AMO: bars.map((b) => b.amount),
+        TO: toArr, TURNOVER: toArr,
+        DRAWNULL: bars.map(() => null),
+        SETCODE: bars.map(() => 0),
+        // CAPITAL（流通股本，手）从换手率反推：TO%=VOL/股本×100 → 股本=VOL×100/TO
+        CAPITAL: toArr.map((t, i) => (t === null || t === undefined || t <= 0 ? null : (bars[i]!.volume * 100) / t)),
     };
 }
 
@@ -342,6 +495,7 @@ export function runFormula(f: CompiledFormula, base: Record<string, Series>,
     const evalExpr = (e: Expr): Val => {
         switch (e.kind) {
             case "num": return new Array(base.C!.length).fill(e.v);
+            case "str": return new Array(base.C!.length).fill(0); // 字符串参数占位（NAMELIKE 等不消费值）
             case "name": return resolve(e.n);
             case "un": {
                 if (e.op === "NOT") return not(c(evalExpr(e.x)));
@@ -356,12 +510,14 @@ export function runFormula(f: CompiledFormula, base: Record<string, Series>,
                     case "-": return sub(s(l), s(r));
                     case "*": return mul(s(l), s(r));
                     case "/": return div(s(l), s(r));
-                    case ">": return gt(l, r);
-                    case "<": return lt(l, r);
-                    case ">=": return gte(l, r);
-                    case "<=": return lte(l, r);
-                    case "=": return eq(l, r);
-                    case "!=": return ne(l, r);
+                    // 数值比较同算术收缩（TDX 语义：条件=0/1 参与比较，X_36>0 恒等
+                    // X_36——2026-11-02 漏票追凶：布尔直入 cmp 被当 null 致 X_37 假 false）
+                    case ">": return gt(s(l), s(r));
+                    case "<": return lt(s(l), s(r));
+                    case ">=": return gte(s(l), s(r));
+                    case "<=": return lte(s(l), s(r));
+                    case "=": return eq(s(l), s(r));
+                    case "!=": return ne(s(l), s(r));
                     default: throw new FormulaError(`未知运算符 ${e.op}`, 0);
                 }
             }
@@ -370,11 +526,20 @@ export function runFormula(f: CompiledFormula, base: Record<string, Series>,
                 const consts = (fn.constArgs ?? []).map((idx) => {
                     const a = e.args[idx]!;
                     if (a.kind === "num") return a.v;
-                    const p = f.params[(a as { kind: "name"; n: string }).n.toUpperCase()];
-                    if (p !== undefined) return p;
-                    throw new FormulaError(`${e.fn} 第 ${idx + 1} 参须为常量`, 0);
+                    if (a.kind === "name") {
+                        const p = f.params[a.n.toUpperCase()];
+                        if (p !== undefined) return p;
+                        // 本地变量窗口：取该变量末有效值当窗口常量（顺序求值保证已入 values）
+                        const lv = values.get(a.n.toUpperCase());
+                        if (lv !== undefined) {
+                            const sv = (typeof lv[0] === "boolean" ? (lv as Cond).map((b) => (b ? 1 : 0)) : lv as Series);
+                            for (let i = sv.length - 1; i >= 0; i--) if (sv[i] !== null && sv[i] !== undefined) return sv[i]!;
+                        }
+                    }
+                    // 动态窗口（BARSLAST call）：eval 侧自取序列，常量位给 NaN 占位
+                    return Number.NaN;
                 });
-                return fn.eval(e.args.map((a) => evalExpr(a)), consts);
+                return fn.eval(e.args.map((a) => evalExpr(a)), consts, base);
             }
         }
     };

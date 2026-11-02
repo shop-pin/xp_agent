@@ -107,6 +107,8 @@ function buildFixture(dir: string): { root: string; day: string } {
 
 test('引擎全链：宇宙闸+命中+一致行为锚（用户参数改窗 → 引擎同源生效）+ 产物落盘', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sc4-run-'))
+    const prevProfile = process.env.USERPROFILE
+    process.env.USERPROFILE = dir  // 密封 strategy.json（runScreener 经 loadStrategy 读家目录）
     try {
         const { root, day } = buildFixture(dir)
         const configPath = writeConfig(dir, {
@@ -130,12 +132,16 @@ test('引擎全链：宇宙闸+命中+一致行为锚（用户参数改窗 → �
         assert.ok(md.includes('# 选股报告 ' + day))
         assert.ok(md.includes('浦发银行'))
     } finally {
+        if (prevProfile === undefined) delete process.env.USERPROFILE
+        else process.env.USERPROFILE = prevProfile
         rmSync(dir, { recursive: true, force: true })
     }
 })
 
 test('引擎边界：--formula 不在库内点名可用清单；指定日无收口明确报错', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sc4-run-'))
+    const prevProfile = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
     try {
         const { root, day } = buildFixture(dir)
         const configPath = screenerConfigPath()
@@ -143,6 +149,8 @@ test('引擎边界：--formula 不在库内点名可用清单；指定日无收�
         assert.throws(() => runScreener({ root, configPath, day: '2026-01-01' }), /无 daily-k 收口/)
         void day
     } finally {
+        if (prevProfile === undefined) delete process.env.USERPROFILE
+        else process.env.USERPROFILE = prevProfile
         rmSync(dir, { recursive: true, force: true })
     }
 })
@@ -151,6 +159,8 @@ test('宇宙闸单测：ST/退市/北交所/创科/停牌/零价/流动性逐条
     // 经由引擎的 universe 行为在 fixture 层已锚；此处钉 universeGate 语义边界
     // （通过导出面间接——直接构造跑一次，断言拒装口径）
     const dir = mkdtempSync(join(tmpdir(), 'sc4-run-'))
+    const prevProfile = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
     try {
         const { root, day } = buildFixture(dir)
         const kDir = join(root, 'daily-k')
@@ -170,6 +180,38 @@ test('宇宙闸单测：ST/退市/北交所/创科/停牌/零价/流动性逐条
         assert.ok(!codes.includes('sz300001'), '创科剔（excludeCK 开）')
         assert.ok(codes.includes('sh600000'), '正常票在')
     } finally {
+        if (prevProfile === undefined) delete process.env.USERPROFILE
+        else process.env.USERPROFILE = prevProfile
         rmSync(dir, { recursive: true, force: true })
+    }
+})
+
+test('公式目录装载：*.txt 装 / .off.txt 停用 / 覆盖内置同名（2026-11-02 用户形态）', () => {
+    const savedFormulas = process.env.MINI_FORMULAS_DIR
+    const home = mkdtempSync(join(tmpdir(), 'sc4-fdir-'))
+    const fdir = join(home, 'formulas')
+    mkdirSync(join(fdir, 'indicators'), { recursive: true })
+    mkdirSync(join(fdir, 'screeners'), { recursive: true })
+    writeFileSync(join(fdir, 'indicators', 'MYIND.txt'), 'MA3:MA(C,3); XOUT:MA3>0;')
+    writeFileSync(join(fdir, 'indicators', 'DEAD.off.txt'), 'A:C;')
+    writeFileSync(join(fdir, 'screeners', 'my-scr.txt'), 'XG:CROSS(MYIND.MA3, C);')
+    writeFileSync(join(fdir, 'screeners', 'vol-surge.off.txt'), 'XG:C>0;')
+    process.env.MINI_FORMULAS_DIR = fdir
+    try {
+        const loaded = loadScreeners(join(home, 'no-json.json'))
+        // .off.txt 指标跳过装载；MYIND 编译入列
+        assert.ok(loaded.indicators.some((d) => d.id === 'MYIND'), '目录指标应装载')
+        assert.ok(!loaded.indicators.some((d) => d.id === 'DEAD'), '.off 指标应跳过')
+        // 覆盖内置同名 screener → enabled:false 进停用清单（原公式仍注册）
+        const vs = loaded.screeners.find((s) => s.id === 'vol-surge')
+        assert.ok(vs && !vs.enabled, '.off 应停用同名内置')
+        // 新 screener 装载且跨引用目录指标
+        const my = loaded.screeners.find((s) => s.id === 'my-scr')
+        assert.ok(my && my.enabled, '目录选股公式应装载')
+        assert.ok(loaded.rejected.every((r) => !r.id.startsWith('indicator:MYIND')), '好公式不应拒装')
+    } finally {
+        if (savedFormulas === undefined) delete process.env.MINI_FORMULAS_DIR
+        else process.env.MINI_FORMULAS_DIR = savedFormulas
+        rmSync(home, { recursive: true, force: true })
     }
 })

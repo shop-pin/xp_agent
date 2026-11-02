@@ -27,11 +27,16 @@ export interface KBar {
     volume: number;
     /** 成交额（元；腾讯 qfqday 无此字段——近似 close×volume×100，见头注近似④）。 */
     amount: number;
+    /** 换手率（百分数，如 2.5 = 2.5%）；hist-k（腾讯）无此字段——只有 daily-k 路径的 bar 带。 */
+    turnover?: number;
 }
 
 /** 腾讯 fqkline 响应 → KBar[]（纯函数，fixture 钉格式：
- *  data.<code>.qfqday = [["YYYY-MM-DD",open,close,high,low,volume(手)],…]）。
- *  qfq 缺失时回退 data.<code>.day（非复权键）。 */
+ *  data.<code>.qfqday = [["YYYY-MM-DD",open,close,high,low,volume],…]）。
+ *  qfq 缺失时回退 data.<code>.day（非复权键）。
+ *  量纲（2026-11-02 选股对数轮实锤）：主板 vol=手、科创板（sh68）vol=股
+ *  ——同一接口两种单位（虹软 1250 万"手"=不可能，÷100 后与 sina daily-k
+ *  精确吻合），解析层归一到手。 */
 export function parseTencentKlines(text: string, code: string): KBar[] {
     let json: { data?: Record<string, { qfqday?: string[][]; day?: string[][] }> };
     try {
@@ -41,12 +46,13 @@ export function parseTencentKlines(text: string, code: string): KBar[] {
     }
     const node = json.data?.[code];
     const rows = node?.qfqday ?? node?.day ?? [];
+    const unitFix = code.startsWith("sh68") ? 100 : 1; // 科创板量=股 → 手
     const out: KBar[] = [];
     for (const row of rows) {
         const [day, open, close, high, low, volume] = row;
         const c = Number(close);
         if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(c)) continue;
-        const vol = Number(volume);
+        const vol = Math.round(Number(volume) / unitFix);
         out.push({
             day, open: Number(open), close: c, high: Number(high), low: Number(low),
             volume: vol, amount: Math.round(c * vol * 100), // 近似④

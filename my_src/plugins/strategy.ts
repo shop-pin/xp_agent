@@ -96,6 +96,17 @@ export interface ScreenerConfig {
     /** 收盘收口链自动跑选股（SC5，2026-11-01）：digest 之后追加 screener-run。
      *  默认 false——公式库先人工看一段报告再开（未验证的公式不自动进链）。 */
     autoRun: boolean;
+    /** 票池与数据口径（2026-11-02 用户定，通达信对齐）：全部 A 股=剔北交
+     *  （excludeBJ）+ 创科保留（excludeCK:false）；剔除 ST 选项（excludeST）；
+     *  前复权选项（qfq——数据面当前固定前复权，此标记为口径声明与报告注记）；
+     *  amountMin=0 表示不剔成交额（公式内自带 AMO 闸，universe 不叠加）。 */
+    universe?: {
+        excludeST?: boolean;
+        excludeBJ?: boolean;
+        excludeCK?: boolean;
+        amountMin?: number;
+        qfq?: boolean;
+    };
 }
 
 export interface StrategyConfig {

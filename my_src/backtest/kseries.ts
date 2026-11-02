@@ -42,7 +42,10 @@ export function loadMarketDaily(root: string = dataRootPath()): Map<string, KBar
             rows = readSchemaJsonl<DailyKRow>(join(kDir, `${d}.jsonl`), SCHEMA_DAILY_K).rows;
         } catch { continue; }
         for (const r of rows) {
-            const bar: KBar = { day: d, open: r.o, close: r.c, high: r.h, low: r.l, volume: r.vol, amount: r.amt };
+            const bar: KBar = {
+                day: d, open: r.o, close: r.c, high: r.h, low: r.l, volume: r.vol, amount: r.amt,
+                ...(r.to !== undefined ? { turnover: r.to } : {}),
+            };
             const arr = out.get(r.code);
             if (!arr) { out.set(r.code, [bar]); continue; }
             const last = arr[arr.length - 1]!;

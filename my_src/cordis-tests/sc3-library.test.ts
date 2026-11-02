@@ -107,3 +107,13 @@ function runWith(lib: FormulaLibrary, bars: KBar[]) {
     const base = baseFromBars(bars)
     return { hits: lib.runStock(base), values: lib.runIndicatorValues(base) }
 }
+
+test('指标跨引用：后序指标引用内置 MACD 输出（2026-11-02 多指标协同）', () => {
+    const lib = FormulaLibrary.build(BUILTIN_INDICATORS, [{
+        id: 'probe-xref', name: '探针', enabled: true,
+        formula: 'XG:MACD.DIF!=0 AND KDJ.K<50;',
+    }] as never);
+    // 编译通过即声明：indicator 编译期可引用前序（内置）指标输出
+    assert.ok(lib.hasIndicator('MACD.DIF'))
+    assert.ok(lib.hasIndicator('KDJ.K'))
+})

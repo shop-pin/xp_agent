@@ -30,6 +30,20 @@ test('parseTencentKlines：fixture 对拍（2026-10-21 真响应录样，amount=
     assert.equal(broken.length, 0)
 })
 
+test('parseTencentKlines：科创板量纲归一（腾讯 sh68 返回股，÷100→手；2026-11-02 选股对数轮实锤）', () => {
+    // 虹软科技 sh688088 真响应节选：vol=12520751（股）——sina daily-k 同日=125208 手
+    const text = JSON.stringify({
+        code: 0, msg: "", data: {
+            sh688088: { qfqday: [
+                ["2026-11-02", "28.97", "31.23", "31.58", "28.70", "12520751.000"],
+            ] },
+        },
+    })
+    const bars = parseTencentKlines(text, "sh688088")
+    assert.equal(bars[0]!.volume, 125208, '÷100 归一到手，与 sina 对齐')
+    assert.equal(bars[0]!.amount, Math.round(31.23 * 125208 * 100), 'amount 随量纲同步修正')
+})
+
 // ---------- 10 交易日重放手算 ----------
 
 const bar = (day: string, close: number, amount = 5e7) => ({

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { defaultCloseOut } from '../plugins/market-watch.js'
+import { defaultCloseOut, screenerSummary } from '../plugins/market-watch.js'
 import { loadStrategy, DEFAULT_STRATEGY } from '../plugins/strategy.js'
 import { renderScreenerSection, type ScreenerSummaryRow } from '../backtest/digest.js'
 
@@ -80,6 +80,34 @@ test('mergeIntoWatchlist：去重、来源注记、非法码剔除（HOME 沙箱
     } finally {
         process.env.HOME = savedHome
         process.env.USERPROFILE = savedProfile
+        rmSync(dir, { recursive: true, force: true })
+    }
+})
+
+test('screenerSummary：自定义公式打明细、内置只计数、文件缺席静默（2026-11-02 terminal 需求）', () => {
+    const prevData = process.env.MINI_STOCKS_DATA_DIR
+    const dir = mkdtempSync(join(tmpdir(), 'sc5-summary-'))
+    process.env.MINI_STOCKS_DATA_DIR = dir  // dataRootPath 密封（env 优先）
+    try {
+        const scDir = join(dir, 'screener')
+        mkdirSync(scDir, { recursive: true })
+        const head = JSON.stringify({ v: 1, schema: 'stocks.screener', day: '2026-11-02', universe: 5025, formulas: ['FLZT_xuanguqi', 'kdj-golden'] })
+        const rows = [
+            JSON.stringify({ code: 'sh600020', name: '中原高速', close: 4.32, formulas: ['FLZT_xuanguqi'] }),
+            JSON.stringify({ code: 'sh600754', name: '锦江酒店', close: 20.57, formulas: ['FLZT_xuanguqi'] }),
+            JSON.stringify({ code: 'sz000001', name: '平安银行', close: 10.5, formulas: ['kdj-golden'] }),
+        ]
+        writeFileSync(join(scDir, '2026-11-02.jsonl'), [head, ...rows].join('\n') + '\n')
+        const text = screenerSummary('2026-11-02')
+        assert.ok(text.includes('🎯 选股完成 2026-11-02'), '头行带计数')
+        assert.ok(text.includes('kdj-golden'), '内置公式只出现在计数行')
+        assert.ok(text.includes('FLZT_xuanguqi 命中 2 只'), '自定义公式打明细')
+        assert.ok(text.includes('sh600020 中原高速 收 4.32'), '命中行明细')
+        assert.ok(!text.includes('kdj-golden 命中'), '内置公式不打明细（防刷屏）')
+        assert.equal(screenerSummary('1999-01-01'), '', '无产物日返回空串')
+    } finally {
+        if (prevData === undefined) delete process.env.MINI_STOCKS_DATA_DIR
+        else process.env.MINI_STOCKS_DATA_DIR = prevData
         rmSync(dir, { recursive: true, force: true })
     }
 })

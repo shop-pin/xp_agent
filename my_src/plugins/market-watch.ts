@@ -21,6 +21,7 @@
 // 被唤醒）。注记 meta/note(key:"watch") 进 SessionLog（日志即真相）。
 
 import { spawn } from "child_process";
+import { existsSync } from "fs";
 import { join } from "path";
 import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
@@ -29,6 +30,10 @@ import type { CommandService } from "../services/commands.js";
 import type { UiService } from "../services/ui-service.js";
 import type { SessionLog } from "../services/session-log.js";
 import type { ScheduleService } from "../services/schedule.js";
+import { BUILTIN_SCREENERS } from "../backtest/formulas/builtin.js";
+import { SCHEMA } from "../backtest/schema.js";
+import type { ScreenerHit } from "../backtest/screener-run.js";
+import { dataRootPath, readSchemaJsonl } from "./data-store.js";
 import { marketPhase, type MarketDataService } from "./market-data.js";
 import { cnDay, cnHm, type PaperBroker } from "./paper-broker.js";
 import type { Signal } from "./signal-engine.js";
@@ -139,6 +144,34 @@ export function defaultCloseOut(
     };
 }
 
+/** 选股摘要进 terminal（2026-11-02 用户需求）：收口链选股完成后读当日
+ *  screener/<day>.jsonl——自定义公式（非内置库）打命中明细，内置只打计数
+ *  （kdj-golden 七百只级，明细会刷屏）；单公式明细 cap 200 行。文件缺席
+ *  （选股未跑/失败）返回空串——失败路径已有 catch 喊，这里不重复。 */
+export function screenerSummary(day: string): string {
+    const builtinIds = new Set(BUILTIN_SCREENERS.map((s) => s.id));
+    const path = join(dataRootPath(), "screener", `${day}.jsonl`);
+    if (!existsSync(path)) return "";
+    let rows: ScreenerHit[];
+    try {
+        rows = readSchemaJsonl<ScreenerHit>(path, SCHEMA.SCREENER).rows;
+    } catch {
+        return ""; // 坏文件不挡收口链
+    }
+    const counts = new Map<string, number>();
+    for (const h of rows) for (const f of h.formulas) counts.set(f, (counts.get(f) ?? 0) + 1);
+    if (counts.size === 0) return "";
+    const head = [...counts.entries()].map(([id, n]) => `${id} ${n}`).join(" / ");
+    const lines = [`🎯 选股完成 ${day}（${head}）`];
+    for (const [id] of [...counts.entries()].filter(([fid]) => !builtinIds.has(fid))) {
+        const hits = rows.filter((h) => h.formulas.includes(id));
+        lines.push(`${id} 命中 ${hits.length} 只：`);
+        for (const h of hits.slice(0, 200)) lines.push(`  ${h.code} ${h.name} 收 ${h.close.toFixed(2)}`);
+        if (hits.length > 200) lines.push(`  …（其余 ${hits.length - 200} 只略）`);
+    }
+    return lines.join("\n");
+}
+
 export interface WatchConfig {
     /** 策略配置（缺省 loadStrategy()——watch 节参数源）。 */
     strategy?: StrategyConfig;
@@ -192,9 +225,11 @@ export class WatchService extends Service {
     private closeOutAfterReview: boolean;
     private prompts: WatchPrompts;
     private tickMs: number;
+    private strategy: StrategyConfig;
 
     constructor(ctx: Context, name: string, config: WatchConfig = {}) {
         super(ctx, name);
+        this.strategy = config.strategy ?? loadStrategy();
         this.wake = config.wake;
         this.cooldown = config.signalCooldownMs ?? 180_000;
         this.maxSignalAgeMs = config.maxSignalAgeMs ?? this.cooldown * 2;
@@ -386,6 +421,12 @@ export class WatchService extends Service {
                 this.ctx.get<UiService>("ui")?.error(`收盘 digest 失败：${e instanceof Error ? e.message : String(e)}`);
             }
         }
+        // 选股摘要进 terminal（2026-11-02 用户需求）：autoRun 开时收口链已跑完
+        // 选股——自退前把命中清单打出来（内置公式只计数，自定义公式打明细）
+        if (this.strategy.screener?.autoRun) {
+            const summary = screenerSummary(this.day);
+            if (summary) this.ctx.get<UiService>("ui")?.info(summary);
+        }
         if (this.exit) {
             this.ctx.get<UiService>("ui")?.info("👋 复盘完成，盯盘会话自退");
             this.exit();
@@ -401,6 +442,7 @@ export const marketWatchPlugin: Plugin = {
         const strategy = config.strategy ?? loadStrategy();
         const watch = new WatchService(ctx, "watch", {
             ...config,
+            strategy,
             signalCooldownMs: config.signalCooldownMs ?? strategy.watch.signalCooldownMs,
             maxSignalAgeMs: config.maxSignalAgeMs ?? strategy.watch.maxSignalAgeMs,
             perCodeWakeCap: config.perCodeWakeCap ?? strategy.watch.perCodeWakeCap,

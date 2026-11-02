@@ -158,3 +158,103 @@ test('坏公式9：注释未闭合', () => {
 test('坏公式10：非法字符', () => {
     expectError('A:1@2;', '无法识别的字符')
 })
+
+// ---------- TDX 移植高频件（2026-11-02 用户公式验收轮） ----------
+
+test('金例9：IF 条件选择 + DRAWNULL 作 else=不画（null 传播）', () => {
+    const f = loadFormula('A:IF(C>2,100,DRAWNULL); B:IF(C>2,C,0*C);')
+    const out = runFormula(f, baseFromBars(bars([1, 2, 3, 4])))
+    assert.deepEqual(out.values.get('A'), [null, null, 100, 100])
+    assert.deepEqual(out.values.get('B'), [0, 0, 3, 4])
+    // DRAWNULL 参与 XG 比较 = null → false（保守：不画出即不命中）
+    const xg = evalXg('A:IF(C>3,1,DRAWNULL); XG:A=1;', bars([1, 2, 3, 4]))
+    assert.deepEqual(xg, [false, false, false, true])
+})
+
+test('金例10：FILTER 信号静默窗——发出后 N 根内不再发', () => {
+    // C=[5,1,5,5,1,5]，cond=C>3 → [T,F,T,T,F,T]；N=2：
+    // idx0 发出；idx2 距 0=2 不>2 屏蔽；idx3 距 0=3>2 发出；idx5 距 3=2 屏蔽
+    const xg = evalXg('XG:FILTER(C>3,2);', bars([5, 1, 5, 5, 1, 5]))
+    assert.deepEqual(xg, [true, false, false, true, false, false])
+})
+
+test('金例11：BETWEEN 区间判定含边界 + null 传播', () => {
+    const xg = evalXg('XG:BETWEEN(C,2,3);', bars([1, 2, 3, 4]))
+    assert.deepEqual(xg, [false, true, true, false])
+})
+
+test('金例12：TO 换手率基础名（百分数口径）——有值判定 / hist-k 缺失=null→false', () => {
+    const withTo: KBar[] = bars([10, 10]).map((b, i) => ({ ...b, turnover: [1.5, 3.5][i] }))
+    const xg = evalXg('XG:TO>3;', withTo)
+    assert.deepEqual(xg, [false, true])
+    const noTo = evalXg('XG:TO>0;', bars([10, 10]))
+    assert.deepEqual(noTo, [false, false])
+})
+
+test('金例13：REF 动态窗口 BARSLAST——取上次条件成立时的值', () => {
+    // C=[3,1,1,4,5]，cond=C>2 → [T,F,F,T,T]；BARSLAST 距上次成立=[0,1,2,0,0]
+    // REF(C,BARSLAST(C>2))：逐点回看 n 根——idx0 n=0 取自身 3、idx1 n=1 取 C[0]=3、
+    // idx2 n=2 取 C[0]=3、idx3 n=0 取自身 4、idx4 取自身 5
+    const f = loadFormula('R:REF(C,BARSLAST(C>2));')
+    const out = runFormula(f, baseFromBars(bars([3, 1, 1, 4, 5])))
+    assert.deepEqual(out.values.get('R'), [3, 3, 3, 4, 5])
+    // 编译期：BARSLAST 只放行 REF 第二参，其他位置仍拒
+    expectError('A:HHV(C,BARSLAST(C>2));', 'BARSLAST 仅 REF 第二参支持动态')
+})
+
+// ---------- TDX 原版公式直读适配（2026-11-02 用户公式逐字轮） ----------
+
+test('金例16：|| 与 && 词法（TDX 原版惯用）', () => {
+    const xg = evalXg('XG:(C>3||C<1)&&(C<10);', bars([5]))
+    assert.deepEqual(xg, [true])
+})
+
+test('金例17：画线属性剥离 + 绘图语句忽略——TDX 指标原样可编译', () => {
+    const f = loadFormula(
+        'LONG:IF(C>2,100,DRAWNULL),STICK,COLORRED,LINETHICK9; MIMI:=FILTER(C>2,3)*100,COLORYELLOW,LINETHICK3;'
+        + 'STICKLINE(C>2,0,100,2,0),COLORMAGENTA;'
+        + "DRAWTEXT(C>2,90,'   主升启动'),COLORYELLOW;")
+    assert.deepEqual([...f.outputs], ['LONG'])
+})
+
+test('金例18：CONST 取末值 + FORCAST 线性回归外推手算', () => {
+    const f = loadFormula('K:CONST(C);')
+    const out = runFormula(f, baseFromBars(bars([1, 2, 3])))
+    assert.deepEqual(out.values.get('K'), [3, 3, 3])
+    // FORCAST(C,4) 窗口 [1,2,3,4]：斜率 1、截距 0 → 当前位（t=3）拟合值=4
+    const g = loadFormula('F:FORCAST(C,4);')
+    const r = runFormula(g, baseFromBars(bars([1, 2, 3, 4, 9])))
+    assert.equal(r.values.get('F')![3], 4)
+    assert.equal(r.values.get('F')![2], null, '窗口未满=null')
+})
+
+test('金例19：FINANCE(7)/CAPITAL 反推——HSL 公式语义=真换手百分数（单位锚）', () => {
+    // VOL=1000 手、TO=2.5% → 股本=1000×100/2.5=40000 手=400 万股
+    const withTo: KBar[] = bars([10]).map((b) => ({ ...b, turnover: 2.5 }))
+    const f = loadFormula('CAP:CAPITAL; F7:FINANCE(7); HSL:IF((SETCODE==0||SETCODE==1),100*VOL,VOL)/(FINANCE(7)/100);')
+    const out = runFormula(f, baseFromBars(withTo))
+    assert.equal(out.values.get('CAP')![0], 40000, 'CAPITAL=手')
+    assert.equal(out.values.get('F7')![0], 4_000_000, 'FINANCE(7)=股（TDX 单位）')
+    assert.equal(out.values.get('HSL')![0], 2.5, 'HSL=真换手%（用户公式 X5 闸语义）')
+    // 无换手率（hist-k 形态）→ null → X5 闸=false 保守
+    const noTo = evalXg('XG:FINANCE(7)>0;', bars([10]))
+    assert.deepEqual(noTo, [false])
+})
+
+test('金例20：NAMELIKE/CODELIKE 恒 false（universe 闸承担）+ 本地变量窗口 LLV(X,X)', () => {
+    const xg = evalXg("X2:=NOT(NAMELIKE('ST') OR NAMELIKE('*ST') OR NAMELIKE('S')); XG:X2 AND NOT(CODELIKE(1));", bars([5]))
+    assert.deepEqual(xg, [true], '两者恒 false → NOT 恒 true')
+    // LLV(X_52,X_52)：窗口参=本地变量 → 运行期取末值常量（X_52=[F,T] 末值 true=1）
+    const f = loadFormula('X_52:=C>1; L:LLV(X_52,X_52);')
+    const out = runFormula(f, baseFromBars(bars([1, 2])))
+    assert.deepEqual(out.values.get('L'), [0, 1], '窗口=末值 1 → 逐位取自身收缩')
+})
+
+test('金例21：布尔序列参与数值比较=0/1 收缩（X_36>0 恒等自身——漏票追凶修复锚）', () => {
+    // EXIST(X_36>0,36)：X_36 是 Cond——修复前 cmp 把 boolean 当 null → 全 false
+    const xg = evalXg('X36:C>2; B:EXIST(X36>0,3); XG:B;', bars([1, 2, 3, 4]))
+    assert.deepEqual(xg, [false, false, true, true])
+    // 布尔与数值直接比较：真(1)>0 真、假(0)>0 假
+    const xg2 = evalXg('XG:(C>2)>0 AND (C>2)==(C>1);', bars([3]))
+    assert.deepEqual(xg2, [true])
+})

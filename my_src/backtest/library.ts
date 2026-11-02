@@ -32,12 +32,16 @@ export class FormulaLibrary {
         private readonly indicatorNames: Set<string>,
     ) {}
 
-    /** 从定义构建（内置或用户合并后）——任何坏定义 fail-fast。 */
+    /** 从定义构建（内置或用户合并后）——任何坏定义 fail-fast。
+     *  指标按定义序编译，前序指标输出可被后序指标引用（2026-11-02 用户
+     *  "多指标协同"需求：SRC 引用内置 MACD.DIF 同缝）——顺序语义=TDX
+     *  先定义后引用；运行期产出同样按序累积注入。 */
     static build(indicatorDefs: readonly IndicatorDef[], screenerDefs: readonly ScreenerDef[]): FormulaLibrary {
         const indicators: CompiledIndicator[] = [];
         const indicatorNames = new Set<string>();
         for (const def of indicatorDefs) {
-            const compiled = loadFormula(def.formula, { params: def.params });
+            const available = new Map<string, Val>([...indicatorNames].map((n) => [n, []]));
+            const compiled = loadFormula(def.formula, { params: def.params, indicators: available });
             for (const out of compiled.outputs) indicatorNames.add(`${def.id.toUpperCase()}.${out.toUpperCase()}`);
             indicators.push({ def, compiled });
         }
@@ -54,11 +58,12 @@ export class FormulaLibrary {
         return this.indicatorNames.has(name.toUpperCase());
     }
 
-    /** 逐票求值指标层：产出复合键（"ID.输出名" → 序列/条件）。 */
+    /** 逐票求值指标层：产出复合键（"ID.输出名" → 序列/条件）；按序累积——
+     *  后序指标可消费前序指标的产出（与 build 的顺序编译同缝）。 */
     runIndicatorValues(base: Record<string, Series>): Map<string, Val> {
         const produced = new Map<string, Val>();
         for (const ind of this.indicators) {
-            const out = runFormula(ind.compiled, base);
+            const out = runFormula(ind.compiled, base, produced);
             for (const [name, val] of out.values) {
                 if (ind.compiled.outputs.includes(name)) {
                     produced.set(`${ind.def.id.toUpperCase()}.${name}`, val);

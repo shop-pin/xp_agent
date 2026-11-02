@@ -265,3 +265,26 @@ export const sub = (a: Series, b: Series): Series => zip2(a, b, (x, y) => x - y)
 export const mul = (a: Series, b: Series): Series => zip2(a, b, (x, y) => x * y);
 export const div = (a: Series, b: Series): Series => zip2(a, b, (x, y) => (y === 0 ? NaN : x / y));
 export const abs = (a: Series): Series => lift(a, Math.abs);
+
+/** FORCAST(X,N)：N 周期线性回归在**当前位**的拟合值（TDX 同名函数——2026-11-02
+ *  对数轮实锤：中原高速放量日"外推下一根"语义超 BETWEEN 上限、"当前拟合"在
+ *  区间内，通达信选了它 → 语义=当前位拟合）。窗口含 null → null；n<2 → 全 null。 */
+export function forcast(x: Series, n: number): Series {
+    const out: Series = new Array(x.length).fill(null);
+    if (n < 2) return out;
+    for (let i = n - 1; i < x.length; i++) {
+        let sx = 0, sy = 0, sxy = 0, sxx = 0;
+        for (let j = 0; j < n; j++) {
+            const v = x[i - n + 1 + j];
+            if (v === null || v === undefined) { sx = Number.NaN; break; }
+            sx += j; sy += v; sxy += j * v; sxx += j * j;
+        }
+        if (Number.isNaN(sx)) continue;
+        const denom = n * sxx - sx * sx;
+        if (denom === 0) continue;
+        const b = (n * sxy - sx * sy) / denom;
+        const a = (sy - b * sx) / n;
+        out[i] = a + b * (n - 1);
+    }
+    return out;
+}
