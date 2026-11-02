@@ -241,6 +241,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         }
         await host.ready;
         process.once("SIGINT", () => {
+            agent.noteShutdown("sigint");
             void agent.close().then(() => process.exit(0));
         });
         await new Promise<never>(() => {});
@@ -319,7 +320,13 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
         // mid-flight; asking a closed interface throws. Stop asking and let
         // the outer await finish.
         let closed = false;
-        rl.on("close", () => { closed = true; resolve(); });
+        rl.on("close", () => {
+            // stdin EOF（Ctrl+D 空行/终端断开）：2026-11-02 挂机静默死亡排查
+            // 加的留痕——此前这条路径进程无声消失，事后无法与他杀区分
+            agent.noteShutdown("stdin-eof");
+            closed = true;
+            resolve();
+        });
         // SIGINT 两连退出：agent 处理中 → cancel(cause)（停 loop/goal 标志 +
         // 清 inbox + abort 在途请求，busy 时由 agent 自己报告打断）、留在 REPL
         // （send 的 settle 以 abort 错误 reject，经 ask 的 catch 回到提示符）；
@@ -338,6 +345,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
             sigintCount++;
             if (sigintCount >= 2) {
                 console.log("\nBye!\n");
+                agent.noteShutdown("sigint");
                 // 先断 MCP 子进程/定时器，否则它们会吊住进程（issue #8 教训）
                 agent.close().finally(() => process.exit(0));
                 return;

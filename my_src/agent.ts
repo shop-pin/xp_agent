@@ -7,7 +7,7 @@ import { LlmRuntime, assembleStream, MODEL, type Settlement } from "./services/l
 import { Inbox, type AgentHandle, type AgentStatus, type PreStepDecision } from "./services/agents.js";
 import { Context } from "./cordis/context.js";
 import { loadRows, dumpTree } from "./cordis/loader.js";
-import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn } from "./plugins/session-jsonl.js";
+import { sessionJsonlPlugin, readSessionLines, repairUnclosedTurn, sessionDir } from "./plugins/session-jsonl.js";
 import { SkillRegistry } from "./plugins/skills-registry.js";
 import { HostService } from "./plugins/host-webserver.js";
 import { buildPresetFromSkill } from "./plugins/subagent.js";
@@ -28,7 +28,7 @@ import {
     SCHEDULE_WAKEUP_TOOL, dynamicLoopDirective,
 } from "./autonomy.js";
 import { randomUUID } from "crypto";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { UiService } from "./services/ui-service.js";
@@ -46,6 +46,23 @@ import {
 function isAbortLike(e: unknown): boolean {
     const err = e as { name?: string; message?: string };
     return err?.name === "AbortError" || String(err?.message ?? "").includes("aborted");
+}
+
+/** 顶层崩溃留痕：默认行为（stderr + 退出）之前先落一条 shutdown note。挂
+ *  listener 会抑制 Node 的默认崩溃退出——记录后显式 exit(1) 保持原语义。
+ *  模块级守卫：同进程多 Agent（测试）只挂一次，第一个主 agent 的留痕生效。 */
+let crashRecorderInstalled = false;
+function installCrashRecorder(agent: { isSubAgent: boolean; noteShutdown(how: string, extra?: Record<string, unknown>): void }): void {
+    if (crashRecorderInstalled || agent.isSubAgent) return;
+    crashRecorderInstalled = true;
+    process.on("uncaughtException", (e) => {
+        agent.noteShutdown("uncaught-exception", { message: String(e?.stack ?? e).slice(0, 2000) });
+        process.exit(1);
+    });
+    process.on("unhandledRejection", (r) => {
+        agent.noteShutdown("unhandled-rejection", { message: String(r instanceof Error ? r.stack : r).slice(0, 2000) });
+        process.exit(1);
+    });
 }
 
 export interface AgentOptions {
@@ -163,6 +180,10 @@ export class Agent implements AgentHandle {
         if (this.mode === "plan") {
             this.planFilePath = this.generatePlanFilePath();
         }
+        installCrashRecorder({
+            isSubAgent: this.isSubAgent,
+            noteShutdown: (how, extra) => this.noteShutdown(how, extra),
+        });
     }
 
     /** 广告视图：主 agent = 注册表投影（请求体形状，剥 execute/hint）+ 静态
@@ -710,6 +731,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
      *  stdio 把进程吊住）。不做优雅退场戏：close 即断，进程即刻终止。 */
     requestExit(): void {
         void this.close().finally(() => process.exit(0));
+    }
+
+    /** 退出留痕（2026-11-02 挂机静默死亡排查）：优雅退出（SIGINT×2 / stdin EOF）
+     *  与顶层崩溃都往会话文件补一条 shutdown note。绕过 SessionLog——退出路径
+     *  上 close() 可能已摘掉 append listeners，直接 appendFileSync 与
+     *  session-jsonl 同格式同纪律（同步写，崩则丢由读侧半行兜底）。
+     *  关窗/强杀无钩子可挂，仍无痕——挂机进程外部守护是另一层的事。 */
+    noteShutdown(how: string, extra: Record<string, unknown> = {}): void {
+        try {
+            const file = join(sessionDir(), `${this.sessionId}.jsonl`);
+            if (!existsSync(file)) return;
+            appendFileSync(file, JSON.stringify({
+                type: "meta/note", key: "host",
+                value: { kind: "shutdown", how, at: Date.now(), ...extra },
+            }) + "\n");
+        } catch { /* 留痕失败不挡退出 */ }
     }
 
     private setStatus(s: AgentStatus): void {
