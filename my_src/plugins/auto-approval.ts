@@ -120,6 +120,11 @@ export const autoApprovalPlugin = {
             "tools/pre-execute",
             monotonic(async (call, next) => {
                 if (call.mode !== "auto") return next();
+                // 模拟盘交易面（"trade" hint，stock place_order）：TradeGuard 在瀑布
+                // 最外层已做代码级风控，分类器再裁一遍只会把无人值守会话卡死在
+                // 人工门上（2026-11-03 实录：place_order 触发 readline 等键 2h，
+                // 收盘收口链全灭）。实盘 broker（S15）不得声明此 hint。
+                if (call.def?.permissionHint === "trade") return { type: "allow" as const };
                 // fast-path：只读/无副作用工具跳过分类器（集合语义：web_fetch 刻意
                 // 排除——URL 拉取可能带数据出境，分类器必须看到；不能用
                 // permissionHint 取代）

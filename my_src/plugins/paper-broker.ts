@@ -393,7 +393,7 @@ export class PaperBroker extends Service {
                 },
                 required: ["code", "side", "price", "qty"],
             },
-            permissionHint: "exec",
+            permissionHint: "trade",
             execute: async (input) => {
                 const result = await this.submitOrder({
                     code: String(input.code ?? ""),

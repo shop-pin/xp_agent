@@ -48,6 +48,8 @@ interface Mount {
 function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
     broker?: boolean; stopLossPct?: number; trailingStopPct?: number;
     closeOut?: (day: string) => Promise<void> | void; exit?: () => void; closeOutAfterReview?: boolean;
+    postCloseRefine?: boolean;
+    prompts?: { refine?: (pool: string, day: string) => string };
 } = {}): Mount {
     const ctx = new Context()
     new ToolsService(ctx, 'tools')
@@ -77,6 +79,8 @@ function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
         closeOut: opts.closeOut,
         exit: opts.exit,
         closeOutAfterReview: opts.closeOutAfterReview,
+        postCloseRefine: opts.postCloseRefine,
+        prompts: opts.prompts,
     })
     return {
         ctx, watch: ctx.watch!, wakes, schedule, quotes,
@@ -197,6 +201,32 @@ test('收口链开启：复盘 turn 结束 → 先 digest 后自退，一次不�
     m.cleanup()
 })
 
+test('盘后精选（2026-11-03）：收口后先发 refine wake，精选 turn 结束才自退', async () => {
+    const seq: string[] = []
+    const m = mountWatch(180_000, MON_OPEN, {
+        closeOutAfterReview: true,
+        postCloseRefine: true,
+        closeOut: async (day) => { seq.push(`digest:${day}`) },
+        exit: () => { seq.push('exit') },
+        prompts: { refine: (pool, day) => `[refine:${day}]:${pool ? pool.length : 0}` },
+    })
+    m.watch.start()
+    m.tick(MON_CLOSED - MON_OPEN)
+    m.watch.evaluate() // close wake
+    m.ctx.emit('agent/turn-end', { reason: 'review' })
+    await settle()
+    assert.deepEqual(seq, ['digest:2026-10-19'], '收口完成但未自退——精选 turn 在后')
+    assert.ok(m.wakes.some((w) => w.startsWith('[refine:2026-10-19]')), 'refine wake 已发')
+    assert.ok(notes(m.ctx).some((n) => n.value?.kind === 'refine'), 'refine 注记落日志')
+    m.ctx.emit('agent/turn-end', { reason: 'refine' })
+    await settle()
+    assert.deepEqual(seq, ['digest:2026-10-19', 'exit'], '精选 turn 结束 → 自退')
+    m.ctx.emit('agent/turn-end', { reason: 'again' })
+    await settle()
+    assert.equal(seq.length, 2, '自退只一次（awaitingExit 闩）')
+    m.cleanup()
+})
+
 test('收口链 digest 抛错仍自退；无宿主（exit 缺）只收口不退', async () => {
     let exited = 0
     const m1 = mountWatch(180_000, MON_OPEN, {
@@ -262,6 +292,22 @@ test('信号唤醒的静默条件：休市信号不响；熔断时不叫醒裁�
     } finally {
         m.cleanup()
     }
+})
+
+test('盘中启动次序：巡检未做时信号不叫醒（2026-11-03 抢跑修复）；巡检 wake 先于信号 wake', async () => {
+    const MON_LUNCH = MON_OPEN + 2 * 3_600_000 // 12:00 午休
+    const MON_PM = MON_OPEN + 3 * 3_600_000 // 13:00 午后开盘
+    const m = mountWatch(180_000, MON_LUNCH)
+    m.watch.start() // 午休时段 armed：evaluate 不巡检
+    assert.equal(m.wakes.length, 0, '午休不巡检不叫醒')
+    m.tick(MON_PM - MON_LUNCH)
+    m.watch.onSignal(mkSignal(MON_PM)) // 快照驱动的信号先于巡检 tick 到达
+    assert.equal(m.wakes.length, 0, '巡检未做：信号攒信箱不叫醒（开盘巡检先行）')
+    m.watch.evaluate() // 巡检轮：open wake + 同轮 flush 出账
+    assert.equal(m.wakes.length, 2)
+    assert.match(m.wakes[0], /开盘巡检/)
+    assert.match(m.wakes[1], /盘中信号/)
+    m.cleanup()
 })
 
 test('信箱：冷却内信号不裸丢，tick 兜底出账（Day 1 中恒集团饿死修复）', async () => {

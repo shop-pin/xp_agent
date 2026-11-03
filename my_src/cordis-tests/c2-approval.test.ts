@@ -232,6 +232,30 @@ test('auto fast-path：只读工具放行且不惊动分类器；web_fetch 刻�
   assert.equal(fake.calls(), 1) // web_fetch 必须过分类器（stage1 放行即完成，一次调用）
 })
 
+test('trade hint：模拟盘交易面跳过分类器直接放行（2026-11-03 place_order 卡死修复）', async () => {
+  const ctx = new Context()
+  const tools = new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui')
+  new SessionLog(ctx, 'session-log')
+  ctx.plugin(approvalPlugin)
+  ctx.plugin(autoApprovalPlugin)
+  // 分类器脚本故意给 block——若 trade hint 失效，这里会落 deny 而非直通
+  const fake = fakeClassifierLlm(ctx, () => '<block>yes</block>')
+  ctx.require<ToolsService>('tools').register({
+    name: 'paper_order_probe',
+    description: 'stub',
+    parameters: { type: 'object', properties: {} },
+    permissionHint: 'trade',
+    execute: async () => 'FILLED',
+  })
+  const outcome = await tools.executeCall(
+    { name: 'paper_order_probe', input: {}, mode: 'auto' },
+    { dispatch: async () => EXECUTED },
+  )
+  assert.equal(outcome.kind, 'result')
+  assert.equal(fake.calls(), 0, '分类器没被惊动——trade hint 直通（guard 外层风控仍在）')
+})
+
 test('auto 裁决映射：分类器 block/deny 落 deny；分类器不可用 + 有人 → confirm 落 ask', async () => {
   const ctx = new Context()
   const tools = new ToolsService(ctx, 'tools')

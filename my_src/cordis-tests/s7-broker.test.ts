@@ -210,7 +210,7 @@ test('账本重放：重启同账（现金/持仓/盈亏/序列号），日切�
 test('注记与工具：trade 注记进 SessionLog；place_order/get_portfolio 输出形态', async () => {
     const m = mountBroker()
     const tools = m.ctx.require<ToolsService>('tools')
-    assert.equal(tools.get('place_order')!.permissionHint, 'exec')
+    assert.equal(tools.get('place_order')!.permissionHint, 'trade')
     assert.equal(tools.get('get_portfolio')!.permissionHint, 'read')
     const out = await tools.get('place_order')!.execute(
         { code: 'sh600000', side: 'buy', price: 10, qty: 100, reason: 'test' }, {})

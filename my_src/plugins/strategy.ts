@@ -56,6 +56,10 @@ export interface WatchConfig {
     /** 收盘收口链（2026-10-29 方案 C）：复盘 turn 结束后跑 digest-run 编译
      *  + 宿主自退——挂机模式无人值守（早开会话、收盘自动收尾）。交互默认关。 */
     closeOutAfterReview: boolean;
+    /** 盘后精选 turn（2026-11-03）：收口链跑完后追加一个 LLM turn——从当日
+     *  命中池精选明日候选 + 给出明日交易计划（默认精选规则=盘面/消息/风格状态；
+     *  日后用户精选教程文档接管时替换 prompts.refine）。默认关（零漂移）。 */
+    postCloseRefine: boolean;
 }
 
 export interface RiskConfig {
@@ -131,7 +135,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
         divergenceChgPct: 1.5, divergenceSurgeX: 0.8,
         cooldownMs: 300_000, dailyFireCap: 2, refireGrowth: 1.5, flipGrowth: 2,
     },
-    watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2, closeOutAfterReview: false },
+    watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2, closeOutAfterReview: false, postCloseRefine: false },
     risk: { maxPositionPct: 0.2, maxDailyLoss: 15_000 },
     exit: { stopLossPct: 0.05, trailingStopPct: 0.05 },
     pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, excludeCK: false, pbMin: 0, recentDays: 365 },

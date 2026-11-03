@@ -39,6 +39,8 @@ export interface ScreenerRunResult {
     disabled: string[];
     jsonlPath: string;
     mdPath: string;
+    /** 数据防线告警（换手率全零等）——非空 = 命中清单不可信。 */
+    warnings: string[];
     elapsedMs: number;
 }
 
@@ -102,17 +104,29 @@ export function runScreener(opts: ScreenerRunOptions = {}): ScreenerRunResult {
     let universeCount = 0;
     const hits: ScreenerHit[] = [];
     const perFormula = new Map<string, number>();
+    let zeroTo = 0;
     for (const [code, bars] of market) {
         const trimmed = bars.filter((b) => b.day <= day);
         const name = names.get(code) ?? code;
         const gated = universeGate(trimmed, code, name, day, universe);
         if (!gated) continue;
         universeCount++;
+        const lastBar = gated[gated.length - 1]!;
+        if (!((lastBar.turnover ?? 0) > 0) && lastBar.volume > 0) zeroTo++;
         const window = gated.slice(-lookback);
         const hitIds = [...lib.runStock(baseFromBars(window)).keys()];
         if (hitIds.length === 0) continue;
         hits.push({ code, name, close: window[window.length - 1]!.close, formulas: hitIds });
         for (const id of hitIds) perFormula.set(id, (perFormula.get(id) ?? 0) + 1);
+    }
+    // 数据防线（2026-11-03 实录）：TDX 源收盘的 daily-k 无换手率（全 0）——
+    // CAPITAL/FINANCE 市值股本反推闸会整条静默失效（FLZT 当日 0 命中）。
+    // 不拦跑，但在报告与 stdout 喊出声，免得拿"公式失效"当"行情没戏"。
+    const warnings: string[] = [];
+    if (universeCount > 0 && zeroTo / universeCount > 0.9) {
+        warnings.push(`目标日 ${day} 的 daily-k 换手率全零（疑似 TDX 源收盘写盘）——`
+            + `市值/股本类闸（CAPITAL/FINANCE）失效，命中清单不可信；`
+            + `盘后用 sina 收盘快照重写当日 daily-k 后重跑`);
     }
 
     const perFormulaList = screeners
@@ -142,6 +156,7 @@ export function runScreener(opts: ScreenerRunOptions = {}): ScreenerRunResult {
     ].filter(Boolean).join(" + ");
     lines.push(`- 宇宙 ${universeCount} 只（${rulesText}）· 公式 ${perFormulaList.length} 条`
         + ` · 停用 ${disabled.length} 条 · 拒装 ${loaded.rejected.length} 条 · 耗时 ${Date.now() - t0}ms`);
+    for (const w of warnings) lines.push(`- ⚠ ${w}`);
     for (const r of loaded.rejected) lines.push(`- ⚠ 拒装 ${r.id}：${r.error.split("\n")[0]}`);
     for (const id of disabled) lines.push(`- 停用：${id}`);
     lines.push("");
@@ -162,7 +177,7 @@ export function runScreener(opts: ScreenerRunOptions = {}): ScreenerRunResult {
     return {
         day, universe: universeCount, hits, perFormula: perFormulaList,
         rejected: loaded.rejected, disabled, jsonlPath, mdPath,
-        elapsedMs: Date.now() - t0,
+        warnings, elapsedMs: Date.now() - t0,
     };
 }
 
@@ -208,6 +223,7 @@ function main(): void {
     try {
         const result = runScreener({ day: arg("day"), formulaId: arg("formula") });
         console.log(readFileSync(result.mdPath, "utf-8"));
+        for (const w of result.warnings) console.error(`⚠ ${w}`);
         console.error(`选股完成：宇宙 ${result.universe}，命中 ${result.hits.length} 票 → ${result.jsonlPath}`);
     } catch (e) {
         console.error(`选股失败：${e instanceof Error ? e.message : String(e)}`);

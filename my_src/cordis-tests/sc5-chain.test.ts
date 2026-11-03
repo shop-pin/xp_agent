@@ -9,28 +9,32 @@ import { defaultCloseOut, screenerSummary } from '../plugins/market-watch.js'
 import { loadStrategy, DEFAULT_STRATEGY } from '../plugins/strategy.js'
 import { renderScreenerSection, type ScreenerSummaryRow } from '../backtest/digest.js'
 
-test('defaultCloseOut：digest 恒跑；autoRun 开才追加选股；顺序 digest→选股', async () => {
+test('defaultCloseOut：digest 恒跑；autoRun 开才追加选股；顺序选股→digest（§八要吃当日行）', async () => {
     const calls: string[] = []
     const digest = async (day: string) => { calls.push(`digest:${day}`) }
     const screener = async (day: string) => { calls.push(`screener:${day}`) }
     const on = defaultCloseOut({ ...DEFAULT_STRATEGY, screener: { autoRun: true } }, digest, screener)
     await on('2026-11-03')
-    assert.deepEqual(calls, ['digest:2026-11-03', 'screener:2026-11-03'], '顺序：digest 先')
+    assert.deepEqual(calls, ['screener:2026-11-03', 'digest:2026-11-03'], '顺序：选股先（digest §八读当日 screener 文件）')
     calls.length = 0
     const off = defaultCloseOut(DEFAULT_STRATEGY, digest, screener)   // 缺省 autoRun=false
     await off('2026-11-03')
     assert.deepEqual(calls, ['digest:2026-11-03'], 'autoRun 关：只 digest（零漂移生命线）')
 })
 
-test('defaultCloseOut：选股失败向上 reject（收口链 catch 喊出声、不静默吞）', async () => {
+test('defaultCloseOut：选股失败 digest 仍跑，错误最后向上 reject（catch 喊出声、不静默吞）', async () => {
+    const calls: string[] = []
+    const digest = async (day: string) => { calls.push(`digest:${day}`) }
     const screener = async () => { throw new Error('screener exit 1') }
     const chain = defaultCloseOut({ ...DEFAULT_STRATEGY, screener: { autoRun: true } },
-        async () => {}, screener)
+        digest, screener)
     await assert.rejects(chain('2026-11-03'), /screener exit 1/)
+    assert.deepEqual(calls, ['digest:2026-11-03'], '选股挂了 digest 照跑（复盘基础产物保住）')
 })
 
 test('strategy：screener 节缺省 autoRun=false，用户覆盖合并生效', () => {
     assert.equal(DEFAULT_STRATEGY.screener.autoRun, false)
+    assert.equal(DEFAULT_STRATEGY.watch.postCloseRefine, false, '盘后精选默认关（零漂移生命线）')
     const dir = mkdtempSync(join(tmpdir(), 'sc5-'))
     try {
         const path = join(dir, 'strategy.json')
@@ -100,10 +104,10 @@ test('screenerSummary：自定义公式打明细、内置只计数、文件缺�
         writeFileSync(join(scDir, '2026-11-02.jsonl'), [head, ...rows].join('\n') + '\n')
         const text = screenerSummary('2026-11-02')
         assert.ok(text.includes('🎯 选股完成 2026-11-02'), '头行带计数')
-        assert.ok(text.includes('kdj-golden'), '内置公式只出现在计数行')
         assert.ok(text.includes('FLZT_xuanguqi 命中 2 只'), '自定义公式打明细')
+        assert.ok(text.includes('kdj-golden 命中 1 只'), '内置公式同样打明细（2026-11-03 全量需求）')
         assert.ok(text.includes('sh600020 中原高速 收 4.32'), '命中行明细')
-        assert.ok(!text.includes('kdj-golden 命中'), '内置公式不打明细（防刷屏）')
+        assert.ok(text.includes('sz000001 平安银行 收 10.50'), '内置公式命中行也出名字代码')
         assert.equal(screenerSummary('1999-01-01'), '', '无产物日返回空串')
     } finally {
         if (prevData === undefined) delete process.env.MINI_STOCKS_DATA_DIR

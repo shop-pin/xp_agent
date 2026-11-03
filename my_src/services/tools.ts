@@ -26,8 +26,10 @@ export interface JSONSchema {
     required?: string[];
 }
 
-/** 权限提示：C2 权限瀑布用，C1 只挂上不消费。 */
-export type PermissionHint = "read" | "edit" | "exec" | "meta";
+/** 权限提示：C2 权限瀑布用，C1 只挂上不消费。"trade" = 模拟盘交易面——
+ *  TradeGuard 在瀑布最外层做代码级风控，不再进人工/分类器确认（无人值守
+ *  会话等键盘会把 turn 驱动卡死）。实盘 broker（S15）不得用此 hint。 */
+export type PermissionHint = "read" | "edit" | "exec" | "meta" | "trade";
 
 /** 工具执行上下文：agent 循环借给工具的运行时资源（随章节扩充）。 */
 export interface ToolExec {

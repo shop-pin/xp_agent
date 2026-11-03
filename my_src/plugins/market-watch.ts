@@ -30,8 +30,8 @@ import type { CommandService } from "../services/commands.js";
 import type { UiService } from "../services/ui-service.js";
 import type { SessionLog } from "../services/session-log.js";
 import type { ScheduleService } from "../services/schedule.js";
-import { BUILTIN_SCREENERS } from "../backtest/formulas/builtin.js";
 import { SCHEMA } from "../backtest/schema.js";
+import { BUILTIN_SCREENERS } from "../backtest/formulas/builtin.js";
 import type { ScreenerHit } from "../backtest/screener-run.js";
 import { dataRootPath, readSchemaJsonl } from "./data-store.js";
 import { marketPhase, type MarketDataService } from "./market-data.js";
@@ -64,6 +64,8 @@ export interface WatchPrompts {
     /** 破止损线的持仓（S14 离场节：watch 唤醒裁决，不自动卖）。 */
     risk(hits: RiskHit[], time: string): string;
     close(date: string): string;
+    /** 盘后精选（2026-11-03）：pool = 自定义公式命中池文本（空串=当日无选股产物）。 */
+    refine(pool: string, day: string): string;
 }
 
 export const defaultPrompts: WatchPrompts = {
@@ -80,6 +82,16 @@ export const defaultPrompts: WatchPrompts = {
     close: (date) =>
         `[盯盘 ${date} 收盘] 请运行 /review 做今日复盘（持仓与当日盈亏、当日成交、`
         + `信号与消息对照、memory 更新持仓与偏好、明日计划）。`,
+    refine: (pool, day) =>
+        `[盯盘 ${day} 盘后精选] 今日选股已完成，请基于命中池做盘后精选并给出明日交易计划。`
+        + `命中池（自定义公式，全量）：\n${pool || "（今日无选股产物——直接按盘面给计划）"}\n`
+        + `精选与计划要求：`
+        + `①精选 2–5 只明日候选：结合当日盘面强度、板块联动、当日消息（latest_news）、`
+        + `风格状态与裁决对账（read_file 读当日 digest 的 §三/§六/§七）、历史教训（get_learnings），`
+        + `每只给出：入选理由 / 风险点 / 明日关注位（介入价区与放弃条件）。`
+        + `②明日交易计划：现有持仓处理（含止损/止盈触发位）、开仓方向与仓位上限、`
+        + `风控纪律（单日亏损红线、不追高条件）。`
+        + `把精选清单与明日计划直接打印在终端（这是收盘前的最后输出）。`,
     risk: (hits, time) => {
         const lines = hits.map((h) =>
             h.reason === "trailing"
@@ -130,26 +142,35 @@ function spawnScreenerRun(day: string): Promise<void> {
     });
 }
 
-/** 缺省收口链：digest（必跑）→ 选股（strategy.screener.autoRun 开时）。
- *  spawn 函数可注入——链路组合的测试面。选股失败随收口链 catch 喊出声，
- *  不阻断自退（与 digest 同语义：可事后手动补跑）。 */
+/** 缺省收口链：选股（strategy.screener.autoRun 开时）先行 → digest（必跑）。
+ *  选股先行的理由：digest 第八节读当日 screener/<day>.jsonl——旧序（digest 先）
+ *  在 autoRun 当天 §八永远缺当日行（2026-11-03 修正）。选股失败不阻断 digest
+ *  （复盘基础产物保住），错误最后随收口链 catch 喊出声、不阻断自退。
+ *  spawn 函数可注入——链路组合的测试面。 */
 export function defaultCloseOut(
     strategy: StrategyConfig,
     spawnDigest: (day: string) => Promise<void> = spawnDigestRun,
     spawnScreener: (day: string) => Promise<void> = spawnScreenerRun,
 ): (day: string) => Promise<void> {
     return async (day) => {
+        let screenerErr: unknown = null;
+        if (strategy.screener?.autoRun) {
+            try {
+                await spawnScreener(day);
+            } catch (e) {
+                screenerErr = e;
+            }
+        }
         await spawnDigest(day);
-        if (strategy.screener?.autoRun) await spawnScreener(day);
+        if (screenerErr) throw screenerErr;
     };
 }
 
-/** 选股摘要进 terminal（2026-11-02 用户需求）：收口链选股完成后读当日
- *  screener/<day>.jsonl——自定义公式（非内置库）打命中明细，内置只打计数
- *  （kdj-golden 七百只级，明细会刷屏）；单公式明细 cap 200 行。文件缺席
- *  （选股未跑/失败）返回空串——失败路径已有 catch 喊，这里不重复。 */
+/** 选股摘要进 terminal（2026-11-02 用户需求；2026-11-03 改全量）：收口链
+ *  选股完成后读当日 screener/<day>.jsonl——每条公式打全部命中（代码+名称+收盘），
+ *  头行带各公式计数。文件缺席（选股未跑/失败）返回空串——失败路径已有 catch
+ *  喊，这里不重复。 */
 export function screenerSummary(day: string): string {
-    const builtinIds = new Set(BUILTIN_SCREENERS.map((s) => s.id));
     const path = join(dataRootPath(), "screener", `${day}.jsonl`);
     if (!existsSync(path)) return "";
     let rows: ScreenerHit[];
@@ -163,11 +184,10 @@ export function screenerSummary(day: string): string {
     if (counts.size === 0) return "";
     const head = [...counts.entries()].map(([id, n]) => `${id} ${n}`).join(" / ");
     const lines = [`🎯 选股完成 ${day}（${head}）`];
-    for (const [id] of [...counts.entries()].filter(([fid]) => !builtinIds.has(fid))) {
+    for (const [id] of counts) {
         const hits = rows.filter((h) => h.formulas.includes(id));
         lines.push(`${id} 命中 ${hits.length} 只：`);
-        for (const h of hits.slice(0, 200)) lines.push(`  ${h.code} ${h.name} 收 ${h.close.toFixed(2)}`);
-        if (hits.length > 200) lines.push(`  …（其余 ${hits.length - 200} 只略）`);
+        for (const h of hits) lines.push(`  ${h.code} ${h.name} 收 ${h.close.toFixed(2)}`);
     }
     return lines.join("\n");
 }
@@ -193,6 +213,8 @@ export interface WatchConfig {
     exit?: () => void;
     /** 收盘收口链开关（缺省走策略 watch.closeOutAfterReview）。 */
     closeOutAfterReview?: boolean;
+    /** 盘后精选 turn 开关（缺省走策略 watch.postCloseRefine）。 */
+    postCloseRefine?: boolean;
     /** 提示词覆盖（测试锚定）。 */
     prompts?: Partial<WatchPrompts>;
 }
@@ -208,6 +230,8 @@ export class WatchService extends Service {
     private reviewed = false;
     /** 收盘收口链 armed：close wake 已发、等复盘 turn 的 agent/turn-end。 */
     private awaitingReview = false;
+    /** 盘后精选 armed：refine wake 已发、等精选 turn 的 agent/turn-end 再自退。 */
+    private awaitingExit = false;
     private lastSignalWake = 0;
     /** 信箱：同 code 留最新（冷却内的信号不再裸丢——Day 1 中恒集团被槽位饿死）。 */
     private pending = new Map<string, { sig: Signal; at: number }>();
@@ -223,6 +247,7 @@ export class WatchService extends Service {
     private closeOut: ((day: string) => Promise<void> | void) | undefined;
     private exit: (() => void) | undefined;
     private closeOutAfterReview: boolean;
+    private postCloseRefine: boolean;
     private prompts: WatchPrompts;
     private tickMs: number;
     private strategy: StrategyConfig;
@@ -239,6 +264,7 @@ export class WatchService extends Service {
         this.closeOut = config.closeOut ?? spawnDigestRun;
         this.exit = config.exit;
         this.closeOutAfterReview = config.closeOutAfterReview ?? false;
+        this.postCloseRefine = config.postCloseRefine ?? this.strategy.watch.postCloseRefine;
         this.prompts = { ...defaultPrompts, ...config.prompts };
         // 测试/演示加速旋钮（对齐 MINI_WEB_PORT 的 env 传参先例）
         this.tickMs = Number(process.env.MINI_WATCH_TICK_MS) || 30_000;
@@ -368,6 +394,10 @@ export class WatchService extends Service {
         if (!market) return;
         const now = market.clock();
         if (marketPhase(now) !== "open") return;
+        // 开盘巡检先行（2026-11-03）：巡检 wake 是 tick 驱动、信号 wake 是快照
+        // 事件驱动——盘中启动时信号会抢在巡检前面（实录：open 词迟到 4 个 turn）。
+        // 巡检未做，信号只攒信箱不叫醒；evaluate 的巡检轮同 tick 兜底出账。
+        if (!this.patrolled) return;
         const ts = now.getTime();
         if (ts - this.lastSignalWake < this.cooldown) return;
         const day = cnDay(ts);
@@ -408,9 +438,16 @@ export class WatchService extends Service {
      *  误触发面：收盘后用户手聊的第一个 turn 结束也会命中——挂机场景无此输入，
      *  交互模式默认关（strategy.watch.closeOutAfterReview）。 */
     async onTurnEnd(): Promise<void> {
-        if (!this.armed || !this.awaitingReview) return;
+        if (!this.armed) return;
         const market = this.ctx.get<MarketDataService>("market");
         if (!market || marketPhase(market.clock()) !== "closed") return;
+        // 盘后精选 turn 结束 → 现在才自退（2026-11-03：精选/明日计划是收盘前最后输出）
+        if (this.awaitingExit) {
+            this.awaitingExit = false;
+            this.requestExit("复盘与盘后计划完成，盯盘会话自退");
+            return;
+        }
+        if (!this.awaitingReview) return;
         this.awaitingReview = false;
         this.note({ kind: "close-out", day: this.day });
         if (this.closeOut) {
@@ -421,16 +458,45 @@ export class WatchService extends Service {
                 this.ctx.get<UiService>("ui")?.error(`收盘 digest 失败：${e instanceof Error ? e.message : String(e)}`);
             }
         }
-        // 选股摘要进 terminal（2026-11-02 用户需求）：autoRun 开时收口链已跑完
-        // 选股——自退前把命中清单打出来（内置公式只计数，自定义公式打明细）
+        // 选股摘要进 terminal（2026-11-02 用户需求；2026-11-03 全量）：收口链
+        // 已跑完选股——自退前把命中清单打出来（每公式全量 code+name+close）
         if (this.strategy.screener?.autoRun) {
             const summary = screenerSummary(this.day);
             if (summary) this.ctx.get<UiService>("ui")?.info(summary);
         }
-        if (this.exit) {
-            this.ctx.get<UiService>("ui")?.info("👋 复盘完成，盯盘会话自退");
-            this.exit();
+        // 盘后精选 + 明日计划（2026-11-03）：命中池喂给 LLM turn 精选；
+        // 自退推迟到该 turn 结束（awaitingExit）。精选规则日后由用户教程文档接管。
+        if (this.postCloseRefine) {
+            const pool = this.refinePool(this.day);
+            this.awaitingExit = true;
+            void this.fire(this.prompts.refine(pool, this.day), "refine", this.day);
+            return;
         }
+        this.requestExit("复盘完成，盯盘会话自退");
+    }
+
+    /** 精选命中池：自定义公式（非内置库）打全量，内置只给计数行；cap 50 行防
+     *  wake 文本膨胀（更多命中留给 turn 里 read_file 报告文件）。 */
+    private refinePool(day: string): string {
+        const path = join(dataRootPath(), "screener", `${day}.jsonl`);
+        if (!existsSync(path)) return "";
+        let rows: ScreenerHit[];
+        try {
+            rows = readSchemaJsonl<ScreenerHit>(path, SCHEMA.SCREENER).rows;
+        } catch {
+            return "";
+        }
+        const builtinIds = new Set(BUILTIN_SCREENERS.map((s) => s.id));
+        const custom = rows.filter((h) => h.formulas.some((f) => !builtinIds.has(f)));
+        const lines = custom.slice(0, 50).map((h) => `  ${h.code} ${h.name} 收 ${h.close.toFixed(2)}（${h.formulas.filter((f) => !builtinIds.has(f)).join("/")}）`);
+        if (custom.length > 50) lines.push(`  …（其余 ${custom.length - 50} 只见 screener/${day}.md）`);
+        return lines.join("\n");
+    }
+
+    private requestExit(message: string): void {
+        if (!this.exit) return;
+        this.ctx.get<UiService>("ui")?.info(`👋 ${message}`);
+        this.exit();
     }
 }
 
@@ -451,6 +517,7 @@ export const marketWatchPlugin: Plugin = {
             // 缺省收口链 = digest + 选股（autoRun 开时）——显式 closeOut 覆盖不受影响
             closeOut: config.closeOut ?? defaultCloseOut(strategy),
             closeOutAfterReview: config.closeOutAfterReview ?? strategy.watch.closeOutAfterReview,
+            postCloseRefine: config.postCloseRefine ?? strategy.watch.postCloseRefine,
         });
         ctx.on("market/signal", (sig) => watch.onSignal(sig));
         ctx.on("market/degraded", (d) => watch.onDegraded(d));
