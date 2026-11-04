@@ -266,15 +266,30 @@ type FnDef = {
 const s = (v: Val): Series => (typeof v[0] === "boolean" ? (v as Cond).map((b) => (b ? 1 : 0)) : v as Series);
 const c = (v: Val): Cond => (typeof v[0] === "boolean" ? v as Cond : (v as Series).map((x) => x !== null && x !== undefined && x > 0));
 
-/** 从换手率反推流通股本（手）：TO% = VOL(手)/股本(手)×100 → 股本 = VOL×100/TO。
- *  无换手率的 bar（hist-k 路径）→ null。FINANCE(7)/CAPITAL 同源。 */
+/** 流通股本（手）序列：TO% = VOL(手)/股本(手)×100 → 股本 = VOL×100/TO。
+ *  缺 to（或 0）的 bar 回填"最近一根带 to 的 bar"的反推值（2026-11-03 挂账
+ *  销账：TDX 源收盘快照无 to → 当日反推全废、FINANCE/HSL 闸整条失效；股本
+ *  短窗内近似常量，TDX 的 CAPITAL 本就是当前值口径）。开局就无 to → null
+ *  （保守，比较=false 与旧口径一致）。FINANCE(7)/CAPITAL 同源。 */
+function capitalSeries(vols: Series, tos: Series): Series {
+    const out: Series = new Array(vols.length).fill(null);
+    let last: number | null = null;
+    for (let i = 0; i < vols.length; i++) {
+        const v = vols[i], t = tos[i];
+        if (v !== null && v !== undefined && t !== null && t !== undefined && t > 0) {
+            last = (v * 100) / t;
+        }
+        out[i] = last;
+    }
+    return out;
+}
+
 function capitalFrom(ctx: Record<string, Series>): Series {
-    const to = ctx.TO ?? []; const vol = ctx.V ?? [];
-    return vol.map((v, i) => {
-        const t = to[i];
-        if (v === null || v === undefined || t === null || t === undefined || t <= 0) return null;
-        return (v * 100) / t;
-    });
+    // 股本表注入（2026-11-04 TDX 纯化）：base 已带 CAPITAL（TDX finance_batch
+    // 的流通股本，手）时直读——反推链（to 依赖）只作无注入时的兜底。
+    const injected = ctx.CAPITAL;
+    if (injected && injected.length > 0) return injected;
+    return capitalSeries(ctx.V ?? [], ctx.TO ?? []);
 }
 
 export const BUILTIN_FUNCS: Record<string, FnDef> = {
@@ -342,8 +357,9 @@ export const BUILTIN_FUNCS: Record<string, FnDef> = {
     // TDX 原版公式直读补件（2026-11-02 用户公式逐字适配轮）：
     //   CONST 取末值常量；FORCAST 线性回归外推；NAMELIKE/CODELIKE 恒 false
     //   （ST/板块过滤由 universe 闸承担——净效果一致）；SETCODE 恒 0（A 股
-    //   沪深分支恒真）；FINANCE/CAPITAL 从当日换手率反推流通股本（TO%=VOL/股本
-    //   → 股本(手)=VOL×100/TO；42=流通市值=C×股本×100），无换手率的历史段 null。
+    //   沪深分支恒真）；FINANCE/CAPITAL 从换手率反推流通股本（TO%=VOL/股本
+    //   → 股本(手)=VOL×100/TO；42=流通市值=C×股本×100），缺 to 的 bar 回填
+    //   最近一根带 to 的 bar 反推值（capitalSeries——TDX 收盘日 to 断供面）。
     CONST: {
         eval: (a) => {
             const x = s(a[0]!);
@@ -452,9 +468,14 @@ export function loadFormula(text: string, opts: FormulaLoadOptions = {}): Compil
 
 /** 基础行情绑定（C/O/H/L/V/AMOUNT 全别名 → 同一序列；TO=换手率百分数，
  *  hist-k 路径的 bar 无此字段 → null 序列；DRAWNULL=全 null，TDX 画线占位；
- *  AMO=AMOUNT 别名（TDX 惯用）；SETCODE 恒 0（A 股沪深分支恒真）。 */
-export function baseFromBars(bars: readonly KBar[]): Record<string, Series> {
+ *  AMO=AMOUNT 别名（TDX 惯用）；SETCODE 恒 0（A 股沪深分支恒真）。
+ *  opts.floatSharesLots：TDX 股本表的流通股本（手）——注入则 CAPITAL=常量
+ *  序列（TDX 财务口径本就是当前值），HSL/FINANCE 不再依赖换手率反推。 */
+export function baseFromBars(bars: readonly KBar[], opts?: { floatSharesLots?: number }): Record<string, Series> {
     const toArr: Series = bars.map((b) => b.turnover ?? null);
+    const capital = opts?.floatSharesLots !== undefined && opts.floatSharesLots > 0
+        ? bars.map(() => opts.floatSharesLots!)
+        : capitalSeries(bars.map((b) => b.volume), toArr);
     return {
         C: bars.map((b) => b.close), CLOSE: bars.map((b) => b.close),
         O: bars.map((b) => b.open), OPEN: bars.map((b) => b.open),
@@ -465,8 +486,7 @@ export function baseFromBars(bars: readonly KBar[]): Record<string, Series> {
         TO: toArr, TURNOVER: toArr,
         DRAWNULL: bars.map(() => null),
         SETCODE: bars.map(() => 0),
-        // CAPITAL（流通股本，手）从换手率反推：TO%=VOL/股本×100 → 股本=VOL×100/TO
-        CAPITAL: toArr.map((t, i) => (t === null || t === undefined || t <= 0 ? null : (bars[i]!.volume * 100) / t)),
+        CAPITAL: capital,
     };
 }
 

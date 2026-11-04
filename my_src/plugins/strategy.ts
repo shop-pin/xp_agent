@@ -60,6 +60,10 @@ export interface WatchConfig {
      *  命中池精选明日候选 + 给出明日交易计划（默认精选规则=盘面/消息/风格状态；
      *  日后用户精选教程文档接管时替换 prompts.refine）。默认关（零漂移）。 */
     postCloseRefine: boolean;
+    /** 盘后精选墙钟预算 ms（2026-11-04）：精选 turn 超时未结束 = 烂尾自退——
+     *  收口产物（复盘/digest/选股报告）此时已全部落盘，会话不许悬挂。
+     *  0 = 关（不推荐）。默认 10 分钟。 */
+    refineTimeoutMs: number;
 }
 
 export interface RiskConfig {
@@ -135,7 +139,7 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
         divergenceChgPct: 1.5, divergenceSurgeX: 0.8,
         cooldownMs: 300_000, dailyFireCap: 2, refireGrowth: 1.5, flipGrowth: 2,
     },
-    watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2, closeOutAfterReview: false, postCloseRefine: false },
+    watch: { signalCooldownMs: 180_000, maxSignalAgeMs: 360_000, perCodeWakeCap: 2, closeOutAfterReview: false, postCloseRefine: false, refineTimeoutMs: 600_000 },
     risk: { maxPositionPct: 0.2, maxDailyLoss: 15_000 },
     exit: { stopLossPct: 0.05, trailingStopPct: 0.05 },
     pool: { topN: 20, amountMin: 3e7, priceMin: 2, peMin: 0, peMax: 300, excludeCK: false, pbMin: 0, recentDays: 365 },

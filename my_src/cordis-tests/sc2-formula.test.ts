@@ -241,6 +241,27 @@ test('金例19：FINANCE(7)/CAPITAL 反推——HSL 公式语义=真换手百分
     assert.deepEqual(noTo, [false])
 })
 
+test('金例19b：CAPITAL 缺 to 回填最近一根带 to 的 bar（2026-11-03 挂账：TDX 收盘日 to=0 反推全废）', () => {
+    // 三根：to=2.5 → 股本=1000×100/2.5=40000 手；to=5 → 20000 手；末根无 to（TDX 收盘形态）→ 回填 20000
+    const b = bars([10])[0]!
+    const three: KBar[] = [{ ...b, turnover: 2.5 }, { ...b, turnover: 5 }, { ...b }]
+    const f = loadFormula('CAP:CAPITAL;')
+    const out = runFormula(f, baseFromBars(three))
+    assert.deepEqual(out.values.get('CAP'), [40000, 20000, 20000], '缺 to 的 bar 回填最近带 to bar 的反推股本')
+    assert.deepEqual(evalXg('XG:FINANCE(7)>0;', three), [true, true, true], 'TDX 收盘日 FINANCE/HSL 闸不再整条失效')
+    // 开局就无 to（纯 hist-k 形态）→ 仍全 null，与旧口径一致（保守）
+    assert.deepEqual(evalXg('XG:FINANCE(7)>0;', bars([10, 10])), [false, false])
+})
+
+test('金例19c：股本表注入 CAPITAL——HSL/FINANCE 脱离换手率（2026-11-04 TDX 纯化：to=0 日可用）', () => {
+    const f = loadFormula('CAP:CAPITAL; F7:FINANCE(7); HSL:IF((SETCODE==0||SETCODE==1),100*VOL,VOL)/(FINANCE(7)/100);')
+    // bar 无 to + 注入流通股本 4 万手（=400 万股，capital-refresh-tdx.py 股→手换算后）
+    const out = runFormula(f, baseFromBars(bars([10]), { floatSharesLots: 40000 }))
+    assert.equal(out.values.get('CAP')![0], 40000, 'CAPITAL=股本表常量（手）')
+    assert.equal(out.values.get('F7')![0], 4_000_000, 'FINANCE(7)=股本表×100（股）')
+    assert.equal(out.values.get('HSL')![0], 2.5, 'HSL=100×1000/40000=2.5%（与 to 无关）')
+})
+
 test('金例20：NAMELIKE/CODELIKE 恒 false（universe 闸承担）+ 本地变量窗口 LLV(X,X)', () => {
     const xg = evalXg("X2:=NOT(NAMELIKE('ST') OR NAMELIKE('*ST') OR NAMELIKE('S')); XG:X2 AND NOT(CODELIKE(1));", bars([5]))
     assert.deepEqual(xg, [true], '两者恒 false → NOT 恒 true')

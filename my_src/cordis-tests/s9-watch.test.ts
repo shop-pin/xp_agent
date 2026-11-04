@@ -49,6 +49,7 @@ function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
     broker?: boolean; stopLossPct?: number; trailingStopPct?: number;
     closeOut?: (day: string) => Promise<void> | void; exit?: () => void; closeOutAfterReview?: boolean;
     postCloseRefine?: boolean;
+    refineTimeoutMs?: number;
     prompts?: { refine?: (pool: string, day: string) => string };
 } = {}): Mount {
     const ctx = new Context()
@@ -80,6 +81,7 @@ function mountWatch(cooldownMs = 180_000, at = MON_OPEN, opts: {
         exit: opts.exit,
         closeOutAfterReview: opts.closeOutAfterReview,
         postCloseRefine: opts.postCloseRefine,
+        refineTimeoutMs: opts.refineTimeoutMs,
         prompts: opts.prompts,
     })
     return {
@@ -224,6 +226,30 @@ test('盘后精选（2026-11-03）：收口后先发 refine wake，精选 turn �
     m.ctx.emit('agent/turn-end', { reason: 'again' })
     await settle()
     assert.equal(seq.length, 2, '自退只一次（awaitingExit 闩）')
+    m.cleanup()
+})
+
+test('盘后精选超时（2026-11-04）：精选 turn 卡死 → 墙钟预算到点强制自退；正常自退后定时器不二次触发', async () => {
+    const seq: string[] = []
+    const m = mountWatch(180_000, MON_OPEN, {
+        closeOutAfterReview: true,
+        postCloseRefine: true,
+        refineTimeoutMs: 30,
+        closeOut: async (day) => { seq.push(`digest:${day}`) },
+        exit: () => { seq.push('exit') },
+        prompts: { refine: () => '[refine]' },
+    })
+    m.watch.start()
+    m.tick(MON_CLOSED - MON_OPEN)
+    m.watch.evaluate() // close wake
+    m.ctx.emit('agent/turn-end', { reason: 'review' })
+    await settle()
+    assert.deepEqual(seq, ['digest:2026-10-19'], '收口完成，精选 turn 在跑')
+    await new Promise((r) => setTimeout(r, 100)) // 精选 turn 永不结束 → 过墙钟预算
+    assert.deepEqual(seq, ['digest:2026-10-19', 'exit'], '精选烂尾也自退（2026-11-04 实录：考古被硬杀）')
+    m.ctx.emit('agent/turn-end', { reason: 'refine' }) // 迟到的精选 turn 结束
+    await settle()
+    assert.equal(seq.length, 2, '自退仍只一次（超时已消费 awaitingExit）')
     m.cleanup()
 })
 

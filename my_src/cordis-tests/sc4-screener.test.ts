@@ -6,9 +6,10 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { loadScreeners, screenerConfigPath, DEFAULT_UNIVERSE } from '../backtest/screener-config.js'
-import { runScreener } from '../backtest/screener-run.js'
+import { runScreener, groupedHits } from '../backtest/screener-run.js'
 import { schemaHeader, readSchemaJsonl, SCHEMA_DAILY_K } from '../plugins/data-store.js'
 import { SCHEMA } from '../backtest/schema.js'
+import type { SectorInfo } from '../backtest/sector.js'
 
 function withTempHome<T>(fn: (dir: string) => T): T {
     const savedHome = process.env.HOME
@@ -84,8 +85,7 @@ test('loadScreeners：坏配置明确拒读（坏 JSON / 缺 formula / universe 
 
 // ---------- 引擎全链（fixture） ----------
 
-function buildFixture(dir: string): { root: string; day: string } {
-    const root = join(dir, 'data')
+function buildFixture(dir: string): { root: string; day: string } {    const root = join(dir, 'data')
     const histDir = join(root, 'hist-k')
     const kDir = join(root, 'daily-k')
     mkdirSync(histDir, { recursive: true })
@@ -213,5 +213,79 @@ test('公式目录装载：*.txt 装 / .off.txt 停用 / 覆盖内置同名（20
         if (savedFormulas === undefined) delete process.env.MINI_FORMULAS_DIR
         else process.env.MINI_FORMULAS_DIR = savedFormulas
         rmSync(home, { recursive: true, force: true })
+    }
+})
+
+// ---------- 板块归属（2026-11-04 用户需求：跟的什么板块 + 分组排序） ----------
+
+test('groupedHits：同板块归组，个股多的板块在上，并列看板块涨幅，未归类垫底', () => {
+    const rows = [
+        { code: 'sh600001', name: '甲', close: 10, formulas: ['f'], sector: '半导体', sectorChg: 5 },
+        { code: 'sh600002', name: '乙', close: 10, formulas: ['f'] },
+        { code: 'sh600003', name: '丙', close: 10, formulas: ['f'], sector: '黄金', sectorChg: 9 },
+        { code: 'sh600004', name: '丁', close: 10, formulas: ['f'], sector: '通信设备', sectorChg: 3 },
+        { code: 'sh600005', name: '戊', close: 10, formulas: ['f'], sector: '通信设备', sectorChg: 3 },
+        { code: 'sh600006', name: '己', close: 10, formulas: ['f'], sector: '通信设备', sectorChg: 3 },
+        { code: 'sh600007', name: '庚', close: 10, formulas: ['f'] },
+    ]
+    const lines = groupedHits(rows)
+    const heads = lines.filter((l) => l.startsWith('###'))
+    assert.deepEqual(heads, [
+        '### 通信设备 +3.00%（3）', // 3 只最多 → 最上
+        '### 黄金 +9.00%（1）',     // 并列 1 只看板块涨幅：9 > 5
+        '### 半导体 +5.00%（1）',
+        '### 未归类（2）',          // 永远垫底
+    ], '板块内个股最多的在最上面、最少的在最下面')
+    assert.ok(lines.some((l) => l.includes('（跟 黄金 +9.00%）')), '每行自带板块标签')
+    assert.ok(lines.some((l) => l.startsWith('- sh600007') && !l.includes('跟')), '未归类行不带标签')
+    assert.deepEqual(groupedHits([]), ['- 无命中'], '空清单')
+})
+
+test('runScreener 注入板块归属：jsonl 行带 sector/sectorChg，md 按板块分组，缺席告警', () => {    const dir = mkdtempSync(join(tmpdir(), 'sc4-sector-'))
+    const prevProfile = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    try {
+        const { root, day } = buildFixture(dir)
+        const configPath = writeConfig(dir, { screeners: [{ id: 'good', formula: 'XG:C>0;' }] })
+        const sector = new Map<string, SectorInfo>([['sh600000', { board: '银行', chg: 1.25 }]])
+        const result = runScreener({ root, configPath, day, sector })
+        const row = readSchemaJsonl<{ code: string; sector?: string; sectorChg?: number }>(result.jsonlPath, SCHEMA.SCREENER).rows[0]!
+        assert.equal(row.sector, '银行', 'jsonl 行带板块字段（对账原料）')
+        assert.equal(row.sectorChg, 1.25)
+        const md = readFileSync(result.mdPath, 'utf-8')
+        assert.ok(md.includes('### 银行 +1.25%（1）'), 'md 分组头（板块+涨幅+只数）')
+        assert.ok(md.includes('（跟 银行 +1.25%）'), '命中行带板块标签')
+        assert.ok(md.includes('- 板块归属 1 只'), '报告头板块注记')
+        // 不注入且无缓存 → 告警线（降级不静默）
+        const plain = runScreener({ root, configPath, day })
+        assert.ok(readFileSync(plain.mdPath, 'utf-8').includes('板块归属数据缺席'), '板块缓存缺席告警')
+    } finally {
+        if (prevProfile === undefined) delete process.env.USERPROFILE
+        else process.env.USERPROFILE = prevProfile
+        rmSync(dir, { recursive: true, force: true })
+    }
+})
+
+test('股本表注入（2026-11-04 TDX 纯化）：shares.jsonl 在手 → md 注记 + CAPITAL 不吃换手率', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sc4-shares-'))
+    const prevProfile = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    try {
+        const { root, day } = buildFixture(dir)
+        // fixture 票 VOL=1000 手、流通股本 400 万股=40000 手 → HSL=2.5%（真股本口径）
+        const sharesHead = JSON.stringify({ v: 1, schema: 'stocks.shares', day, count: 1 })
+        writeFileSync(join(root, 'shares.jsonl'),
+            [sharesHead, JSON.stringify({ code: 'sh600000', floatShares: 4_000_000, totalShares: 4_000_000 })].join('\n') + '\n')
+        const configPath = writeConfig(dir, {
+            screeners: [{ id: 'good', formula: 'HSLV:IF((SETCODE==0||SETCODE==1),100*VOL,VOL)/(FINANCE(7)/100); XG:FINANCE(7)>0 AND HSLV>2 AND HSLV<3;' }],
+        })
+        const result = runScreener({ root, configPath, day })
+        assert.ok(result.hits.some((h) => h.code === 'sh600000'),
+            'HSL 闸按真股本口径放行 2.5%（反推口径 HSL=1 会被拒——注入生效的判别面）')
+        assert.ok(readFileSync(result.mdPath, 'utf-8').includes('- 股本：TDX 股本表 1 只'), 'md 报告带股本表注记')
+    } finally {
+        if (prevProfile === undefined) delete process.env.USERPROFILE
+        else process.env.USERPROFILE = prevProfile
+        rmSync(dir, { recursive: true, force: true })
     }
 })

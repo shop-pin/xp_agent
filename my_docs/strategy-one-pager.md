@@ -56,6 +56,8 @@
 | 规则 | 参数键 | 默认 |
 |---|---|---|
 | 收盘收口链：复盘 turn 结束 → digest-run 编译 → 宿主自退（挂机无人值守；digest 失败不阻断自退） | `watch.closeOutAfterReview` | false（交互会话关） |
+| 盘后精选 turn：收口后喂命中池（带板块归属标签）精选明日候选 + 明日计划 | `watch.postCloseRefine` | false |
+| 盘后精选墙钟预算：精选 turn 超时未结束 = 烂尾自退（收口产物此时已全部落盘，会话不许悬挂——2026-11-04 实录教训） | `watch.refineTimeoutMs` | 600000（0 = 关） |
 
 ## 缺口清单（调试期按序）
 
