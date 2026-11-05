@@ -205,6 +205,10 @@ export function runScreener(opts: ScreenerRunOptions = {}): ScreenerRunResult {
         });
         for (const id of hitIds) perFormula.set(id, (perFormula.get(id) ?? 0) + 1);
     }
+    // 命中排序对齐通达信默认（2026-11-05 用户对表拍板）：按 6 位数字段升序
+    // （00→30→60→688→90）；代码全为前缀+6 位数字，数字段字符串序=数字序。
+    // 排在落盘前，jsonl/md/精选池全链继承同一顺序。
+    hits.sort((a, b) => (a.code.slice(2) < b.code.slice(2) ? -1 : a.code.slice(2) > b.code.slice(2) ? 1 : 0));
     // 数据防线（2026-11-03 实录）：TDX 源收盘的 daily-k 无换手率（全 0）——
     // CAPITAL/FINANCE 市值股本反推闸会整条静默失效（FLZT 当日 0 命中）。
     // 不拦跑，但在报告与 stdout 喊出声，免得拿"公式失效"当"行情没戏"。
