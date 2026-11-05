@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { defaultCloseOut, screenerSummary } from '../plugins/market-watch.js'
+import { defaultCloseOut, screenerSummary, spawnCli } from '../plugins/market-watch.js'
 import { loadStrategy, DEFAULT_STRATEGY } from '../plugins/strategy.js'
 import { renderScreenerSection, type ScreenerSummaryRow } from '../backtest/digest.js'
 
@@ -123,4 +123,15 @@ test('screenerSummary：一行完成提示（结果不打 terminal，只指报�
         else process.env.MINI_STOCKS_DATA_DIR = prevData
         rmSync(dir, { recursive: true, force: true })
     }
+})
+
+test('spawnCli：挂死子进程被墙钟超时树杀并 reject——收口链不永挂、自退保底（2026-11-05 execSync 挂死同族）', async () => {
+    const t0 = Date.now()
+    await assert.rejects(
+        spawnCli(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], 'hang-probe', 400),
+        /hang-probe 超时/,
+    )
+    assert.ok(Date.now() - t0 < 5000, '超时在预算附近触发，不是永挂')
+    // 正常退出路径不受影响：exit 0 resolve
+    await assert.doesNotReject(spawnCli(process.execPath, ['-e', 'process.exit(0)'], 'ok-probe', 5000))
 })

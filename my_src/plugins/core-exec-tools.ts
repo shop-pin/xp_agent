@@ -19,7 +19,9 @@ const SHELL_TIMEOUT_MS = 30000;
 const KILL_GRACE_MS = 5000;
 const MAX_CAPTURE = 5 * 1024 * 1024;
 
-function killTree(child: ChildProcess): void {
+/** 进程树杀（Windows timeout 只杀直接子进程、孤儿握管道的教训——run_shell
+ *  2026-11-05 挂死实录）：win32 走 taskkill /T /F；POSIX detached 组长负 pid 杀组。 */
+export function killTree(child: ChildProcess): void {
     if (process.platform === "win32") {
         try {
             spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" })

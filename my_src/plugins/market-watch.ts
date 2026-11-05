@@ -23,6 +23,7 @@
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
+import { killTree } from "./core-exec-tools.js";
 import type { Context } from "../cordis/context.js";
 import type { Plugin } from "../cordis/fiber.js";
 import { Service } from "../cordis/service.js";
@@ -107,41 +108,49 @@ export const defaultPrompts: WatchPrompts = {
     },
 };
 
-/** 收盘收口缺省实现：spawn 同仓的 digest-run CLI（零 LLM 编译当日 digest）。
- *  cwd 纪律：runbook 固定从 my_src 起 `node dist/cli.js`。显式 --day（2026-10-30
- *  缺陷③：缺省取最新收口日，当日断供时静默重算昨日 digest 无告警）；stderr
- *  捕获、非零退出显式 reject——digest 挂掉要能在收口链的 catch 里喊出声。
- *  收口链本身仍不阻断自退（digest 可事后手动补跑）。 */
-function spawnDigestRun(day: string): Promise<void> {
+/** 收口链单步墙钟预算（2026-11-05 教训：execSync 挂死同族——三个 spawn 此前
+ *  无超时，任一子进程永挂 = closeOut 永不收敛 = 自退到不了 = terminal 再僵死）。
+ *  超时 = 树杀 + reject，链 catch 喊出声后仍走 digest/精选/自退——产物缺一件
+ *  也要退。预算取 10 分钟：kclose 含 15:01 闸（收盘链场景等待 ≤60s + 覆写 ~30s）
+ *  余量充足；screener 真跑 ~20s、digest 秒级。 */
+const CLOSE_STEP_TIMEOUT_MS = 10 * 60_000;
+
+/** 收口链 spawn 统一包装：stderr 捕获、非零退出显式 reject、墙钟超时树杀。
+ *  cwd 纪律：runbook 固定从 my_src 起 `node dist/cli.js`（dist/py 相对路径）。 */
+export function spawnCli(file: string, args: string[], label: string,
+    timeoutMs: number = CLOSE_STEP_TIMEOUT_MS): Promise<void> {
     return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath,
-            [join("dist", "backtest", "digest-run.js"), "--day", day],
-            { stdio: ["ignore", "ignore", "pipe"] });
+        const child = spawn(file, args, { stdio: ["ignore", "ignore", "pipe"] });
         let err = "";
         child.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
+        const timer = setTimeout(() => {
+            killTree(child);
+            reject(new Error(`${label} 超时（${timeoutMs}ms，进程树已杀）——收口链不永挂`));
+        }, timeoutMs);
+        timer.unref?.();
         child.on("close", (code) => {
+            clearTimeout(timer);
             if (code === 0) resolve();
-            else reject(new Error(`digest-run exit ${code}${err.trim() ? `：${err.trim()}` : ""}`));
+            else reject(new Error(`${label} exit ${code}${err.trim() ? `：${err.trim()}` : ""}`));
         });
-        child.on("error", reject);
+        child.on("error", (e) => {
+            clearTimeout(timer);
+            reject(e);
+        });
     });
+}
+
+/** 收盘收口缺省实现：spawn 同仓的 digest-run CLI（零 LLM 编译当日 digest）。
+ *  显式 --day（2026-10-30 缺陷③：缺省取最新收口日，当日断供时静默重算昨日
+ *  digest 无告警）——digest 挂掉/超时要能在收口链的 catch 里喊出声。 */
+function spawnDigestRun(day: string): Promise<void> {
+    return spawnCli(process.execPath, [join("dist", "backtest", "digest-run.js"), "--day", day], "digest-run");
 }
 
 /** 选股步骤（SC5）：同形态 spawn screener-run（research 面，结果只进
  *  screener/<day>.{jsonl,md}）。开关 = strategy.screener.autoRun（默认 false）。 */
 function spawnScreenerRun(day: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath,
-            [join("dist", "backtest", "screener-run.js"), "--day", day],
-            { stdio: ["ignore", "ignore", "pipe"] });
-        let err = "";
-        child.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
-        child.on("close", (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(`screener-run exit ${code}${err.trim() ? `：${err.trim()}` : ""}`));
-        });
-        child.on("error", reject);
-    });
+    return spawnCli(process.execPath, [join("dist", "backtest", "screener-run.js"), "--day", day], "screener-run");
 }
 
 /** 盘后日K收口（2026-11-04 用户拍板：等满 15:01 用 TDX 已收日K覆写当日
@@ -151,18 +160,7 @@ function spawnScreenerRun(day: string): Promise<void> {
 function spawnKcloseRun(day: string): Promise<void> {
     const py = process.env.MINI_TDX_PYTHON
         ?? join("..", "mcp-tdx", ".venv", "Scripts", "python.exe");
-    return new Promise((resolve, reject) => {
-        const child = spawn(py,
-            [join("kclose-tdx.py"), "--day", day],
-            { stdio: ["ignore", "ignore", "pipe"] });
-        let err = "";
-        child.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
-        child.on("close", (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(`kclose-tdx exit ${code}${err.trim() ? `：${err.trim()}` : ""}`));
-        });
-        child.on("error", reject);
-    });
+    return spawnCli(py, [join("kclose-tdx.py"), "--day", day], "kclose-tdx");
 }
 
 /** 缺省收口链：盘后日K收口（kclose，等满 15:01 用 TDX 已收K覆写当日 daily-k）
