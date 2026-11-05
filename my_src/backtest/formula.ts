@@ -407,14 +407,40 @@ export interface CompiledFormula {
     outputs: string[];
 }
 
+/** TDX 参数头行（"参数1:N 最小值:1.00 最大值:300.00 缺省:35.00"）：FLZT 无参
+ *  走不到此路，ZLKP（2026-11-05）首个带参公式。头行剥除不进正文；缺省值作
+ *  params 基座、显式 opts.params 同名覆盖。名字段容错全角标点——用户手写
+ *  "M《"，TDX 指标管理器里是 "M"（ZLKP 文档截图为准）；名字保留 ASCII 词字
+ *  与汉字，书名号类全角符号剔除。 */
+export function stripTdxParamHeader(text: string): { body: string; defaults: Record<string, number> } {
+    const defaults: Record<string, number> = {};
+    const body: string[] = [];
+    for (const line of text.split(/\r?\n/)) {
+        const m = /^参数\d*\s*:(.*)$/.exec(line);
+        if (!m) { body.push(line); continue; }
+        const parts = m[1]!.trim().split(/\s+/).filter(Boolean);
+        const name = parts[0]?.replace(/[^\w一-鿿]/g, "");
+        if (!name) { body.push(line); continue; } // 畸形头不吞正文——缺名按普通行编译报错
+        for (const kv of parts.slice(1)) {
+            const eq = kv.indexOf(":");
+            if (eq > 0 && kv.slice(0, eq).trim() === "缺省") {
+                const v = Number(kv.slice(eq + 1));
+                if (Number.isFinite(v)) defaults[name.toUpperCase()] = v;
+            }
+        }
+    }
+    return { body: body.join("\n"), defaults };
+}
+
 export function loadFormula(text: string, opts: FormulaLoadOptions = {}): CompiledFormula {
-    const program = new Parser(lex(text)).parseProgram();
+    const { body, defaults } = stripTdxParamHeader(text);
+    const program = new Parser(lex(body)).parseProgram();
     const seen = new Set<string>();
     for (const st of program.statements) {
         if (seen.has(st.name)) throw new FormulaError(`变量重复定义：${st.name}`, 0);
         seen.add(st.name);
     }
-    const params = opts.params ?? {};
+    const params = { ...defaults, ...opts.params };
     const indicators = opts.indicators;
     // 静态检查：未知函数 / 未知名字 / 窗口参常量性
     const locals = new Set(program.statements.map((st) => st.name));

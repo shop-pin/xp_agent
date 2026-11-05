@@ -279,3 +279,27 @@ test('金例21：布尔序列参与数值比较=0/1 收缩（X_36>0 恒等自身
     const xg2 = evalXg('XG:(C>2)>0 AND (C>2)==(C>1);', bars([3]))
     assert.deepEqual(xg2, [true])
 })
+
+test('金例22：TDX 参数头——ZLKP 形态三行头剥除、M《 容错为 M、缺省垫底、显式覆盖（2026-11-05）', () => {
+    const text = [
+        '参数1:N 最小值:1.00 最大值:300.00 缺省:35.00',
+        '参数2:M《 最小值:1.00 最大值:300.00 缺省:35.00',
+        '参数3:N1 最小值:1.00 最大值:1000.00 缺省:3.00',
+        'A:MA(C,N); XG:CROSS(A, MA(C,M));',
+    ].join('\n')
+    // 头行剥除（正文无「参数」行）、缺省真进 params；FLZT 无参路径零漂移
+    const f = loadFormula(text, { requireXg: true })
+    assert.deepEqual(f.params, { N: 35, M: 35, N1: 3 })
+    // 显式覆盖同名参数（screeners.json params 优先于缺省）
+    assert.equal(loadFormula(text, { requireXg: true, params: { N: 5 } }).params.N, 5)
+    // 缺省值真参与求值：N=35 超窗口 → MA 全 null → xg 全 false，不炸
+    assert.deepEqual(evalXg(text, bars([1, 2, 3])), [false, false, false])
+})
+
+test('金例23：参数头缺省值参与 SMA 链——手算锚（P=2）', () => {
+    const text = '参数1:P 最小值:1.00 最大值:10.00 缺省:2.00\nV1:=SMA(C,P,1); XG:V1>=3;'
+    // SMA(C,2,1)：Y0=C0=2（首根播种）；Y1=(1×4+(2-1)×2)/2=3 → idx1 达标
+    const f = loadFormula(text, { requireXg: true })
+    assert.equal(f.params.P, 2)
+    assert.deepEqual(runFormula(f, baseFromBars(bars([2, 4]))).xg!, [false, true])
+})
