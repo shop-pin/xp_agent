@@ -16,10 +16,16 @@ const args = process.argv.slice(2);
 const record = args.includes("--record");
 const chapters = args.filter((a) => !a.startsWith("--"));
 
-const dirs = existsSync(join(HERE, "snapshots"))
-    ? readdirSync(join(HERE, "snapshots")).filter((d) => /^ch\d+$/.test(d))
-        .sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)))
+// 双根扫描（缝契约 §1.2 第 6 条）：框架章 snapshots/ + 股票章 stock/snapshots/
+// ——stock/ 缺席（纯框架仓）时第二根天然为空，框架单独跑零股票章。
+const scanRoot = (root) => existsSync(root)
+    ? readdirSync(root).filter((d) => /^ch\d+$/.test(d)).map((d) => ({ dir: d, root }))
     : [];
+const found = [
+    ...scanRoot(join(HERE, "snapshots")),
+    ...scanRoot(join(HERE, "stock", "snapshots")),
+].sort((a, b) => Number(a.dir.slice(2)) - Number(b.dir.slice(2)));
+const dirs = found.map((f) => f.dir);
 if (dirs.length === 0) {
     console.error("no snapshots/ recorded yet — record with: node run-mock.mjs <ch> --snapshot-record");
     process.exit(1);

@@ -14,13 +14,12 @@
   },
   "include": [
     "*.ts",
-    "backtest/**/*.ts",
     "cordis/**/*.ts",
     "cordis-tests/**/*.ts",
     "services/**/*.ts",
     "plugins/**/*.ts",
-    "scripts/**/*.ts",
     "webui/**/*.ts",
-    "webui/**/*.tsx"
+    "webui/**/*.tsx",
+    "stock/**/*.ts"
   ]
 }

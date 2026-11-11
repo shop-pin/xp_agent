@@ -22,9 +22,23 @@ export class ApprovalService extends Service {
     private interactive: ApprovalProvider | null = null;
     private fallback: ApprovalProvider | null = null;
     private confirmed = new Set<string>();
+    /** 无人值守（挂机 armed）：ask 一律立即拒绝，绝不挂 readline 等键。
+     *  2026-11-06 实录：default 模式挂机，巡检写新 memory 文件撞上确认门，
+     *  readline 等键 8 小时，收盘收口链全灭——REPL 在场 ≠ 有人在键盘前，
+     *  "有没有人"的权威信号是 watch armed，不是 provider 是否存在。 */
+    private unattended = false;
 
     setInteractiveProvider(provider: ApprovalProvider): void {
         this.interactive = provider;
+    }
+
+    /** watch armed（无人值守）置 true，/watch off 恢复交互。 */
+    setUnattended(v: boolean): void {
+        this.unattended = v;
+    }
+
+    isUnattended(): boolean {
+        return this.unattended;
     }
 
     /** 审批插件的 apply 里设置（REPL 问答兜底）。 */
@@ -38,6 +52,9 @@ export class ApprovalService extends Service {
     }
 
     async request(call: PreExecCall, message: string): Promise<ApprovalVerdict> {
+        // 无人值守闸压在 provider 选择之前：三条 ask 来路（静态九段 confirm /
+        // 分类器 autoFallback / trade-guard 下单卡）全在此收敛，一处拦截全覆盖
+        if (this.unattended) return "deny";
         const cacheable = call.mode !== "auto";
         if (cacheable && this.confirmed.has(message)) return "allow-always";
         const provider = this.interactive ?? this.fallback;

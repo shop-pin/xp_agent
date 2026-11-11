@@ -45,14 +45,8 @@ import { coreMetaTools } from "./plugins/core-meta-tools.js";
 import { approvalPlugin } from "./plugins/approval.js";
 import { autoApprovalPlugin } from "./plugins/auto-approval.js";
 import { autonomyPlugin } from "./plugins/autonomy.js";
-import { marketDataPlugin, sinaSource } from "./plugins/market-data.js";
-import { makeTdxSource } from "./plugins/market-data-tdx.js";
-import { newsFeedPlugin } from "./plugins/news-feed.js";
-import { signalEnginePlugin } from "./plugins/signal-engine.js";
-import { paperBrokerPlugin } from "./plugins/paper-broker.js";
-import { tradeGuardPlugin } from "./plugins/trade-guard.js";
-import { marketWatchPlugin } from "./plugins/market-watch.js";
-import { dataStorePlugin } from "./plugins/data-store.js";
+import { existsSync } from "fs";
+import { fileURLToPath, pathToFileURL } from "url";
 
 /** 插件表：resolve(name) 的静态映射。 */
 export const plugins: Record<string, Plugin> = {
@@ -79,13 +73,6 @@ export const plugins: Record<string, Plugin> = {
     "auto-approval": autoApprovalPlugin,
     "autonomy": autonomyPlugin,
     "host-webserver": hostWebserverPlugin,
-    "market-data": marketDataPlugin,
-    "news-feed": newsFeedPlugin,
-    "signal-engine": signalEnginePlugin,
-    "paper-broker": paperBrokerPlugin,
-    "trade-guard": tradeGuardPlugin,
-    "market-watch": marketWatchPlugin,
-    "data-store": dataStorePlugin,
 };
 
 export function resolvePlugin(name: string): Plugin {
@@ -224,36 +211,10 @@ function webPort(): number | undefined {
  * 瀑布里只剩 approval 外层（deny 规则硬底线 + 九段静态流水线）。
  * 'web'：web Host 版——启用 host 行并接上桥（--dump-config 无宿主时保持
  * disabled 占位：预览不该真的绑端口）。
+ * stock 系 profile 不在本文件：缝契约下它们住在 stock/cordis.stock.config.ts，
+ * 启动时动态发现并入本表（文件末尾）——框架对股票域零 import。
  */
-/** stock profile 的行集（M7 抽出——stock 与 stock-tdx 只差 market 行的源注入）。 */
-function stockRows(host: AppHost | undefined, marketConfig?: Record<string, unknown>): Row[] {
-    const marketRow: Row = { id: "market", name: "market-data", ...(marketConfig ? { config: marketConfig } : {}) };
-    return host ? [
-        { id: "skills", name: "skills-registry", config: { catalogInjection: !host.isSubAgent, productSkills: true } },
-        { id: "guard", name: "trade-guard" },
-        marketRow,
-        { id: "news", name: "news-feed" },
-        { id: "signals", name: "signal-engine" },
-        { id: "broker", name: "paper-broker" },
-        // S9：memory 行整行替换——必须带上 app 层的桥与开关（同 skills 行纪律），
-        // 额外打开 writeTool（/review 的持仓与偏好落盘）
-        { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
-        // S9：盯盘编排——唤醒桥从宿主接（C5 loop 同款 inbox next-turn）；
-        // 收盘收口自退桥（方案 C）同源接出
-        { id: "watch", name: "market-watch", config: { wake: host.wake, exit: host.requestExit } },
-        { id: "datastore", name: "data-store" },
-    ] : [
-        { id: "skills", name: "skills-registry", config: { productSkills: true } },
-        { id: "guard", name: "trade-guard" },
-        marketRow,
-        { id: "news", name: "news-feed" },
-        { id: "signals", name: "signal-engine" },
-        { id: "broker", name: "paper-broker" },
-        { id: "memory", name: "memory-prefetch", config: { writeTool: true } },
-        { id: "watch", name: "market-watch" },
-        { id: "datastore", name: "data-store" },
-    ];
-}
+
 
 export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
     full: [],
@@ -274,46 +235,28 @@ export const profiles: Record<string, Row[] | ((host?: AppHost) => Row[])> = {
             },
         }]
         : [{ id: "host", name: "host-webserver", disabled: true }],
-    // S1+S2：股票版——启用行情数据面 + 产品内置技能层（my_src/skills/，
-    // product rank 5：用户/项目同名技能可覆盖）。工厂形态是因为 skills 行
-    // 的 catalogInjection 要跟宿主走（子 agent 不注入目录——D1 语义，整行
-    // 替换不能丢掉 app 层给的这个开关）。
-    // M7：marketRow 参数支持源注入（stock-tdx 变体传 tdxSource；缺省新浪）。
-    stock: (host) => stockRows(host),
-    // M7：TDX 源变体——数据面走 eltdx 网关（前置：python -m eltdx.http_server
-    // --port 7727，env MINI_TDX_GATEWAY）。网关连续失败（约 15s）自动切新浪兜底
-    // 并发降级告警（2026-10-30 缺陷①：fail-closed 裸奔一天零告警的修复）——
-    // 切换不自动切回（防抖动，挂机日结进程每日重启即重置）；池工具的估值过滤
-    // 在 TDX 源下退化（见 market-data-tdx 头注），兜底期同样退化。
-    "stock-tdx": (host) => stockRows(host, { source: makeTdxSource(), fallback: sinaSource }),
-    // S7：web + stock 组合——F6 投影侧栏要看 trade 流水，得同时有 host 行和
-    // broker 行。profile 是单选的，组合形态就显式做成第四个名字（不加多层
-    // 组合语法——两个真实需求之前不发明机制）。
-    "web-stock": (host) => host
-        ? [
-            ...((profiles.web as (host?: AppHost) => Row[])(host)),
-            { id: "skills", name: "skills-registry", config: { catalogInjection: true, productSkills: true } },
-            { id: "guard", name: "trade-guard" },
-            { id: "market", name: "market-data" },
-            { id: "news", name: "news-feed" },
-            { id: "signals", name: "signal-engine" },
-            { id: "broker", name: "paper-broker" },
-            { id: "memory", name: "memory-prefetch", config: { bridge: { inject: host.inject }, enabled: !host.isSubAgent, writeTool: true } },
-            { id: "watch", name: "market-watch", config: { wake: host.wake, exit: host.requestExit } },
-            { id: "datastore", name: "data-store" },
-        ]
-        : [
-            { id: "host", name: "host-webserver", disabled: true },
-            { id: "skills", name: "skills-registry", config: { productSkills: true } },
-            { id: "guard", name: "trade-guard" },
-            { id: "market", name: "market-data" },
-            { id: "news", name: "news-feed" },
-            { id: "signals", name: "signal-engine" },
-            { id: "broker", name: "paper-broker" },
-            { id: "memory", name: "memory-prefetch", config: { writeTool: true } },
-            { id: "watch", name: "market-watch" },
-            { id: "datastore", name: "data-store" },
-        ],
+}
+
+// ---------- 股票域动态发现（缝契约 §1.2） ----------
+// stock/cordis.stock.config.ts 提供 { plugins, profiles } 两件套（disabled 占位
+// 行本就住在 baseRows，loader 对 disabled 行 resolve 前跳过——占位不需要插件
+// 实现，瀑布序与 dump-config 输出零扰动）。文件存在→并入本模块的两张表；
+// 缺席→纯框架启动（新机器克隆框架仓即可全绿）。存在但损坏 → import 抛错
+// 裸奔失败（fail-loud），不吞。发现必须放在两张表初始化之后：stock 补丁
+// 静态 import 本模块取 Row/AppHost 类型与 web profile 行集（环经动态
+// import 切开，此处所有绑定已初始化）。
+export interface StockPatch {
+    /** 插件表增量：resolve(name) 的静态映射补充（active 股票行靠它解析）。 */
+    plugins?: Record<string, Plugin>;
+    /** 命名补丁层增量：stock 系 profile（含宿主桥工厂）。 */
+    profiles?: Record<string, Row[] | ((host?: AppHost) => Row[])>;
+}
+
+const stockSpec = fileURLToPath(new URL("./stock/cordis.stock.config.js", import.meta.url));
+if (existsSync(stockSpec)) {
+    const patch = (await import(pathToFileURL(stockSpec).href)) as StockPatch;
+    Object.assign(plugins, patch.plugins ?? {});
+    Object.assign(profiles, patch.profiles ?? {});
 }
 
 /** 分层铺平：同 id 后写胜（整行替换）。loadRows 内部还有一次同 id 去重，

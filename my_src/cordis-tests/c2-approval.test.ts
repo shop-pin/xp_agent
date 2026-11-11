@@ -9,9 +9,9 @@ import { mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Context } from '../cordis/context.js'
-import { ToolsService, type ToolExec, type ExecOutcome } from '../services/tools.js'
+import { ToolsService, withToolWatchdog, toolWatchdogMs, type ToolExec, type ExecOutcome, type PreExecCall } from '../services/tools.js'
 import { checkPermission } from '../permissions.js'
-import { approvalPlugin } from '../plugins/approval.js'
+import { approvalPlugin, makeReplFallbackProvider } from '../plugins/approval.js'
 import { autoApprovalPlugin } from '../plugins/auto-approval.js'
 import type { ApprovalService } from '../services/approval.js'
 import { coreFsTools } from '../plugins/core-fs-tools.js'
@@ -296,4 +296,102 @@ test('post-execute：监听器可改写输出（block 带反馈），无监听�
   const run = exec(h)
   const outcome = await run('run_shell', { command: 'echo hi' }, 'default')
   assert.equal(outcome.kind === 'result' && outcome.output, '[blocked] EXECUTED')
+})
+
+// ---------- 无人值守闸（2026-11-06 审批 readline 挂 8 小时修复） ----------
+
+test('unattended：armed 期间 ask 一律自动拒（provider 不被惊动），解除后恢复交互', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'c2-unattended-'))
+  try {
+    const fresh = join(dir, 'fresh.txt')
+    const h = buildTree(true) // interactive provider 恒 allow——armed 时也绝不能被问到
+    h.approval.setUnattended(true)
+    const run = exec(h)
+    const denied = await run('write_file', { file_path: fresh, content: 'x' }, 'default')
+    assert.equal(denied.kind, 'denied')
+    assert.equal(denied.kind === 'denied' && denied.content,
+      'Denied: watch armed (unattended) — actions needing confirmation are auto-denied until /watch off.')
+    assert.equal(h.providerCalls.length, 0, 'armed 期间 provider 绝不能被问——问 = readline 挂死回归')
+
+    // 解除（/watch off）：同一动作恢复走交互问答
+    h.approval.setUnattended(false)
+    const allowed = await run('write_file', { file_path: fresh, content: 'x' }, 'default')
+    assert.equal(allowed.kind, 'result')
+    assert.equal(h.providerCalls.length, 1)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('unattended 覆盖 auto 模式的 autoFallback confirm 路径', async () => {
+  const ctx = new Context()
+  const tools = new ToolsService(ctx, 'tools')
+  new UiService(ctx, 'ui')
+  ctx.plugin(approvalPlugin)
+  ctx.plugin(autoApprovalPlugin)
+  const approval = ctx.require<ApprovalService>('approval')
+  const asked: string[] = []
+  approval.setInteractiveProvider(async (_c, m) => { asked.push(m); return 'deny' })
+  approval.setUnattended(true)
+  const outcome = await tools.executeCall(
+    { name: 'run_shell', input: { command: 'rm -rf a' }, mode: 'auto' },
+    { dispatch: async () => EXECUTED },
+  )
+  assert.equal(outcome.kind, 'denied')
+  assert.equal(asked.length, 0, 'autoFallback 的 confirm 也必须被 unattended 闸拦下')
+})
+
+// ---------- 工具执行看门狗（2026-11-05 挂账销账） ----------
+
+test('watchdog：快路径原样通过；超墙钟 reject；孤儿后续 reject 不炸进程', async () => {
+  assert.equal(toolWatchdogMs(), 600_000, 'env 未设 → 缺省 10 分钟')
+  const prev = process.env.MINI_TOOL_TIMEOUT_MS
+  try {
+    process.env.MINI_TOOL_TIMEOUT_MS = '5'
+    assert.equal(toolWatchdogMs(), 5)
+  } finally {
+    if (prev === undefined) delete process.env.MINI_TOOL_TIMEOUT_MS
+    else process.env.MINI_TOOL_TIMEOUT_MS = prev
+  }
+
+  const passthrough = await withToolWatchdog(async () => 'ok', 50, 'fast-tool')
+  assert.equal(passthrough, 'ok')
+
+  // 孤儿在看门狗胜出后才 reject——reject 由 race 落给断言；孤儿分支被吞，
+  // unhandled rejection 会让 node --test 判红，下面的等待窗就是给它的
+  await assert.rejects(
+    withToolWatchdog(
+      () => new Promise<string>((_, reject) => setTimeout(() => reject(new Error('late orphan failure')), 40)),
+      10, 'slow-tool',
+    ),
+    /tool watchdog: slow-tool exceeded 0s wall clock/,
+  )
+  await new Promise((r) => setTimeout(r, 60))
+})
+
+test('watchdog：超时 reject 的话术带工具名与秒数', async () => {
+  await assert.rejects(
+    withToolWatchdog(() => new Promise<string>(() => { }), 20, 'write_file'),
+    /tool watchdog: write_file exceeded 0s wall clock/,
+  )
+})
+
+// ---------- 审批 provider 的 abort 感知（Ctrl+C 解挂确认） ----------
+
+test('repl provider：挂起后 abort → deny 解挂（Ctrl+C 不再被 readline 吞掉）', async () => {
+  const ui = { confirmation() { } } as unknown as UiService
+  const ac = new AbortController()
+  // 注：工厂闭包 process.stdin——挂起确认走真实 stdin（测试环境无输入，不会自答）
+  const pending = makeReplFallbackProvider(ui)({ signal: ac.signal } as unknown as PreExecCall, 'wanna write?')
+  setTimeout(() => ac.abort(), 10)
+  const verdict = await pending
+  assert.equal(verdict, 'deny')
+})
+
+test('repl provider：abort 已发生后调用 → 立即 deny 不开 readline', async () => {
+  const ui = { confirmation() { } } as unknown as UiService
+  const ac = new AbortController()
+  ac.abort()
+  const verdict = await makeReplFallbackProvider(ui)({ signal: ac.signal } as unknown as PreExecCall, 'm?')
+  assert.equal(verdict, 'deny')
 })

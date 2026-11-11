@@ -112,6 +112,40 @@ export function monotonic(
     };
 }
 
+// ---------- 工具执行看门狗（driver 级墙钟硬解，2026-11-05 挂账销账） ----------
+
+/** 看门狗预算：env 覆盖（MINI_TOOL_TIMEOUT_MS），缺省 10 分钟。
+ *  在途工具的现状：run_shell 30s 树杀、MCP 60s、行情 fetch 10-30s——都远小于
+ *  缺省值；能吃满 10 分钟的只有"结构性挂死"（2026-11-06 实录：审批 readline
+ *  等键 8 小时）。 */
+export function toolWatchdogMs(): number {
+    const raw = Number(process.env.MINI_TOOL_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 600_000;
+}
+
+/** 墙钟竞速：超时 reject（agent 循环的 catch 转成 error tool_result，driver
+ *  继续），败者的后续 resolve/reject 一律丢弃——注意孤儿不会被打断（审批
+ *  readline 会一直挂着等人按键，迟到的 y 仍会执行写入），看门狗只是把 driver
+ *  从等待里解放出来，不是终止器。 */
+export async function withToolWatchdog<T>(run: () => Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    const orphan = run();
+    orphan.catch(() => { }); // 看门狗胜出后孤儿若 reject，不能变成 unhandled rejection
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            orphan,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`tool watchdog: ${label} exceeded ${Math.round(timeoutMs / 1000)}s wall clock`)),
+                    timeoutMs,
+                );
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 export interface ToolDefinition {
     name: string;
     description: string;
@@ -234,6 +268,11 @@ export class ToolsService extends Service {
                 ? await approval.request(preCall, decision.message)
                 : "deny"; // fail-closed：没有审批服务的树不执行任何 ask
             if (verdict === "deny") {
+                // 无人值守自动拒：announce 上 UI 留痕（区别于人手按 n 的静默）
+                if (approval?.isUnattended()) {
+                    const reason = "Denied: watch armed (unattended) — actions needing confirmation are auto-denied until /watch off.";
+                    return { kind: "denied", content: reason, announce: reason };
+                }
                 return { kind: "denied", content: "User denied this action." };
             }
         }

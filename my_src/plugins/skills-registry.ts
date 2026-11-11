@@ -14,7 +14,6 @@
 import { existsSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import { fileURLToPath } from "url";
 import { Service } from "../cordis/service.js";
 import type { Context } from "../cordis/context.js";
 import { parseSkillFile, buildSkillDescriptions, type SkillDefinition } from "../skills.js";
@@ -81,18 +80,19 @@ function scanSkillDir(baseDir: string, source: "user" | "project" | "product"): 
 
 export const skillsPlugin = {
     name: "skills-registry",
-    apply(ctx: Context, config: { catalogInjection?: boolean; productSkills?: boolean } = {}) {
+    apply(ctx: Context, config: { catalogInjection?: boolean; productSkills?: string } = {}) {
         const reg = new SkillRegistry(ctx, "skills");
         // S2：产品内置技能层（对齐真 CC 的 built-in skills）——rank 5 低于
         // user(10)/project(20)：产品给的默认能力，用户/项目同名可覆盖。
-        // 默认关（stock profile 打开）：base 的目录注入不增行，mock/snapshot
-        // 锚定的首条 user 消息零变化。
-        if (config.productSkills) {
+        // 默认关：base 的目录注入不增行，mock/snapshot 锚定的首条 user 消息
+        // 零变化。开的时候由产品补丁传目录（缝契约：框架不认识 stock/skills，
+        // 路径来自 cordis.stock.config 的 skills 行）。
+        const productSkillsDir = config.productSkills;
+        if (productSkillsDir) {
             reg.registerProvider({
                 source: "product",
                 rank: 5,
-                list: () => scanSkillDir(
-                    fileURLToPath(new URL("../../skills", import.meta.url)), "product"),
+                list: () => scanSkillDir(productSkillsDir, "product"),
             });
         }
         reg.registerProvider({

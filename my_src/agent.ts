@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { toolDefinitions, type ToolDef } from "./tools.js";
-import { ToolsService, getActiveToolDefinitions, truncateResult, activateTools, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
+import { ToolsService, getActiveToolDefinitions, truncateResult, activateTools, withToolWatchdog, toolWatchdogMs, type ToolDefinition, type TurnConclusion } from "./services/tools.js";
 import type { ApprovalService } from "./services/approval.js";
 import { SessionLog, type TokenUsage, type SessionEvent } from "./services/session-log.js";
 import { LlmRuntime, assembleStream, MODEL, type Settlement } from "./services/llm.js";
@@ -956,14 +956,20 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         this.sessionLog.append({ type: "tool/call", id: tu.id, name: tu.name, input: tu.input as Record<string, any> });
                         // C2：权限决策与执行整体下沉 executeCall 管线（pre-execute 瀑布
                         // → 审批 → dispatch → post-execute）。D6 起 auto 分类器机制
-                        // 也在 auto-approval 插件里（句柄消亡，管线只借中断信号）
-                        const outcome = await this.cordis.require<ToolsService>("tools").executeCall(
-                            { name: tu.name, input: tu.input as Record<string, any>, mode: this.mode, planFilePath: this.planFilePath || undefined },
-                            {
-                                readFileState: this.readFileState,
-                                dispatch: (n, i) => this.executeToolCall(n, i),
-                                signal: this.abortController?.signal,
-                            },
+                        // 也在 auto-approval 插件里（句柄消亡，管线只借中断信号）。
+                        // 墙钟看门狗兜底：管线里任何结构性挂死（2026-11-05 execSync、
+                        // 2026-11-06 审批 readline）都只烧掉这一个工具的结果，driver 继续
+                        const outcome = await withToolWatchdog(
+                            () => this.cordis.require<ToolsService>("tools").executeCall(
+                                { name: tu.name, input: tu.input as Record<string, any>, mode: this.mode, planFilePath: this.planFilePath || undefined },
+                                {
+                                    readFileState: this.readFileState,
+                                    dispatch: (n, i) => this.executeToolCall(n, i),
+                                    signal: this.abortController?.signal,
+                                },
+                            ),
+                            toolWatchdogMs(),
+                            tu.name,
                         );
                         if (outcome.kind === "denied") {
                             if (outcome.announce) this.ui.info(`Denied: ${outcome.announce}`);

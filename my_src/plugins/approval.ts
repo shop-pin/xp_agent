@@ -23,14 +23,27 @@ import { UiService } from "../services/ui-service.js";
 export { ApprovalService };
 
 // 旧 confirmDangerous 的展示职责留在这里：问什么先打出来，回调只收 y/n
-//（E1：横幅经 ctx.ui 渲染器出——provider 改为 apply 里闭包 ui 的工厂产物）
-const makeReplFallbackProvider = (ui: UiService): ApprovalProvider => async (_call, message) => {
+//（E1：横幅经 ctx.ui 渲染器出——provider 改为 apply 里闭包 ui 的工厂产物）。
+// 导出仅供测试注入 stdin。abort 感知：Ctrl+C（busy 分支 abort）能解挂确认——
+// 否则 readline 默认吞 SIGINT，cli 的 cancel 动不了这条等待（2026-11-06 实录：
+// 审批 readline 挂 8 小时，Ctrl+C 无效只能关窗）。导出仅供测试。
+export const makeReplFallbackProvider = (ui: UiService): ApprovalProvider => async (call, message) => {
     ui.confirmation(message);
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise<"allow-once" | "deny">((resolve) => {
-        rl.question("  Allow? (y/n): ", (answer) => {
+        let settled = false;
+        const done = (verdict: "allow-once" | "deny") => {
+            if (settled) return;
+            settled = true;
+            call.signal?.removeEventListener("abort", onAbort);
             rl.close();
-            resolve(answer.toLowerCase().startsWith("y") ? "allow-once" : "deny");
+            resolve(verdict);
+        };
+        const onAbort = () => done("deny");
+        if (call.signal?.aborted) { done("deny"); return; }
+        call.signal?.addEventListener("abort", onAbort, { once: true });
+        rl.question("  Allow? (y/n): ", (answer) => {
+            done(answer.toLowerCase().startsWith("y") ? "allow-once" : "deny");
         });
     });
 };
