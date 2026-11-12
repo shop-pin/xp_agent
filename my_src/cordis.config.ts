@@ -15,36 +15,36 @@
 // 危险点（E2 章规格）：patch 的覆盖粒度是整行替换——想改 config 必须连
 // name 一起写全，只写 config 会把 name 顶掉（resolve 直接 fail）。
 
-import type { Row } from "./cordis/loader.js";
-import type { Plugin } from "./cordis/fiber.js";
+import type { Row } from "./src/core/loader.js";
+import type { Plugin } from "./src/core/fiber.js";
 
 // 再导出行类型：patch 文件 / cli / agent 都从清单这里拿（清单是装配语义的家）
 export type { Row };
-import type { PermissionMode } from "./permissions.js";
-import type { CommandsBridge } from "./plugins/commands.js";
-import type { HostBridge } from "./plugins/host-webserver.js";
-import { hostWebserverPlugin } from "./plugins/host-webserver.js";
-import { buildStaticSystemPrompt } from "./prompt.js";
+import type { PermissionMode } from "./src/approval/permissions.js";
+import type { CommandsBridge } from "./src/interaction/commands.js";
+import type { HostBridge } from "./src/host/host-webserver.js";
+import { hostWebserverPlugin } from "./src/host/host-webserver.js";
+import { buildStaticSystemPrompt } from "./src/core/prompt.js";
 
 import {
     serviceTools, serviceSessionLog, serviceUi, serviceCommands,
     serviceLlm, serviceSystemPrompt, serviceAgents,
-} from "./plugins/services.js";
-import { llmAnthropicPlugin } from "./plugins/llm-anthropic.js";
-import { adapterEchoPlugin } from "./plugins/adapter-echo.js";
-import { promptSectionsPlugin } from "./plugins/prompt-sections.js";
-import { skillsPlugin } from "./plugins/skills-registry.js";
-import { commandsPlugin } from "./plugins/commands.js";
-import { mcpBridgePlugin } from "./plugins/mcp-bridge.js";
-import { subagentPlugin } from "./plugins/subagent.js";
-import { memoryPlugin } from "./plugins/memory.js";
-import { compactionPlugin } from "./plugins/compaction.js";
-import { coreFsTools } from "./plugins/core-fs-tools.js";
-import { coreExecTools } from "./plugins/core-exec-tools.js";
-import { coreMetaTools } from "./plugins/core-meta-tools.js";
-import { approvalPlugin } from "./plugins/approval.js";
-import { autoApprovalPlugin } from "./plugins/auto-approval.js";
-import { autonomyPlugin } from "./plugins/autonomy.js";
+} from "./src/plugins/services.js";
+import { llmAnthropicPlugin } from "./src/llm/llm-anthropic.js";
+import { adapterEchoPlugin } from "./src/plugins/adapter-echo.js";
+import { promptSectionsPlugin } from "./src/interaction/prompt-sections.js";
+import { skillsPlugin } from "./src/skill/skills-registry.js";
+import { commandsPlugin } from "./src/interaction/commands.js";
+import { mcpBridgePlugin } from "./src/mcp/mcp-bridge.js";
+import { subagentPlugin } from "./src/subagent/subagent-plugin.js";
+import { memoryPlugin } from "./src/memory/memory-plugin.js";
+import { compactionPlugin } from "./src/compaction/compaction.js";
+import { coreFsTools } from "./src/tools/core-fs-tools.js";
+import { coreExecTools } from "./src/tools/core-exec-tools.js";
+import { coreMetaTools } from "./src/tools/core-meta-tools.js";
+import { approvalPlugin } from "./src/approval/approval.js";
+import { autoApprovalPlugin } from "./src/approval/auto-approval.js";
+import { autonomyPlugin } from "./src/core/autonomy-plugin.js";
 import { existsSync } from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
 

@@ -1,0 +1,317 @@
+// services/tools.ts——C1：工具注册表。第一个长在 B 阶段地基上的业务服务。
+// 参照物：deepseek-harness-master/packages/core/tools/src/index.ts（ToolDefinition
+// 接口段）与 docs/cookbook/adding-a-tool.md。
+//
+// 职责边界（C1）：
+//   - 注册表本体：register（返回 disposer，走插件 fiber 的 effect 自动回滚）/
+//     get / list（顺序 = 注册序，必须与旧 toolDefinitions 数组序一致——请求体
+//     tools 数组逐字节等价的生命线）
+//   - 激活态：tool_search 的"一次搜索，终身有效"仍是模块级全局（对齐 src：
+//     主对话激活对后续所有请求含子 agent 生效），收编进本模块
+//   - truncateResult：工具输出截断的归属也在这里，行为不变
+//
+// 真框架有、mini 略（记入当章文档差距清单）：output.schema/render、
+// isConcurrencySafe、timeoutMs、presentCall/Result、mcp 动态工具的类型面。
+
+import type Anthropic from "@anthropic-ai/sdk";
+import { Service } from "../core/service.js";
+import { toolDefinitions, type ToolDef } from "./tools.js";
+import type { PermissionMode } from "../approval/permissions.js";
+import type { ApprovalService } from "../approval/approval-service.js";
+
+/** 工具参数的 JSON Schema（即 Anthropic.Tool 的 input_schema）。 */
+export interface JSONSchema {
+    type: "object";
+    properties?: Record<string, unknown>;
+    required?: string[];
+}
+
+/** 权限提示：C2 权限瀑布用，C1 只挂上不消费。"trade" = 模拟盘交易面——
+ *  TradeGuard 在瀑布最外层做代码级风控，不再进人工/分类器确认（无人值守
+ *  会话等键盘会把 turn 驱动卡死）。实盘 broker（S15）不得用此 hint。 */
+export type PermissionHint = "read" | "edit" | "exec" | "meta" | "trade";
+
+/** 工具执行上下文：agent 循环借给工具的运行时资源（随章节扩充）。 */
+export interface ToolExec {
+    /** read-before-edit 簿记：路径 → 上次读取的 mtime。 */
+    readFileState?: Map<string, number>;
+    /** agent 的完整分发链（魔法名 → 注册表）——管线管权限，分发归 agent。
+     *  返回 string 即工具输出；返回 TurnConclusion 即工具自结 turn（C5）。 */
+    dispatch?: (name: string, input: Record<string, any>) => Promise<string | TurnConclusion>;
+    /** 在途请求的中断信号（D6 起取代 autoAdjudicate 句柄——分类器机制
+     *  已迁 auto-approval 插件，管线只需要"能被取消"这件事本身）。 */
+    signal?: AbortSignal;
+}
+
+// ---------- C2：执行管线——pre-execute 瀑布 + 审批 + 执行 + post-execute 瀑布 ----------
+
+/** pre-execute 监听器的裁决。allow 放行；deny 硬拒；ask 交审批服务。 */
+export type PreExecDecision =
+    | { type: "allow" }
+    | { type: "deny"; reason: string }
+    | { type: "ask"; message: string };
+
+/** 传给 pre-execute 监听器的调用快照。 */
+export interface PreExecCall {
+    name: string;
+    input: Record<string, any>;
+    mode: PermissionMode;
+    planFilePath?: string;
+    /** 注册表定义（permissionHint 元数据在这里）；mcp__/未知名为 undefined。 */
+    def?: ToolDefinition;
+    /** 在途请求的中断信号（分类器旁调要能随 turn 一起被取消）。 */
+    signal?: AbortSignal;
+}
+
+/** executeCall 的结果：正常输出，或被拒（announce = 需要打印的拒绝原因）。 */
+export type ExecOutcome =
+    | { kind: "result"; output: string; conclusion?: TurnConclusion }
+    | { kind: "denied"; content: string; announce?: string };
+
+/** C5：工具自结 turn 的结论。第一个签发者是 plan 的 clear-and-execute——
+ *  循环只认识这个对象，不认识任何工具的私有状态位。 */
+export interface TurnConclusion {
+    /** 本 step 结束后 turn 收敛，不再继续工具循环。 */
+    concludeTurn: true;
+    /** 跳过本批 tool_result 回灌——clear-and-execute 清历史后，批次里的结果
+     *  没有对应的 tool_use（孤儿化 → 400），必须一并丢弃。 */
+    dropBatch?: boolean;
+    /** 注入文本排 inbox 的 next-turn，drain 循环开新 turn 消费（首条消息的
+     *  reminder 待遇由 runOneTurn 的 pushUser 统一给）。 */
+    nextTurnInput?: string;
+}
+
+function isTurnConclusion(v: unknown): v is TurnConclusion {
+    return typeof v === "object" && v !== null && (v as TurnConclusion).concludeTurn === true;
+}
+
+const DECISION_RANK: Record<PreExecDecision["type"], number> = { allow: 0, ask: 1, deny: 2 };
+
+/** 单调收紧：取两个裁决中更严的那个（同级保留 inner 的 payload——外层只能加严，不能改写）。 */
+function tightenDecisions(inner: PreExecDecision, own: PreExecDecision): PreExecDecision {
+    return DECISION_RANK[own.type] > DECISION_RANK[inner.type] ? own : inner;
+}
+
+/**
+ * 单调守卫：包一层监听器，保证它只能收紧 inner（next()）的裁决。
+ * listener 不调 next = 否决，自己的裁决即为终局（短路保持——inner 不执行）；
+ * 调了 next，返回值比 inner 松 → 丢弃，维持 inner（deny 之后无人能翻案）。
+ */
+export function monotonic(
+    listener: (call: PreExecCall, next: () => PreExecDecision | Promise<PreExecDecision>) => PreExecDecision | Promise<PreExecDecision>,
+): (call: PreExecCall, next: () => PreExecDecision | Promise<PreExecDecision>) => Promise<PreExecDecision> {
+    return async (call, next) => {
+        let inner: PreExecDecision | Promise<PreExecDecision> | undefined;
+        const guardedNext = () => {
+            inner = next();
+            return inner;
+        };
+        const own = await listener(call, guardedNext);
+        if (inner === undefined) return own;
+        return tightenDecisions(await inner, own);
+    };
+}
+
+// ---------- 工具执行看门狗（driver 级墙钟硬解，2026-11-05 挂账销账） ----------
+
+/** 看门狗预算：env 覆盖（MINI_TOOL_TIMEOUT_MS），缺省 10 分钟。
+ *  在途工具的现状：run_shell 30s 树杀、MCP 60s、行情 fetch 10-30s——都远小于
+ *  缺省值；能吃满 10 分钟的只有"结构性挂死"（2026-11-06 实录：审批 readline
+ *  等键 8 小时）。 */
+export function toolWatchdogMs(): number {
+    const raw = Number(process.env.MINI_TOOL_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 600_000;
+}
+
+/** 墙钟竞速：超时 reject（agent 循环的 catch 转成 error tool_result，driver
+ *  继续），败者的后续 resolve/reject 一律丢弃——注意孤儿不会被打断（审批
+ *  readline 会一直挂着等人按键，迟到的 y 仍会执行写入），看门狗只是把 driver
+ *  从等待里解放出来，不是终止器。 */
+export async function withToolWatchdog<T>(run: () => Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    const orphan = run();
+    orphan.catch(() => { }); // 看门狗胜出后孤儿若 reject，不能变成 unhandled rejection
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            orphan,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`tool watchdog: ${label} exceeded ${Math.round(timeoutMs / 1000)}s wall clock`)),
+                    timeoutMs,
+                );
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+export interface ToolDefinition {
+    name: string;
+    description: string;
+    parameters: JSONSchema;
+    permissionHint?: PermissionHint;
+    /** deferred 工具不随 schema 广告，tool_search 命中后激活。 */
+    deferred?: boolean;
+    /** D5：结果可剪（T2 snip 的对象集合——旧 SNIPPABLE_TOOLS 集合变元数据）。 */
+    snippable?: boolean;
+    /** execute 函数体自 tools.ts 的 switch 原样迁出；多数工具是同步的。 */
+    execute(input: Record<string, any>, exec: ToolExec): string | Promise<string>;
+}
+
+// 激活态模块级全局（语义对齐迁移前的 tools.ts）：跨 Agent 实例共享
+const activatedTools = new Set<string>();
+
+export function resetActivatedTools(): void {
+    activatedTools.clear();
+}
+
+export function activateTools(names: string[]): void {
+    for (const name of names) activatedTools.add(name);
+}
+
+export function isActivated(name: string): boolean {
+    return activatedTools.has(name);
+}
+
+/** 发请求用的工具清单：非 deferred 全量，deferred 只给已激活的；deferred 标记剥掉。 */
+export function getActiveToolDefinitions(allTools?: ToolDef[]): Anthropic.Tool[] {
+    const tools = allTools || toolDefinitions;
+    return tools
+        .filter((t) => !t.deferred || activatedTools.has(t.name))
+        .map(({ deferred, ...rest }) => rest);
+}
+
+/** 还没激活的 deferred 工具名单——拼进 system 提示，模型才知道去搜什么。 */
+export function getDeferredToolNames(allTools?: ToolDef[]): string[] {
+    const tools = allTools || toolDefinitions;
+    return tools
+        .filter((t) => t.deferred && !activatedTools.has(t.name))
+        .map((t) => t.name);
+}
+
+const MAX_RESULT_CHARS = 50000;
+
+/** 保留头尾、砍中间：编译错误摘要、测试结果统计这类关键信息往往在输出末尾。 */
+export function truncateResult(result: string): string {
+    if (result.length <= MAX_RESULT_CHARS) return result;
+    const keepEach = Math.floor((MAX_RESULT_CHARS - 60) / 2);
+    return (
+        result.slice(0, keepEach) +
+        `\n\n[... truncated ${result.length - keepEach * 2} chars ...]\n\n` +
+        result.slice(-keepEach)
+    );
+}
+
+export class ToolsService extends Service {
+    private defs: ToolDefinition[] = [];
+
+    /**
+     * 注册工具，返回 disposer（只删自己的注册，幂等）。插件内调用时经 B3
+     * effect 自动收集——插件卸载，工具从模型视野消失。
+     * 同名重复注册 fail-loud：服务表冲突语义（B2）在注册表层的同款。
+     */
+    register(def: ToolDefinition): () => void {
+        if (this.defs.some((d) => d.name === def.name)) {
+            throw new Error(`[mini-cordis] tool "${def.name}" has been registered already`);
+        }
+        this.defs.push(def);
+        let active = true;
+        return () => {
+            if (!active) return;
+            active = false;
+            this.defs = this.defs.filter((d) => d !== def);
+        };
+    }
+
+    /** 按名取工具定义；mcp__ 动态名的占位逻辑仍在 agent 侧，不在这里。 */
+    get(name: string): ToolDefinition | undefined {
+        return this.defs.find((d) => d.name === name);
+    }
+
+    /** 全量定义，注册序。返回快照：外部排序/增删不影响注册表。 */
+    list(): ToolDefinition[] {
+        return [...this.defs];
+    }
+
+    /**
+     * C2 执行管线：snapshotArgs → waterfall('tools/pre-execute')（监听器经
+     * monotonic 只能收紧）→ ask 交审批服务（无服务 = fail-closed deny）→
+     * 执行（dispatch 优先：agent 的魔法名链；否则注册表 execute）→
+     * truncateResult → waterfall('tools/post-execute')（block/accept）。
+     * 权限决策与执行从 agent 循环整体迁入这里，行为与旧 checkPermission
+     * 九段流水线逐段等价（对拍见 dsh-C2.md）。
+     */
+    async executeCall(
+        call: { name: string; input: Record<string, any>; mode: PermissionMode; planFilePath?: string },
+        exec: ToolExec,
+    ): Promise<ExecOutcome> {
+        // 快照：监听器与审批记录看到的是同一份不可变视图，执行用原始 input
+        const snapshot = structuredClone(call.input);
+        const preCall: PreExecCall = {
+            name: call.name,
+            input: snapshot,
+            mode: call.mode,
+            planFilePath: call.planFilePath,
+            def: this.get(call.name),
+            signal: exec.signal,
+        };
+        // 无监听器的裸树 → inner 默认 allow；策略由插件提供
+        const decision = await this.ctx.waterfall("tools/pre-execute", preCall, (): PreExecDecision => ({ type: "allow" }));
+
+        if (decision.type === "deny") {
+            return { kind: "denied", content: `Denied: ${decision.reason}`, announce: decision.reason };
+        }
+        if (decision.type === "ask") {
+            const approval = this.ctx.get<ApprovalService>("approval");
+            const verdict = approval
+                ? await approval.request(preCall, decision.message)
+                : "deny"; // fail-closed：没有审批服务的树不执行任何 ask
+            if (verdict === "deny") {
+                // 无人值守自动拒：announce 上 UI 留痕（区别于人手按 n 的静默）
+                if (approval?.isUnattended()) {
+                    const reason = "Denied: watch armed (unattended) — actions needing confirmation are auto-denied until /watch off.";
+                    return { kind: "denied", content: reason, announce: reason };
+                }
+                return { kind: "denied", content: "User denied this action." };
+            }
+        }
+
+        let output: string;
+        if (exec.dispatch) {
+            const dispatched = await exec.dispatch(call.name, call.input);
+            if (isTurnConclusion(dispatched)) {
+                // 工具经 dispatch 自结 turn：结论原样上浮，输出即注入文本
+                // （不进 tool_result 批次，truncateResult 也不适用）
+                return { kind: "result", output: dispatched.nextTurnInput ?? "", conclusion: dispatched };
+            }
+            output = dispatched;
+        } else if (preCall.def) {
+            output = await preCall.def.execute(call.input, exec);
+        } else {
+            output = `Unknown tool: ${call.name}`;
+        }
+        output = truncateResult(output);
+        // post-execute：监听器可改写输出（block 带反馈）；无监听器 = 原样
+        output = await this.ctx.waterfall("tools/post-execute", { name: call.name, output }, () => output);
+        return { kind: "result", output };
+    }
+}
+
+declare module "../core/context.js" {
+    interface Context {
+        tools?: ToolsService;
+    }
+}
+
+// 管线事件进全局 Events 表（框架自有事件与 vendor 的 internal/* 同一手法，
+// 用户可再 merge 自己的监听器类型）：
+declare module "../core/events.js" {
+    interface Events {
+        "tools/pre-execute"(
+            call: PreExecCall,
+            next: () => PreExecDecision | Promise<PreExecDecision>,
+        ): PreExecDecision | Promise<PreExecDecision>;
+        "tools/post-execute"(result: { name: string; output: string }, next: () => string): string | Promise<string>;
+    }
+}

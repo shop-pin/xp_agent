@@ -14,12 +14,9 @@
   },
   "include": [
     "*.ts",
-    "cordis/**/*.ts",
-    "cordis-tests/**/*.ts",
-    "services/**/*.ts",
-    "plugins/**/*.ts",
-    "webui/**/*.ts",
-    "webui/**/*.tsx",
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "tests/**/*.ts",
     "stock/**/*.ts"
   ]
 }

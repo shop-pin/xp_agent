@@ -18,5 +18,5 @@ if (existsSync(envFile)) {
 const prompt = process.argv.slice(2).join(" ");
 if (!prompt) { console.log('usage: npm run live -- "your prompt"'); process.exit(1); }
 
-const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+const mod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
 await new mod.Agent().chat(prompt);

@@ -3,7 +3,7 @@
 //   npm run mock        → chapter 1
 //   npm run mock -- 2   → chapter 2
 //   npm run mock -- 3   → chapter 3 (asserts on the request the mock actually received)
-import { startMock } from "./mock-anthropic.mjs";
+import { startMock } from "./src/llm/mock-anthropic.mjs";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, appendFileSync, rmSync } from "fs";
 import { createHash } from "crypto";
 import { tmpdir, homedir } from "os";
@@ -1526,7 +1526,7 @@ if (s.runs) {
         // ch24：/loop 是 REPL 命令（对齐 src 后 one-shot 不解析斜杠命令），
         // mock 直接驱动 agent 层。stopLoopAfterMs 模拟 Ctrl+C 中断——
         // dynamic 唤醒延迟钳到 60s 起，真等不现实，靠 loopStop 提前退出睡眠
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         if (r.maxTurns) a.setMaxTurns(r.maxTurns);
         if (r.stopLoopAfterMs) setTimeout(() => a.stopLoop(), r.stopLoopAfterMs);
@@ -1535,7 +1535,7 @@ if (s.runs) {
       } else if (r.planApproval !== undefined) {
         // ch25：审批回调脚本化注入（one-shot 无 REPL）。confirmFn 注入"自动否"——
         // 若模式切换逻辑坏了，走 confirm 路径会干净失败而不是悬在 stdin
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         a.setConfirmFn(async () => false);
         a.setPlanApprovalFn(async () => r.planApproval);
@@ -1544,7 +1544,7 @@ if (s.runs) {
       } else if (r.confirm !== undefined) {
         // ch26：auto 模式直调 agent 层。confirmFn 注入脚本化答复（false=自动否）
         // ——DENIAL_LIMITS 降级的 confirm 路径需要一个回调收尾，否则悬在 stdin
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent({ permissionMode: r.mode || "default" });
         a.setConfirmFn(async () => r.confirm);
         await a.chat(r.prompt);
@@ -1552,7 +1552,7 @@ if (s.runs) {
       } else if (r.midturn !== undefined) {
         // C4：handle/inbox 行为探针。响应被 delayMs 卡住，send/followup/cancel
         // 全部落在"turn 运行中"——时序确定，不靠竞速
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         const isAbort = (e) => e?.name === "AbortError" || String(e?.message ?? "").includes("aborted");
         const readEvents = () => {
@@ -1598,7 +1598,7 @@ if (s.runs) {
       } else if (r.events !== undefined) {
         // C5：循环事件探针。三个 toy 监听器挂在 agent 的 cordis 树上（runtime
         // 直取私有字段——探针专属，教学代码不背这个口子）
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         const actx = a.cordis;
         const readEvents = () => {
@@ -1635,7 +1635,7 @@ if (s.runs) {
         if (a.close) await a.close();
       } else if (r.goalImpossible !== undefined) {
         // C5 第二段：goal impossible → turn 以 blocked 收敛（注记断言）
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
         const directive = a.setGoal("make 2+2 equal 5");
@@ -1649,7 +1649,7 @@ if (s.runs) {
         // 在第一个工具的批后注记处注入异常（per-tool catch 罩不住的位置）——
         // 外层护栏应补齐第二个工具的 error tool_result 后上抛；下一请求的历史
         // 无孤儿（两个 tool_use 都有回应）
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
         const log = a.sessionLog;
@@ -1675,7 +1675,7 @@ if (s.runs) {
         if (a.close) await a.close();
       } else if (r.echoBackend !== undefined) {
         // C6：换后端 = 换路由配置行。整个 agent 循环跑在 echo 假后端上
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const a = new agentMod.Agent();
         const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
         await a.chat("hello echo backend");
@@ -1687,7 +1687,7 @@ if (s.runs) {
         // C8：JSONL 持久化三阶段——①跑两个请求的会话；②新 Agent 从文件 resume
         // 后继续（请求历史/工具结果/system 逐字节续接 + cost 派生恢复）；
         // ③崩溃修复（半行丢弃 + 未闭合 turn/start 补合成 end）
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
         const a = new agentMod.Agent();
         await a.chat("read greeting.txt then summarize");
@@ -1713,7 +1713,7 @@ if (s.runs) {
         // 两个都注"自动否"confirmFn：full 靠分类器放行（不到 confirm），
         // bare 没有 auto-approval，写动作直落 confirm 被否——同一输入、
         // 两条裁决路径，零竞速。
-        const agentMod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+        const agentMod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
         const sample = (key, value) => appendFileSync(logPath, JSON.stringify({ type: "sample", key, value: String(value) }) + "\n");
         const full = new agentMod.Agent({ permissionMode: "auto" });
         const bare = new agentMod.Agent({ permissionMode: "auto", profile: "no-auto" });
@@ -1755,7 +1755,7 @@ if (s.runs) {
   if (crashed) process.exit(process.exitCode === undefined ? 1 : process.exitCode);
 } else {
   console.log(`  you: ${s.prompt}\n`);
-  const mod = await import(pathToFileURL(join(HERE, "dist", "agent.js")).href);
+  const mod = await import(pathToFileURL(join(HERE, "dist", "src", "core", "agent.js")).href);
   const agent = new mod.Agent();
   if (s.autoConfirm) agent.setConfirmFn(async () => true);
   await agent.chat(s.prompt);

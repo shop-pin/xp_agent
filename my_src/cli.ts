@@ -4,11 +4,11 @@ import { resolve, dirname, join } from "path";
 import { mkdirSync, openSync, writeSync, closeSync } from "fs";
 import { homedir } from "os";
 import chalk from "chalk";
-import { Agent } from "./agent.js";
-import { getLatestSessionId } from "./plugins/session-jsonl.js";
-import type { PermissionMode } from "./permissions.js";
-import { printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./ui.js";
-import type { CommandService } from "./services/commands.js";
+import { Agent } from "./src/core/agent.js";
+import { getLatestSessionId } from "./src/session/session-jsonl.js";
+import type { PermissionMode } from "./src/approval/permissions.js";
+import { printError, printInfo, printPlanForApproval, printPlanApprovalOptions } from "./src/interaction/ui.js";
+import type { CommandService } from "./src/interaction/commands-service.js";
 import type { Row } from "./cordis.config.js";
 
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;

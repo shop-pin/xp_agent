@@ -120,10 +120,18 @@ my_src/
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M1 ✅ 2026-11-11** | 股票剥离 + 缝契约（§1.4 完成记录） | stock/ 缺席时框架全绿；恢复后 npm run stock 全绿 |
-| M2＝提交一 | 结构对齐 dsh 语义目录 | 全量回归绿 + 目录树达标 |
-| M— | 新 git 仓初始化（bundle 备份先行） | git log 无股票历史；stock/ 不入库 |
+| **M2 ✅ 2026-11-12** | 结构对齐 dsh 语义目录（§2.1 完成记录） | 全量回归绿 + 目录树达标 |
+| M— | 新 git 仓初始化（bundle 备份先行，需用户确认） | git log 无股票历史；stock/ 不入库 |
 | M3＝提交二 | 功能补齐队列 1–6 | 全量回归绿 + 挂机实跑一天 |
 | 之后 | 股票域在 stock/ 内继续演进 | 每次框架演进跑依赖审计 + 双侧回归 |
+
+### 2.1 M2 完成记录（2026-11-12）
+
+两批走完，全绿。**批1（地基）**：cordis/ 八件 + agent.ts + autonomy.ts + prompt.ts → `src/core/`，frontmatter.ts → `src/util/`。**批2（插件）**：plugins/services/webui/cordis-tests 按语义散入 src/{llm,session,tools,approval,interaction,skill,memory,mcp,subagent,compaction,host,schedule,plugins,core}；cordis-tests → `tests/`（26 章，npm run cordis glob 改 `dist/tests/`）。**留根**：cli.ts、cordis.config.ts、run-*.mjs、snapshot-lib.mjs、assets/、mcp-demo-server.mjs。**命名冲突按 ui-service 先例加后缀**：autonomy-plugin / memory-plugin / subagent-plugin（插件 vs 同名根支持模块）、approval-service / commands-service / tools-service（service vs 同名插件）。webui → `src/host/webui/`（vite outDir 相对配置目录自洽；host-webserver 的 DEFAULT_WEBUI_DIST 改三层上溯 `../../../src/host/webui/dist`；npm run webui 路径同步）。
+
+执行坑记档：①codemod 产出 specifier 必须是 `.js`（NodeNext 运行时语义），从 .ts 迁移表查得的目标要回落扩展名；②import 重解析要 nd/od 双解（批1 已挪文件的 specifier 相对新位置写、批2 挪动的相对旧位置写，existsSync 守卫兜底）；③**worktree 里挂 node_modules junction 后 rm -rf worktree 会穿透 junction 清空主仓 node_modules**（npm ci 自 lock 恢复；症状 = npx tsc 打印 "This is not the tsc command"）；④f4/f5/f6 的 mock-anthropic 动态 URL（绕 TS 模块解析）从 dist/tests 上溯两级 `../../src/llm/mock-anthropic.mjs`；⑤`npm run mock` 单次只跑一章（缺省 ch1），全量=逐章循环 1..45（13/14/16/17/22 空号跳过，40 章绿）。
+
+验收矩阵：恢复态 cordis 195/195 + snapshot 40/40 + mock 40 章绿 + stock 219/219 + webui 构建绿；缺席模拟（stock 改名）cordis 195/195 + snapshot 28/28 + mock 框架章全绿；git status 无 stock/ 条目。§2 验收线中"每目录一行 README"挂账后续补。**下一步 = §4 新仓初始化（git bundle 备份先行，需用户再次确认）→ M3。**
 
 ## §6 明日（11-11）安排
 
